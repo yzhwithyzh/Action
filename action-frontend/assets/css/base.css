@@ -1,0 +1,177 @@
+/* ===== 文档级规则：由 8 个页面合并而来（已验证纯增量、无取值冲突） ===== */
+:root {
+  /* ===== 新中式 · 天青 / 朱砂 色彩系统（甲方定稿） ===== */
+    --indigo-900: #12211d;
+  --indigo-800: #183029;
+  --indigo-700: #1d4239;
+  --indigo-600: #265548;
+  --indigo-500: #2c7f72;
+  --indigo-300: #7cbcb0;
+  --indigo-200: #bfe2da;
+  --indigo-100: #e0f1ec;
+  --paper: #f2f6f4;
+  --paper-2: #e8f1ec;
+  --surface: #ffffff;
+  --ink: #25373a;
+  --muted: #5a6f70;
+  --line: #dae7e1;
+  --cinnabar: #cf4635;
+  --cinnabar-d: #b23a2a;
+  --maxw: 1320px;
+  --radius: 12px;
+  --radius-lg: 20px;
+  --shadow-sm: 0 1px 2px rgba(20,29,51,.06),0 2px 8px rgba(20,29,51,.05);
+  --shadow-md: 0 10px 30px rgba(20,29,51,.10);
+  --shadow-lg: 0 24px 60px rgba(20,29,51,.16);
+  --ease: cubic-bezier(.22,1,.36,1);
+  --z-base: 1;
+  --z-sticky: 100;
+  --z-dropdown: 200;
+  --z-toast: 400;
+  --indigo-900: #12211d;
+  --info: #2a6fc4;
+  --info-bg: #e5eef9;
+  --amber: #9a6b00;
+  --amber-bg: #f7eed6;
+  --z-subnav: 90;
+}
+
+body {
+  font-family: "Source Sans 3","Noto Sans SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+  color: var(--ink);
+  background: var(--paper);
+  line-height: 1.7;
+  overflow-x: clip;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* ===== 跨页共享规则 ===== */
+*{box-sizing:border-box;margin:0;padding:0}
+
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+
+p{overflow-wrap:break-word}
+
+a{color:inherit;text-decoration:none}
+
+h1,h2,h3,h4{font-family:"Spectral","Noto Serif SC",Georgia,serif;line-height:1.18;font-weight:600}
+
+::selection{background:var(--indigo-200);color:var(--indigo-900)}
+
+:focus-visible{outline:2.5px solid var(--indigo-500);outline-offset:3px;border-radius:4px}
+
+img,svg{max-width:100%;display:block}
+
+.vh{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+/* v-html 挂在**组件**（如 NuxtLink）上时，编译产物是 innerHTML prop，服务端渲染
+   不认它——SSR 出来的是一个空标签，文字要等 hydration 才补上，首屏肉眼可见地缺字。
+   套一层 .rich 包装：v-html 落在真实元素上，SSR 正常出内容；display:contents
+   让包装本身不产生盒子，父级 flex 的 gap / align-items 仍作用在文字与箭头之间。 */
+.rich{display:contents}
+
+.skip-link:focus{top:12px;outline:2.5px solid var(--indigo-200);outline-offset:2px}
+
+.wrap{max-width:var(--maxw);margin:0 auto;padding:0 clamp(20px,4vw,44px)}
+
+.kicker::before{content:"";width:22px;height:1.5px;background:var(--cinnabar)}
+
+.btn .arrow{transition:transform .3s var(--ease)}
+
+.btn:hover .arrow{transform:translateX(3px)}
+
+.btn-primary{background:var(--cinnabar);color:#fff;box-shadow:0 6px 18px rgba(192,54,44,.28)}
+
+.btn-primary:hover{background:var(--cinnabar-d);transform:translateY(-2px);box-shadow:0 12px 26px rgba(192,54,44,.34)}
+
+.btn-ink{background:var(--indigo-700);color:#fff}
+
+.btn-ink:hover{background:var(--indigo-800);transform:translateY(-2px);box-shadow:var(--shadow-md)}
+
+.btn-ghost{border-color:var(--indigo-200);color:var(--indigo-700);background:transparent}
+
+.btn-ghost:hover{border-color:var(--indigo-500);background:var(--indigo-100)}
+
+.btn-onDark{border-color:rgba(255,255,255,.28);color:#fff}
+
+.btn-onDark:hover{background:rgba(255,255,255,.10);border-color:rgba(255,255,255,.5)}
+
+.nav .btn{padding:9px 18px;font-size:14px}
+
+@keyframes mm{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
+
+.kicker{display:inline-flex;align-items:center;gap:9px;font-size:13.5px;font-weight:600;letter-spacing:.02em;color:var(--indigo-500);margin-bottom:16px}
+
+.btn-sm{padding:9px 16px;font-size:13.5px}
+
+.phero{position:relative;overflow:hidden;background:var(--indigo-900);color:#fff;isolation:isolate}
+
+.crumb a{color:rgba(233,238,247,.82);transition:color .2s}
+
+.crumb a:hover{color:#fff}
+
+.crumb .sep{color:rgba(233,238,247,.4)}
+
+.crumb b{color:#fff;font-family:inherit;font-weight:600}
+
+.phero-tag .dot{width:7px;height:7px;border-radius:50%;background:var(--cinnabar);box-shadow:0 0 0 4px rgba(192,54,44,.25)}
+
+.phero h1 .hl{color:var(--indigo-200)}
+
+.phero-bg{position:absolute;inset:0;z-index:-1;width:100%;height:100%;object-fit:cover;object-position:center 32%;opacity:.26;pointer-events:none}
+
+.phero::after{content:"";position:absolute;inset:0;z-index:-1;pointer-events:none;background:linear-gradient(90deg,rgba(18,33,29,.86) 4%,rgba(18,33,29,.66) 46%,rgba(18,33,29,.4) 100%)}
+
+.phero .wrap{position:relative;z-index:1}
+
+@media (prefers-reduced-motion:no-preference){
+    html.js .reveal{opacity:0;transform:translateY(18px);transition:opacity .8s var(--ease),transform .8s var(--ease)}
+    html.js .reveal.is-visible{opacity:1;transform:none}
+  }
+
+.is-hidden{display:none !important}
+
+@media(max-width:820px){
+    .fgrid{grid-template-columns:1fr;gap:32px}.copy{flex-direction:column}
+    .menu-open .mobile-menu{display:block;position:fixed;inset:72px 0 0;z-index:var(--z-dropdown);background:var(--paper);padding:28px clamp(20px,5vw,40px);overflow:auto;animation:mm .3s var(--ease)}
+    .menu-open .burger span:nth-child(1){transform:translateY(7px) rotate(45deg)}
+    .menu-open .burger span:nth-child(2){opacity:0}
+    .menu-open .burger span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
+    .mobile-menu a{display:block;font-family:"Spectral","Noto Serif SC",serif;font-size:1.4rem;color:var(--indigo-900);padding:16px 0;border-bottom:1px solid var(--line)}
+    .mobile-menu .btn{width:100%;justify-content:center;margin-top:24px}
+  }
+
+/* ===== 浅色 Hero（参照首页，压轻页头背景） ===== */
+  .phero{color:var(--ink)}
+
+.phero::before{background:
+    radial-gradient(1000px 560px at 88% -6%,rgba(87,190,174,.30),transparent 62%),
+    radial-gradient(660px 460px at 0% 108%,rgba(207,70,53,.10),transparent 66%),
+    linear-gradient(162deg,#e9f3ee 0%,#f2f6f2 46%,#f6efe4 108%)}
+
+.phero-bg{opacity:.16}
+
+.phero::after{background:linear-gradient(90deg,rgba(242,246,244,.94) 0%,rgba(242,246,244,.72) 48%,rgba(242,246,244,.32) 100%)}
+
+.phero-tag{color:var(--indigo-700);background:rgba(255,255,255,.75);border-color:var(--line)}
+
+.phero h1{color:var(--ink)}
+
+.phero h1 .hl{color:var(--cinnabar)}
+
+.phero .psub{color:var(--muted)}
+
+.pstat{background:var(--surface);border-color:var(--line);box-shadow:var(--shadow-sm)}
+
+.pstat b{color:var(--indigo-700)}
+
+.pstat span{color:var(--muted)}
+
+.phero-steps span{color:var(--ink);background:var(--surface);border-color:var(--line)}
+
+.phero-steps .sep2{color:var(--indigo-300);background:none;border:none}
+
+.phero .btn-onDark{border-color:var(--line);color:var(--indigo-700);background:var(--surface)}
+
+.phero .btn-onDark:hover{border-color:var(--indigo-500);background:var(--indigo-100)}

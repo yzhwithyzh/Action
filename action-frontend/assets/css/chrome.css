@@ -1,0 +1,54 @@
+header{position:sticky;top:0;z-index:var(--z-sticky,100);background:rgba(242,246,244,.82);backdrop-filter:blur(14px) saturate(1.4);border-bottom:1px solid var(--line)}
+  .nav{display:flex;align-items:center;gap:20px;height:72px}
+  .brand{display:flex;align-items:center;gap:13px;margin-right:auto}
+  .seal{width:42px;height:42px;flex-shrink:0}
+  .brand-txt b{display:block;font-family:"Spectral","Noto Serif SC",serif;font-weight:700;font-size:19px;color:var(--indigo-900);letter-spacing:.06em;line-height:1.1}
+  .brand-txt small{display:block;font-size:11.5px;color:var(--muted);letter-spacing:.01em}
+  .menu{display:flex;gap:17px;font-size:15px;font-weight:500}
+  .menu a{color:var(--indigo-700);position:relative;padding:4px 0;transition:color .2s;white-space:nowrap}
+  .menu a::after{content:"";position:absolute;left:0;right:0;bottom:-2px;height:2px;background:var(--cinnabar);transform:scaleX(0);transform-origin:left;transition:transform .3s var(--ease)}
+  .menu a:hover{color:var(--indigo-900)}
+  .menu a:hover::after,.menu a.cur::after{transform:scaleX(1)}
+  .menu a.cur{color:var(--indigo-900);font-weight:600}
+  .nav-actions{display:flex;align-items:center;gap:14px}
+  .lang{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;font-weight:600;color:var(--indigo-700);background:transparent;border:1.5px solid var(--line);border-radius:999px;padding:9px 15px;min-height:42px;cursor:pointer;transition:border-color .2s,background .2s}
+  .lang:hover{border-color:var(--indigo-500);background:var(--indigo-100)}
+  .lang svg{width:15px;height:15px;opacity:.7}
+  /* 访客登录入口。刻意**不用** .btn：下面 @media(max-width:900px) 会隐藏
+     .nav-actions .btn，而且本仓没有全局 .btn 基础规则（display/padding/border-radius
+     由 8 个页面各自在 <style> 里写一份），header 不在任何 .page-* 作用域内拿不到形状。
+     这里整段复制上面 .lang 的胶囊规则，行为与语言切换按钮一致。 */
+  .auth-group{display:inline-flex;align-items:center;gap:10px}
+  .auth-link{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;font-weight:600;color:var(--indigo-700);background:transparent;border:1.5px solid var(--line);border-radius:999px;padding:9px 15px;min-height:42px;cursor:pointer;transition:border-color .2s,background .2s}
+  .auth-link:hover{border-color:var(--indigo-500);background:var(--indigo-100)}
+  .auth-link svg{width:15px;height:15px;opacity:.7}
+  .auth-name{display:inline-flex;align-items:center;min-height:42px;padding:9px 15px;border:1.5px solid var(--indigo-200);border-radius:999px;background:var(--indigo-100);font-size:13.5px;font-weight:600;color:var(--indigo-800)}
+  .auth-name>span{display:block;max-width:9em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .burger{display:none;width:44px;height:44px;border:1.5px solid var(--line);border-radius:11px;background:transparent;cursor:pointer;align-items:center;justify-content:center;flex-direction:column;gap:5px}
+  .burger span{width:19px;height:2px;background:var(--indigo-800);transition:.3s var(--ease)}
+  .mobile-menu{display:none}
+  footer{background:var(--indigo-900);color:rgba(233,238,247,.72);padding:clamp(56px,7vw,80px) 0 34px;font-size:15px}
+  .fgrid{display:grid;grid-template-columns:1.7fr 1fr 1fr 1.2fr;gap:48px;margin-bottom:48px}
+  .fbrand .seal{margin-bottom:16px}
+  .fbrand p{max-width:38ch;color:rgba(233,238,247,.6);line-height:1.65;margin-top:8px}
+  footer h2{color:#fff;font-family:"Source Sans 3","Noto Sans SC",sans-serif;font-size:14px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:18px}
+  footer nav a,.fcontact a{display:block;color:rgba(233,238,247,.72);padding:9px 0;transition:color .2s}
+  footer nav a:hover,.fcontact a:hover{color:var(--indigo-200)}
+  .fcontact .fmail{color:#fff;font-weight:600;font-size:1.05rem}
+  .fcontact .fmail:hover{color:var(--indigo-200)}
+  .copy{border-top:1px solid rgba(255,255,255,.12);padding-top:24px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px;color:rgba(233,238,247,.62);font-size:13.5px}
+  @media(max-width:900px){.menu,.nav-actions .btn{display:none}.burger{display:flex}}
+  /* 顶栏放不下三个胶囊 + 汉堡时才收起登录入口，且只收到移动菜单已经可用的区间里
+     （移动菜单自身是 ≤820px 才显示的），不能像 .nav-actions .btn 那样一收就无处可点 */
+  @media(max-width:600px){.nav-actions .auth-group{display:none}}
+  @media(max-width:820px){
+    .fgrid{grid-template-columns:1fr;gap:32px}.copy{flex-direction:column}
+    .menu-open .mobile-menu{display:block;position:fixed;inset:72px 0 0;z-index:var(--z-dropdown,200);background:var(--paper);padding:28px clamp(20px,5vw,40px);overflow:auto;animation:mm .3s var(--ease)}
+    .menu-open .burger span:nth-child(1){transform:translateY(7px) rotate(45deg)}
+    .menu-open .burger span:nth-child(2){opacity:0}
+    .menu-open .burger span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
+    .mobile-menu a{display:block;font-family:"Spectral","Noto Serif SC",serif;font-size:1.4rem;color:var(--indigo-900);padding:16px 0;border-bottom:1px solid var(--line)}
+    .mobile-menu .mm-user{display:block;font-size:13.5px;font-weight:600;color:var(--muted);padding:20px 0 0}
+    .mobile-menu .mm-auth{display:block;width:100%;text-align:left;font-family:"Spectral","Noto Serif SC",serif;font-size:1.4rem;color:var(--indigo-900);padding:16px 0;border:0;border-bottom:1px solid var(--line);background:transparent;cursor:pointer}
+  }
+  @keyframes mm{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
