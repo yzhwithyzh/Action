@@ -8,9 +8,11 @@ const route = useRoute()
 
 interface NavItem {
   key: string
-  to: string
+  to?: string
   /** 高亮匹配的路由 path；带 hash 的锚点链接需单独指定 */
-  match: string
+  match?: string
+  /** 有 children 时本项不是链接，而是顶栏上的一个下拉分组 */
+  children?: NavItem[]
 }
 
 const NAV: NavItem[] = [
@@ -18,15 +20,68 @@ const NAV: NavItem[] = [
   // 滚到平台模块区，跳过 Hero。首页里的「了解平台模块」按钮仍保留 #modules 锚点。
   { key: 'platform', to: '/', match: '/' },
   { key: 'guidelines', to: '/guidelines', match: '/guidelines' },
-  { key: 'methodology', to: '/srd', match: '/srd' },
-  { key: 'implementation', to: '/implementation', match: '/implementation' },
-  { key: 'assistant', to: '/assistant', match: '/assistant' },
+  // 三个 AI 工具页合并成一个下拉：顶栏一级项从 8 个降到 6 个，且它们本就是同一类东西。
+  // 「报告规范」是首要 CTA，必须留在一级，不进这个组。
+  {
+    key: 'tools',
+    children: [
+      { key: 'assistant', to: '/assistant', match: '/assistant' },
+      { key: 'methodology', to: '/srd', match: '/srd' },
+      { key: 'implementation', to: '/implementation', match: '/implementation' },
+    ],
+  },
   { key: 'collaborate', to: '/collaborate', match: '/collaborate' },
   { key: 'news', to: '/news', match: '/news' },
   { key: 'about', to: '/about', match: '/about' },
 ]
 
 const isCurrent = (item: NavItem) => route.path === item.match
+/** 分组按钮的高亮：停在组内任一页面时点亮 */
+const isGroupCurrent = (item: NavItem) => (item.children ?? []).some(isCurrent)
+
+/* ---------- 顶栏下拉 ---------- */
+const openKey = ref<string | null>(null)
+let closeTimer: ReturnType<typeof setTimeout> | undefined
+
+const openGroup = (key: string) => {
+  clearTimeout(closeTimer)
+  openKey.value = key
+}
+// 延迟关闭：鼠标从按钮斜着划向面板时会短暂离开容器，立即关会点不中
+const scheduleClose = () => {
+  clearTimeout(closeTimer)
+  closeTimer = setTimeout(() => { openKey.value = null }, 160)
+}
+const closeGroup = () => {
+  clearTimeout(closeTimer)
+  openKey.value = null
+}
+const toggleGroup = (key: string) => {
+  if (openKey.value === key) closeGroup()
+  else openGroup(key)
+}
+// 焦点移出整个分组才关，Tab 在面板内部移动时保持展开
+const onGroupBlur = (event: FocusEvent, key: string) => {
+  const next = event.relatedTarget as Node | null
+  const root = event.currentTarget as HTMLElement
+  if (openKey.value === key && (!next || !root.contains(next))) closeGroup()
+}
+
+const onDocClick = (event: MouseEvent) => {
+  if (!(event.target as HTMLElement).closest('.menu-grp')) closeGroup()
+}
+const onKeydown = (event: KeyboardEvent) => {
+  if (event.key === 'Escape') closeGroup()
+}
+onMounted(() => {
+  document.addEventListener('click', onDocClick)
+  document.addEventListener('keydown', onKeydown)
+})
+onBeforeUnmount(() => {
+  clearTimeout(closeTimer)
+  document.removeEventListener('click', onDocClick)
+  document.removeEventListener('keydown', onKeydown)
+})
 
 const { guest, isLoggedIn, logout, fetchMe } = useAuth()
 
@@ -56,9 +111,10 @@ watchEffect(() => {
   }
 })
 
-// 路由切换后收起移动菜单
+// 路由切换后收起移动菜单与顶栏下拉
 watch(() => route.fullPath, () => {
   menuOpen.value = false
+  closeGroup()
 })
 
 const switchLang = () => {
@@ -100,13 +156,50 @@ const onLogout = async () => {
       </NuxtLink>
 
       <nav class="menu" :aria-label="t('nav.aria')">
-        <NuxtLink
-          v-for="item in NAV"
-          :key="item.key"
-          :to="item.to"
-          :class="{ cur: isCurrent(item) }"
-          :aria-current="isCurrent(item) ? 'page' : undefined"
-        >{{ t(`nav.${item.key}`) }}</NuxtLink>
+        <template v-for="item in NAV" :key="item.key">
+          <div
+            v-if="item.children"
+            class="menu-grp"
+            :class="{ open: openKey === item.key }"
+            @mouseenter="openGroup(item.key)"
+            @mouseleave="scheduleClose"
+            @focusin="openGroup(item.key)"
+            @focusout="onGroupBlur($event, item.key)"
+          >
+            <button
+              type="button"
+              class="grp-btn"
+              :class="{ cur: isGroupCurrent(item) }"
+              :aria-expanded="openKey === item.key"
+              aria-haspopup="true"
+              @click.stop="toggleGroup(item.key)"
+            >
+              <span>{{ t(`nav.${item.key}`) }}</span>
+              <svg
+                viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
+                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
+              ><path d="m6 9 6 6 6-6" /></svg>
+            </button>
+            <div class="grp-panel">
+              <NuxtLink
+                v-for="sub in item.children"
+                :key="sub.key"
+                :to="sub.to"
+                :class="{ cur: isCurrent(sub) }"
+                :aria-current="isCurrent(sub) ? 'page' : undefined"
+              >
+                <span class="gi-t">{{ t(`nav.${sub.key}`) }}</span>
+                <span class="gi-d">{{ t(`nav.${sub.key}Desc`) }}</span>
+              </NuxtLink>
+            </div>
+          </div>
+          <NuxtLink
+            v-else
+            :to="item.to"
+            :class="{ cur: isCurrent(item) }"
+            :aria-current="isCurrent(item) ? 'page' : undefined"
+          >{{ t(`nav.${item.key}`) }}</NuxtLink>
+        </template>
       </nav>
 
       <div class="nav-actions">
@@ -145,12 +238,26 @@ const onLogout = async () => {
   </header>
 
   <nav class="mobile-menu" :aria-label="t('nav.ariaMobile')">
-    <NuxtLink
-      v-for="item in NAV"
-      :key="item.key"
-      :to="item.to"
-      :aria-current="isCurrent(item) ? 'page' : undefined"
-    >{{ t(`nav.${item.key}`) }}</NuxtLink>
+    <!-- 移动端不做二级折叠：多一次点击换不来什么，直接把分组摊开成缩进的一段 -->
+    <template v-for="item in NAV" :key="item.key">
+      <div v-if="item.children" class="mm-grp">
+        <span class="mm-lbl">{{ t(`nav.${item.key}`) }}</span>
+        <div class="mm-sub">
+          <NuxtLink
+            v-for="sub in item.children"
+            :key="sub.key"
+            :to="sub.to"
+            :class="{ cur: isCurrent(sub) }"
+            :aria-current="isCurrent(sub) ? 'page' : undefined"
+          >{{ t(`nav.${sub.key}`) }}</NuxtLink>
+        </div>
+      </div>
+      <NuxtLink
+        v-else
+        :to="item.to"
+        :aria-current="isCurrent(item) ? 'page' : undefined"
+      >{{ t(`nav.${item.key}`) }}</NuxtLink>
+    </template>
     <!-- 顶栏那份在 ≤600px 会被收起，移动菜单里必须有一份等价入口 -->
     <ClientOnly>
       <template v-if="isLoggedIn">

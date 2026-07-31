@@ -1,7 +1,7 @@
 from datetime import datetime, time
 from typing import Any
 
-from sqlalchemy import Row, and_, delete, func, select, update
+from sqlalchemy import Row, and_, delete, func, nullslast, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.constant import CommonConstant
@@ -79,6 +79,9 @@ class NewsDao:
                 ActionNews.status == '0' if only_published else True,
                 ActionNews.title_zh.like(f'%{query_object.title_zh}%') if query_object.title_zh else True,
                 ActionNews.category_zh == query_object.category_zh if query_object.category_zh else True,
+                # 官网列表页的「ACTION 小组动态 / 领域新闻」两个筛选条走这个字段：
+                # 领域新闻一律是外链（is_external='1'），小组动态是站内条目（'0'）。
+                ActionNews.is_external == query_object.is_external if query_object.is_external else True,
                 ActionNews.status == query_object.status if query_object.status and not only_published else True,
                 ActionNews.publish_date.between(
                     datetime.combine(datetime.strptime(query_object.begin_time, '%Y-%m-%d'), time(00, 00, 00)),
@@ -87,7 +90,15 @@ class NewsDao:
                 if query_object.begin_time and query_object.end_time
                 else True,
             )
-            .order_by(ActionNews.is_top.desc(), ActionNews.publish_date.desc(), ActionNews.news_id.desc())
+            # publish_date 允许为空（外链类新闻多数没有确切日期）。PG 的 `desc()` 默认
+            # NULLS FIRST，会把这些无日期的条目顶到最前，列表页看起来像是倒序排的。
+            # 分页开启后这个问题更致命：第 1 页全是无日期外链，有日期的正文被挤到后面。
+            # 用 nullslast() 钉死，让「有日期的按日期倒序在前、无日期的垫底」。
+            .order_by(
+                ActionNews.is_top.desc(),
+                nullslast(ActionNews.publish_date.desc()),
+                ActionNews.news_id.desc(),
+            )
             .distinct()
         )
 

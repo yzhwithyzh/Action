@@ -31,7 +31,8 @@ const { pick } = useBilingual()
 
 const id = computed(() => String(route.params.id ?? ''))
 
-const { data: res } = await useSiteObject<NewsRow>(`/news/${id.value}`, `news-detail:${id.value}`)
+// swr：详情页是否被预渲染取决于构建时列表页有没有爬到它，取不到时得靠客户端补
+const { data: res } = await useSiteObject<NewsRow>(`/news/${id.value}`, `news-detail:${id.value}`, { swr: true })
 const row = computed<NewsRow | null>(() => res.value?.data ?? null)
 
 const title = computed(() => pick(row.value, 'title'))

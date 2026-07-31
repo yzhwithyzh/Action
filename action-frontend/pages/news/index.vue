@@ -1,13 +1,14 @@
 <script setup lang="ts">
 /**
  * news.html 迁移而来。
- * 模板与样式保持原状；样式已加 .page-news 命名空间，避免 SPA 路由切换时跨页污染。
+ * 样式已加 .page-news 命名空间，避免 SPA 路由切换时跨页污染。
  *
  * 列表数据来自 `/action/site/news`（原为 11 条硬编码）。
- * 注意：**不在前端二次排序**，照接口返回顺序渲染。接口现有顺序确实是反的
- * （DAO 的 `publish_date desc` 在 PG 下默认 NULLS FIRST，5 条无日期的领域新闻
- * 被顶到最前），那是 deferred-work.md 的 W21，须在 DAO 侧修；前端再排一次
- * 会导致前后端各有一套顺序。
+ * **筛选与翻页都走后端**：chip 映射成 `isExternal` 查询参数，页码映射成 `pageNum`，
+ * 由 `useSiteList` 的响应式 query 触发重取。原先是「一次拿 50 条、前端 CSS 隐藏、
+ * 无分页」——条目一超过 50 就会静默截断，且 chip 点了不产生任何请求。
+ *
+ * 注意：**不在前端二次排序**，照接口返回顺序渲染（排序含 NULLS LAST 处理，在 DAO 侧）。
  *
  * 文件位置说明：原为 `pages/news.vue`，因新增详情页 `pages/news/[id].vue` 而迁到
  * `pages/news/index.vue` —— Nuxt 下 `news.vue` 与 `news/` 目录并存时，前者会被当作
@@ -35,8 +36,38 @@ useHead({
   meta: [{ name: 'description', content: t('news._desc') }],
 })
 
-const { data: res } = await useSiteList<NewsRow>('/news', { pageNum: 1, pageSize: 50 }, 'news-page')
+const PAGE_SIZE = 10
+
+type Cat = 'all' | 'team' | 'field'
+
+const activeCat = ref<Cat>('all')
+const pageNum = ref(1)
+
+/**
+ * chip → 接口参数。「领域新闻」在数据上就是外链条目（is_external='1'），
+ * 「ACTION 小组动态」是站内条目（'0'），后端 DAO 按这个字段过滤。
+ * `all` 时不传该参数，而不是传空串——传空串会被 pydantic 收成 `''` 并进入 where。
+ */
+const CAT_PARAM: Record<Cat, string | undefined> = { all: undefined, team: '0', field: '1' }
+
+/** computed 交给 useSiteList 即为响应式：改筛选或页码就会重新打接口 */
+const query = computed(() => {
+  const isExternal = CAT_PARAM[activeCat.value]
+
+  return {
+    pageNum: pageNum.value,
+    pageSize: PAGE_SIZE,
+    ...(isExternal === undefined ? {} : { isExternal }),
+  }
+})
+
+// swr：同首页，列表要跟着后台的发布走，不能是构建期快照
+const { data: res, status, error, refresh } = await useSiteList<NewsRow>('/news', query, 'news-page', { swr: true })
 const rows = computed<NewsRow[]>(() => res.value?.rows ?? [])
+const total = computed(() => res.value?.total ?? 0)
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
+const isPending = computed(() => status.value === 'pending')
+const hasError = computed(() => Boolean(error.value))
 
 /** 领域新闻（外链）归 field，团队动态归 team —— 与原页面的 data-cat 取值一致 */
 const catOf = (r: NewsRow) => (r.isExternal === '1' ? 'field' : 'team')
@@ -50,19 +81,48 @@ const hrefOf = (r: NewsRow) => r.linkUrl || `/news/${r.newsId}`
 /** 只有「标记为外链**且**确有链接」才开新窗口；缺链接时走的是站内详情，不能开新窗 */
 const opensNewTab = (r: NewsRow) => r.isExternal === '1' && !!r.linkUrl
 
-const activeCat = ref<'all' | 'team' | 'field'>('all')
+/** 换筛选必须回到第 1 页：停在第 3 页再切分类，新结果可能根本没有第 3 页 */
+const selectCat = (c: Cat) => {
+  if (activeCat.value === c) return
+  activeCat.value = c
+  pageNum.value = 1
+}
+
+const goPage = (p: number) => {
+  const next = Math.min(Math.max(1, p), totalPages.value)
+  if (next === pageNum.value) return
+  pageNum.value = next
+}
+
 /**
- * 筛选用 CSS 隐藏而**不卸载节点** —— 与原 news.html 的 classList.toggle('hide') 一致。
- * 若用 v-for 过滤，切回来的是全新 DOM：它不带 .is-visible，而 useReveal() 的
- * IntersectionObserver 只在 onMounted 建立一次，永远不会观察这些新节点，
- * 于是它们停在 `.reveal{opacity:0}` 上永久不可见。
+ * 页码窗口：总页数少就全列，多了只显示当前页左右各 2 个。
+ * 不做 `…` 省略号占位，这个站的新闻量级用不上。
  */
-const isHidden = (r: NewsRow) => activeCat.value !== 'all' && catOf(r) !== activeCat.value
+const pageItems = computed(() => {
+  const last = totalPages.value
+  const cur = pageNum.value
+  const start = Math.max(1, Math.min(cur - 2, last - 4))
+  const end = Math.min(last, Math.max(cur + 2, 5))
+
+  return Array.from({ length: end - start + 1 }, (_, i) => start + i)
+})
 
 /** `2026-07-01` → `2026-07`；原页面 <time> 精度到年月 */
 const ym = (d: string | null) => (d ? d.slice(0, 7) : '')
 
-useReveal()
+const { rescan } = useReveal()
+
+/**
+ * 列表换内容后要重新登记揭示动画：新行是全新 DOM，不带 .is-visible，
+ * 而观察者只在 onMounted 建过一次。不调 rescan 就会「行数对但一片空白」。
+ */
+watch(rows, () => void rescan())
+
+/** 翻页后把视线拉回列表顶部，否则点了「下一页」还停在旧页脚位置 */
+watch(pageNum, async () => {
+  await nextTick()
+  document.getElementById('nlist')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+})
 </script>
 
 <template>
@@ -78,18 +138,30 @@ useReveal()
         </div>
 
         <div class="filt reveal" id="filter" role="group" aria-label="按标签筛选新闻">
-          <button type="button" class="fchip" :class="{ on: activeCat === 'all' }" :aria-pressed="activeCat === 'all'" data-cat="all" @click="activeCat = 'all'">{{ t('news.s004') }}</button>
-          <button type="button" class="fchip" :class="{ on: activeCat === 'team' }" :aria-pressed="activeCat === 'team'" data-cat="team" @click="activeCat = 'team'">{{ t('news.s005') }}</button>
-          <button type="button" class="fchip" :class="{ on: activeCat === 'field' }" :aria-pressed="activeCat === 'field'" data-cat="field" @click="activeCat = 'field'">{{ t('news.s006') }}</button>
+          <button type="button" class="fchip" :class="{ on: activeCat === 'all' }" :aria-pressed="activeCat === 'all'" data-cat="all" @click="selectCat('all')">{{ t('news.s004') }}</button>
+          <button type="button" class="fchip" :class="{ on: activeCat === 'team' }" :aria-pressed="activeCat === 'team'" data-cat="team" @click="selectCat('team')">{{ t('news.s005') }}</button>
+          <button type="button" class="fchip" :class="{ on: activeCat === 'field' }" :aria-pressed="activeCat === 'field'" data-cat="field" @click="selectCat('field')">{{ t('news.s006') }}</button>
+          <span v-if="!hasError && total" class="fcount">{{ t('news.count', { n: total }) }}</span>
         </div>
 
-        <div class="nlist" id="nlist">
+        <!-- 取数失败单独成态：不能让空列表冒充「没有内容」 -->
+        <div v-if="hasError" class="nstate nstate-err" role="alert">
+          <p>{{ t('news.loadError') }}</p>
+          <button type="button" class="fchip" @click="refresh()">{{ t('news.retry') }}</button>
+        </div>
+
+        <div v-else-if="!rows.length" class="nstate">
+          <p>{{ isPending ? t('news.loading') : t('news.empty') }}</p>
+        </div>
+
+        <!-- 重取期间保留旧行、只做降权，不清空：避免筛选/翻页时闪一次空框 -->
+        <div v-else class="nlist" id="nlist" :class="{ busy: isPending }" :aria-busy="isPending">
           <NuxtLink
             v-for="r in rows"
             :key="r.newsId"
             :to="hrefOf(r)"
             class="nrow reveal"
-            :class="[catOf(r), { hide: isHidden(r) }]"
+            :class="catOf(r)"
             :data-cat="catOf(r)"
             :target="opensNewTab(r) ? '_blank' : undefined"
             :rel="opensNewTab(r) ? 'noopener noreferrer' : undefined"
@@ -120,6 +192,32 @@ useReveal()
             <span v-if="opensNewTab(r)" class="vh">{{ t('news.s019') }}</span>
           </NuxtLink>
         </div>
+
+        <nav v-if="!hasError && totalPages > 1" class="pager" :aria-label="t('news.pagerAria')">
+          <button
+            type="button" class="pbtn"
+            :disabled="pageNum <= 1"
+            @click="goPage(pageNum - 1)"
+          >{{ t('news.prevPage') }}</button>
+
+          <button
+            v-for="p in pageItems"
+            :key="p"
+            type="button"
+            class="pbtn pnum"
+            :class="{ on: p === pageNum }"
+            :aria-current="p === pageNum ? 'page' : undefined"
+            @click="goPage(p)"
+          >{{ p }}</button>
+
+          <button
+            type="button" class="pbtn"
+            :disabled="pageNum >= totalPages"
+            @click="goPage(pageNum + 1)"
+          >{{ t('news.nextPage') }}</button>
+
+          <span class="vh" aria-live="polite">{{ t('news.pageOf', { cur: pageNum, all: totalPages }) }}</span>
+        </nav>
       </div>
     </section>
   </div>
@@ -152,7 +250,19 @@ useReveal()
 .page-news .fchip{font-family:inherit;font-size:13.5px;font-weight:600;color:var(--indigo-700);background:var(--surface);border:1.5px solid var(--line);padding:8px 16px;border-radius:999px;cursor:pointer;transition:.2s var(--ease)}
 .page-news .fchip:hover{border-color:var(--indigo-300);background:var(--indigo-100)}
 .page-news .fchip.on{background:var(--indigo-700);border-color:var(--indigo-700);color:#fff}
-.page-news .nrow.hide{display:none}
+.page-news .fcount{margin-left:auto;align-self:center;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums}
+.page-news .nstate{border:1px solid var(--line);border-radius:var(--radius-lg);background:var(--surface);padding:clamp(32px,5vw,56px) 24px;text-align:center;color:var(--muted);font-size:14.5px}
+.page-news .nstate-err{color:var(--cinnabar-d)}
+.page-news .nstate .fchip{margin-top:16px}
+/* 重取期间保留旧列表、只做视觉降权，比闪成骨架屏稳定 */
+.page-news .nlist.busy{opacity:.55;transition:opacity .18s var(--ease);pointer-events:none}
+.page-news #nlist{scroll-margin-top:120px}
+.page-news .pager{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:clamp(20px,3vw,28px);justify-content:center}
+.page-news .pbtn{font-family:inherit;font-size:13.5px;font-weight:600;color:var(--indigo-700);background:var(--surface);border:1.5px solid var(--line);padding:8px 15px;border-radius:999px;cursor:pointer;transition:.2s var(--ease)}
+.page-news .pbtn:hover:not(:disabled){border-color:var(--indigo-300);background:var(--indigo-100)}
+.page-news .pbtn:disabled{opacity:.4;cursor:default}
+.page-news .pbtn.pnum{min-width:38px;padding:8px 10px;font-variant-numeric:tabular-nums}
+.page-news .pbtn.on{background:var(--indigo-700);border-color:var(--indigo-700);color:#fff}
 .page-news .nrow.field .nthumb{object-fit:contain;padding:16px;background:var(--surface);border:1px solid var(--line)}
 .page-news .src{font-size:12px;font-weight:700;border-radius:6px;padding:3px 10px;white-space:nowrap}
 .page-news .src.team{color:var(--indigo-600);background:var(--indigo-100)}

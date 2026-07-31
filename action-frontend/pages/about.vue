@@ -11,12 +11,79 @@ useHead({
 })
 
 useReveal()
+
+/**
+ * 子栏目 Tab —— 迁移自 about.html 内联脚本。
+ * 五段内容同时在 DOM 里，只显示当前一段；顺序即子导航顺序。
+ */
+const TABS = ['about', 'mission', 'support', 'contact', 'legal'] as const
+type Tab = (typeof TABS)[number]
+
+const isTab = (v: string): v is Tab => (TABS as readonly string[]).includes(v)
+
+/** SSR 预渲染时固定输出第一段，与原站首屏一致；带 hash 进来的情况在 onMounted 里纠正 */
+const activeTab = ref<Tab>('about')
+
+/**
+ * 切过来的这段是从 display:none 变可见的，IntersectionObserver 虽然也会补触发，
+ * 但那样内容会先空一帧再淡入。原站是直接落位，这里保持同样的即时感。
+ */
+function revealNow(id: Tab) {
+  for (const el of document.getElementById(id)?.querySelectorAll('.reveal') ?? [])
+    el.classList.add('is-visible')
+}
+
+function goTab(id: Tab) {
+  activeTab.value = id
+  // 不走 router.replace：no_prefix 策略下 Nuxt 的 scrollBehavior 会按 hash 再跳一次，
+  // 与下面的 scrollIntoView 打架。原生 replaceState 保留 history.state，路由状态不丢。
+  window.history.replaceState(window.history.state, '', `#${id}`)
+  nextTick(() => {
+    revealNow(id)
+    document.getElementById('about-subnav')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+}
+
+onMounted(() => {
+  const hash = window.location.hash.slice(1)
+  if (!isTab(hash) || hash === activeTab.value) return
+  // 深链进来只切换、不滚动 —— 子导航本身已在首屏
+  activeTab.value = hash
+  nextTick(() => revealNow(hash))
+})
 </script>
 
 <template>
   <div class="page-about">
+    <section class="phero">
+      <img class="phero-bg" src="/assets/hero-about.png" alt="" aria-hidden="true" width="1600" height="900">
+      <div class="wrap">
+        <nav class="crumb reveal" :aria-label="t('about.hero.crumbAria')">
+          <NuxtLink to="/">{{ t('about.hero.crumbHome') }}</NuxtLink>
+          <span class="sep" aria-hidden="true">/</span>
+          <b>{{ t('about.hero.crumbCurrent') }}</b>
+        </nav>
+        <span class="phero-tag reveal"><span class="dot" aria-hidden="true"></span><span>{{ t('about.hero.tag') }}</span></span>
+        <h1 class="reveal" v-html="t('about.hero.title')"></h1>
+        <p class="psub reveal">{{ t('about.hero.sub') }}</p>
+      </div>
+    </section>
+
+    <nav class="subnav" id="about-subnav" :aria-label="t('about.tabsAria')">
+      <div class="wrap subnav-in">
+        <a
+          v-for="tab in TABS"
+          :key="tab"
+          :href="`#${tab}`"
+          :class="{ active: activeTab === tab }"
+          :aria-current="activeTab === tab ? 'true' : undefined"
+          @click.prevent="goTab(tab)"
+        >{{ t(`about.tabs.${tab}`) }}</a>
+      </div>
+    </nav>
+
     <!-- ===================== ① 关于我们 ===================== -->
-    <section class="sec" id="about">
+    <section class="sec" id="about" :class="{ 'is-hidden': activeTab !== 'about' }">
       <div class="wrap">
         <div class="p-intro">
           <span class="kicker reveal">{{ t('about.s001') }}</span>
@@ -55,7 +122,7 @@ useReveal()
       </div>
     </section>
     <!-- ===================== ② 使命与愿景 ===================== -->
-    <section class="sec is-hidden" id="mission">
+    <section class="sec" id="mission" :class="{ 'is-hidden': activeTab !== 'mission' }">
       <div class="wrap">
         <div class="p-intro">
           <span class="kicker reveal">{{ t('about.s037') }}</span>
@@ -77,7 +144,7 @@ useReveal()
     </section>
 
     <!-- ===================== ③ 支持 ACTION ===================== -->
-    <section class="sec is-hidden" id="support">
+    <section class="sec" id="support" :class="{ 'is-hidden': activeTab !== 'support' }">
       <div class="wrap">
         <div class="p-intro">
           <span class="kicker reveal">{{ t('about.s045') }}</span>
@@ -98,7 +165,7 @@ useReveal()
     </section>
 
     <!-- ===================== ④ 联系我们 ===================== -->
-    <section class="sec is-hidden" id="contact">
+    <section class="sec" id="contact" :class="{ 'is-hidden': activeTab !== 'contact' }">
       <div class="wrap">
         <div class="p-intro">
           <span class="kicker reveal">{{ t('about.s059') }}</span>
@@ -125,7 +192,7 @@ useReveal()
     </section>
 
     <!-- ===================== ⑤ 声明与条款 ===================== -->
-    <section class="sec is-hidden" id="legal">
+    <section class="sec" id="legal" :class="{ 'is-hidden': activeTab !== 'legal' }">
       <div class="wrap">
         <div class="p-intro">
           <span class="kicker reveal">{{ t('about.s072') }}</span>
@@ -178,12 +245,22 @@ useReveal()
 .page-about .subh{font-size:12.5px;font-weight:700;color:var(--indigo-900);text-transform:uppercase;letter-spacing:.03em;margin:clamp(30px,4vw,44px) 0 16px;font-family:"Source Sans 3","Noto Sans SC",sans-serif}
 .page-about .subh:first-child{margin-top:0}
 .page-about .btn{display:inline-flex;align-items:center;justify-content:center;gap:9px;padding:13px 24px;border-radius:999px;font-weight:600;font-size:15px;border:1.5px solid transparent;cursor:pointer;white-space:nowrap;transition:transform .25s var(--ease),background-color .25s var(--ease),box-shadow .25s var(--ease),border-color .25s var(--ease)}
-.page-about .phero::before{content:"";position:absolute;inset:0;z-index:-1;background:radial-gradient(1000px 560px at 90% 0%,rgba(44,127,114,.5),transparent 60%),radial-gradient(680px 460px at 2% 100%,rgba(24,48,41,.7),transparent 65%),linear-gradient(160deg,#0d1a17 0%,#12211d 44%,#183029 100%)}
+/* 浅色 Hero（甲方定稿的天青主题）。base.css 里的浅色覆盖是无命名空间的 `.phero::before`，
+   会输给这里的 `.page-about .phero::before`，所以渐变本身必须写成浅色版——否则深底叠上
+   base.css 给的深色字。面包屑 / 标签 / 副标题同理，一并按浅底取色。 */
+.page-about .phero::before{content:"";position:absolute;inset:0;z-index:-1;background:
+  radial-gradient(1000px 560px at 88% -6%,rgba(87,190,174,.30),transparent 62%),
+  radial-gradient(660px 460px at 0% 108%,rgba(207,70,53,.10),transparent 66%),
+  linear-gradient(162deg,#e9f3ee 0%,#f2f6f2 46%,#f6efe4 108%)}
 .page-about .phero .wrap{padding:clamp(28px,3.6vw,42px) clamp(20px,4vw,44px) clamp(40px,5vw,56px)}
-.page-about .crumb{display:flex;align-items:center;gap:9px;font-size:13.5px;color:rgba(233,238,247,.66);margin-bottom:22px;flex-wrap:wrap}
-.page-about .phero-tag{display:inline-flex;align-items:center;gap:10px;font-size:13px;font-weight:600;letter-spacing:.02em;color:var(--indigo-200);background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.16);padding:8px 16px;border-radius:999px;backdrop-filter:blur(4px)}
+.page-about .crumb{display:flex;align-items:center;gap:9px;font-size:13.5px;color:var(--muted);margin-bottom:22px;flex-wrap:wrap}
+.page-about .crumb a{color:var(--indigo-700)}
+.page-about .crumb a:hover{color:var(--cinnabar)}
+.page-about .crumb .sep{color:var(--indigo-300)}
+.page-about .crumb b{color:var(--indigo-900)}
+.page-about .phero-tag{display:inline-flex;align-items:center;gap:10px;font-size:13px;font-weight:600;letter-spacing:.02em;color:var(--indigo-700);background:rgba(255,255,255,.75);border:1px solid var(--line);padding:8px 16px;border-radius:999px;backdrop-filter:blur(4px)}
 .page-about .phero h1{font-size:clamp(1.9rem,3.9vw,3rem);font-weight:700;letter-spacing:-.025em;margin:18px 0 0;text-wrap:balance;line-height:1.14}
-.page-about .phero .psub{margin-top:18px;font-size:clamp(1rem,1.4vw,1.16rem);color:rgba(233,238,247,.9);max-width:64ch;line-height:1.7;text-wrap:pretty}
+.page-about .phero .psub{margin-top:18px;font-size:clamp(1rem,1.4vw,1.16rem);color:var(--muted);max-width:64ch;line-height:1.7;text-wrap:pretty}
 .page-about .subnav{position:sticky;top:72px;z-index:var(--z-subnav);background:rgba(242,246,244,.9);backdrop-filter:blur(12px) saturate(1.3);border-bottom:1px solid var(--line)}
 .page-about .subnav-in{display:flex;align-items:center;gap:2px;overflow-x:auto;scrollbar-width:none}
 .page-about .subnav-in::-webkit-scrollbar{display:none}

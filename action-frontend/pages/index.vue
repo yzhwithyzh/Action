@@ -26,8 +26,10 @@ interface HomeNewsRow {
 
 const { pick } = useBilingual()
 
-// 首页新闻区与 /news 同源，只取前 3 条。顺序照接口返回（W21 的排序问题在 DAO 侧修）。
-const { data: newsRes } = await useSiteList<HomeNewsRow>('/news', { pageNum: 1, pageSize: 3 }, 'home-news')
+// 首页新闻区与 /news 同源，只取前 3 条。顺序照接口返回，不在前端二次排序
+// （DAO 已按 置顶 > 发布日期倒序 NULLS LAST > id 倒序 排好）。
+// swr：新闻由后台随时发布，不能停在构建期那一刻的快照上。
+const { data: newsRes } = await useSiteList<HomeNewsRow>('/news', { pageNum: 1, pageSize: 3 }, 'home-news', { swr: true })
 const newsRows = computed<HomeNewsRow[]>(() => newsRes.value?.rows ?? [])
 
 /** `2026-07-01` → `2026-07` */
@@ -60,9 +62,9 @@ useReveal()
               <span>{{ t('index.s008') }}</span>
             </div>
           </div>
-          <!-- 工具预览：智能报告辅助工具第一步「立项匹配」界面预览 -->
+          <!-- 工具预览：报告助手第一步「立项匹配」界面预览 -->
           <div class="tp-shell reveal">
-            <div class="tp" role="img" aria-label="智能报告辅助工具界面预览：选择研究类型为随机对照试验，自动挂载 CONSORT、STRICTA、SPIRIT 规范，逐条校验报告完整性清单，当前完整性 82%。">
+            <div class="tp" role="img" aria-label="报告助手界面预览：选择研究类型为随机对照试验，自动挂载 CONSORT、STRICTA、SPIRIT 规范，逐条校验报告完整性清单，当前完整性 82%。">
               <div class="tp-chrome" aria-hidden="true">
                 <span class="tp-dots"><i></i><i></i><i></i></span>
                 <span class="tp-title">{{ t('index.s009') }}</span>
@@ -117,7 +119,7 @@ useReveal()
             <span class="mod-go" v-html="t('index.s025')"></span>
           </NuxtLink>
 
-          <!-- 模块 2：智能报告辅助工具（核心） -->
+          <!-- 模块 2：报告助手（核心） -->
           <NuxtLink class="mod-card feat reveal" to="/assistant">
             <span class="mod-badge">{{ t('index.s026') }}</span>
             <svg class="mod-ic" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="7" y="9" width="34" height="30" rx="3" /><path d="M7 17h34M14 25h9M14 31h14" /><circle cx="31" cy="28" r="5" /><path d="M34.5 31.5 38 35" /></svg>

@@ -10,6 +10,28 @@ header{position:sticky;top:0;z-index:var(--z-sticky,100);background:rgba(242,246
   .menu a:hover{color:var(--indigo-900)}
   .menu a:hover::after,.menu a.cur::after{transform:scaleX(1)}
   .menu a.cur{color:var(--indigo-900);font-weight:600}
+  /* 顶栏下拉分组（智能工具）。按钮沿用 .menu a 的字号/颜色/朱砂下划线，
+     面板是白底卡片，每项「标题 + 一行说明」——光有名字用户猜不出 SRD 是干嘛的。 */
+  /* align-items:stretch + line-height:inherit：按钮盒子必须和相邻 .menu a 等高等基线，
+     否则按钮（默认 line-height:normal）会矮一截，::after 下划线跟着浮高，与「协作」错位 */
+  .menu-grp{position:relative;display:flex;align-items:stretch}
+  .grp-btn{display:inline-flex;align-items:center;gap:5px;font-family:inherit;font-size:15px;font-weight:500;line-height:inherit;color:var(--indigo-700);background:transparent;border:0;padding:4px 0;cursor:pointer;position:relative;white-space:nowrap;transition:color .2s}
+  .grp-btn::after{content:"";position:absolute;left:0;right:15px;bottom:-2px;height:2px;background:var(--cinnabar);transform:scaleX(0);transform-origin:left;transition:transform .3s var(--ease)}
+  .grp-btn:hover{color:var(--indigo-900)}
+  .menu-grp:hover .grp-btn::after,.grp-btn.cur::after{transform:scaleX(1)}
+  .grp-btn.cur{color:var(--indigo-900);font-weight:600}
+  .grp-btn svg{width:12px;height:12px;opacity:.55;transition:transform .3s var(--ease)}
+  .menu-grp.open .grp-btn svg{transform:rotate(180deg)}
+  .grp-panel{position:absolute;top:calc(100% + 16px);left:-14px;width:316px;z-index:var(--z-dropdown,200);background:var(--surface,#fff);border:1px solid var(--line);border-radius:var(--radius-lg,20px);box-shadow:var(--shadow-md);padding:8px;opacity:0;visibility:hidden;transform:translateY(-8px);transition:opacity .24s var(--ease),transform .24s var(--ease),visibility .24s}
+  /* 按钮与面板之间有 16px 空隙，补一条透明桥，鼠标移过去时不会中断 hover */
+  .grp-panel::before{content:"";position:absolute;top:-18px;left:0;right:0;height:18px}
+  .menu-grp.open .grp-panel{opacity:1;visibility:visible;transform:none}
+  .grp-panel a{display:block;padding:11px 13px;border-radius:var(--radius,12px);transition:background .2s}
+  .grp-panel a:hover{background:var(--indigo-100)}
+  .grp-panel a.cur{background:var(--indigo-100);box-shadow:inset 2px 0 0 var(--cinnabar)}
+  .gi-t{display:block;font-size:15px;font-weight:600;color:var(--indigo-900);margin-bottom:3px}
+  .gi-d{display:block;font-size:13px;line-height:1.45;color:var(--muted)}
+  @media(prefers-reduced-motion:reduce){.grp-panel,.grp-btn svg{transition-duration:.01ms}}
   .nav-actions{display:flex;align-items:center;gap:14px}
   .lang{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;font-weight:600;color:var(--indigo-700);background:transparent;border:1.5px solid var(--line);border-radius:999px;padding:9px 15px;min-height:42px;cursor:pointer;transition:border-color .2s,background .2s}
   .lang:hover{border-color:var(--indigo-500);background:var(--indigo-100)}
@@ -48,6 +70,11 @@ header{position:sticky;top:0;z-index:var(--z-sticky,100);background:rgba(242,246
     .menu-open .burger span:nth-child(2){opacity:0}
     .menu-open .burger span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
     .mobile-menu a{display:block;font-family:"Spectral","Noto Serif SC",serif;font-size:1.4rem;color:var(--indigo-900);padding:16px 0;border-bottom:1px solid var(--line)}
+    .mobile-menu .mm-grp{padding:16px 0 10px;border-bottom:1px solid var(--line)}
+    .mobile-menu .mm-lbl{display:block;font-family:"Spectral","Noto Serif SC",serif;font-size:1.4rem;color:var(--indigo-900)}
+    .mobile-menu .mm-sub{margin-top:8px;padding-left:15px;border-left:2px solid var(--indigo-200)}
+    .mobile-menu .mm-sub a{font-family:inherit;font-size:1rem;font-weight:500;color:var(--indigo-700);padding:10px 0;border-bottom:0}
+    .mobile-menu .mm-sub a.cur{color:var(--cinnabar)}
     .mobile-menu .mm-user{display:block;font-size:13.5px;font-weight:600;color:var(--muted);padding:20px 0 0}
     .mobile-menu .mm-auth{display:block;width:100%;text-align:left;font-family:"Spectral","Noto Serif SC",serif;font-size:1.4rem;color:var(--indigo-900);padding:16px 0;border:0;border-bottom:1px solid var(--line);background:transparent;cursor:pointer}
   }

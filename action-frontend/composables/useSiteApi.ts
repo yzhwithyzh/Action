@@ -10,6 +10,8 @@
  * 由 `nuxt.config.ts` 的 routeRules 代理到后端；生产走 Nginx 等价配置。
  */
 
+import type { MaybeRefOrGetter } from 'vue'
+
 /** 接口信封 */
 interface Envelope<T> {
   code: number
@@ -17,6 +19,45 @@ interface Envelope<T> {
   rows?: T
   data?: T
   total?: number
+  pageNum?: number
+  pageSize?: number
+  hasNext?: boolean
+}
+
+/** 取数选项 */
+interface SiteFetchOptions {
+  /**
+   * 开启「先展示快照、后台再取一次」（stale-while-revalidate）。
+   *
+   * 站点是 `nitro.preset: 'static'`，数据在 **构建期** 就烤进 HTML，之后不会自己变。
+   * 对后台可随时增删的内容（新闻/动态），不开这个开关就意味着：后台发了新稿，
+   * 官网要等下一次 `npm run generate` 才看得见。开了之后首屏仍是预渲染的静态 HTML
+   * （SEO 与首屏速度不变），hydration 后再跟后端对一次，有变化就换掉。
+   *
+   * 对几乎不变的内容（报告规范库、CFIR/ERIC/RE-AIM 词条）不要开：多一个请求没有收益。
+   */
+  swr?: boolean
+}
+
+/**
+ * 客户端侧的重取策略，两件事：
+ *
+ *  1. `swr` 打开时，每次组件挂载都重取一次 —— 覆盖首屏 hydration 和后续路由切换。
+ *     路由切换时 Nuxt 会命中 payload extraction 的 `nuxtApp.static.data` 直接复用构建期
+ *     快照、根本不发请求，所以这里必须显式 refresh，不能指望「切走再回来」自己刷新。
+ *  2. **无论开没开 `swr`**，只要构建期那次取数是失败的（payload 里带 `_errors`），
+ *     就在客户端补一次。历史上出过一次：`npm run generate` 时后端没起来，
+ *     5 个页面把 502 烤进了静态产物，线上首屏直接开天窗。这层兜底让它自愈。
+ *
+ * 用 `onMounted` 而不是在 setup 里直接调，是为了不破坏 SSR/预渲染那次取数；
+ * `refresh()` 在新响应回来前会保留旧 `data`，所以不会闪空。
+ */
+function useClientRevalidate(result: { refresh: () => Promise<void>; error: { value: unknown } }, swr: boolean) {
+  if (!import.meta.client || !getCurrentInstance()) return
+
+  onMounted(() => {
+    if (swr || result.error.value) void result.refresh()
+  })
 }
 
 function buildUrl(apiBase: string, path: string): string {
@@ -51,14 +92,28 @@ function stripInternal<T>(value: T): T {
  * 取分页列表接口（出参在 `rows` 里）。
  *
  * @param path `/action/site` 之后的路径，如 `/news`
- * @param query 查询参数，如 `{ pageNum: 1, pageSize: 50 }`
+ * @param query 查询参数。**传 computed / getter 即为响应式**：值一变就自动重取，
+ *   分页与筛选就是靠这个走后端的（见 `pages/news/index.vue`）。传普通对象则等同于固定参数。
  * @param key useFetch 的缓存键，同一页面多次取数时须各自唯一
+ * @param opts `{ swr: true }` 表示这块内容后台可随时变，见 `SiteFetchOptions`
  */
-export function useSiteList<T>(path: string, query: Record<string, unknown> = {}, key?: string) {
+export function useSiteList<T>(
+  path: string,
+  query: MaybeRefOrGetter<Record<string, unknown>> = {},
+  key?: string,
+  opts: SiteFetchOptions = {},
+) {
   const { public: { apiBase } } = useRuntimeConfig()
 
-  return useFetch<Envelope<T[]>>(() => buildUrl(apiBase, path), {
-    query,
+  /**
+   * 归一成 computed 再交给 useFetch —— useFetch 内部把 options 塞进 `reactive()` 深度侦听，
+   * ref/computed 会被解包并跟踪，但**普通函数 getter 不会**。这里统一包一层，
+   * 调用方传对象、ref 还是 getter 都能正确触发重取。
+   */
+  const queryRef = computed(() => toValue(query))
+
+  const result = useFetch<Envelope<T[]>>(() => buildUrl(apiBase, path), {
+    query: queryRef,
     key: key ?? `site-list:${path}`,
     // 失败不抛：交给下面的 transform / default 兜住，页面只会少一块内容
     transform: (res): Envelope<T[]> => stripInternal(res),
@@ -67,15 +122,19 @@ export function useSiteList<T>(path: string, query: Record<string, unknown> = {}
       console.error(`[useSiteList] ${path} 取数失败`, response?.status, response?._data)
     },
   })
+
+  useClientRevalidate(result, opts.swr === true)
+
+  return result
 }
 
 /**
  * 取单体/树形接口（出参在 `data` 里）。
  */
-export function useSiteObject<T>(path: string, key?: string) {
+export function useSiteObject<T>(path: string, key?: string, opts: SiteFetchOptions = {}) {
   const { public: { apiBase } } = useRuntimeConfig()
 
-  return useFetch<Envelope<T>>(() => buildUrl(apiBase, path), {
+  const result = useFetch<Envelope<T>>(() => buildUrl(apiBase, path), {
     key: key ?? `site-object:${path}`,
     transform: (res): Envelope<T> => stripInternal(res),
     default: (): Envelope<T> => ({ code: 0 }),
@@ -83,6 +142,10 @@ export function useSiteObject<T>(path: string, key?: string) {
       console.error(`[useSiteObject] ${path} 取数失败`, response?.status, response?._data)
     },
   })
+
+  useClientRevalidate(result, opts.swr === true)
+
+  return result
 }
 
 /**

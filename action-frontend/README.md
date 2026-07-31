@@ -66,3 +66,37 @@ npm run preview    # 本地预览构建产物
 
 开发期 `nuxt.config.ts` 的 `routeRules` 把 `/dev-api/**` 代理到 `http://127.0.0.1:9098/**`。
 生产部署需在 Nginx 等反向代理上做等价配置。
+
+> `apiBase` 在静态构建时就被写死进产物（`runtimeConfig.public` 对 SSG 而言是构建期常量），
+> 线上运行时改 `NUXT_PUBLIC_API_BASE` **不生效**，要改只能重新构建。
+
+## 取数与构建期数据（务必先读）
+
+`nitro.preset: 'static'` + `ssr: true` 意味着：**页面里 `useSiteList` / `useSiteObject` 的结果，
+是在 `npm run generate` 那一刻烤进 HTML 的。**由此有两条硬约束：
+
+**1. 构建时后端必须可达。** 否则代理返回 502，`useSiteApi` 的 `default` 把它兜成空数组，
+构建照样"成功"，但产物是空壳——曾经发生过一次，`/`、`/news`、`/guidelines`、`/assistant`、
+`/implementation` 五个页面把 502 连同错误信息一起写进了线上 HTML。构建前先确认：
+
+```bash
+curl "http://127.0.0.1:9098/action/site/news?pageNum=1&pageSize=3"   # 期望 200 且 rows 非空
+```
+
+构建后可自查产物里有没有把错误烤进去：
+
+```bash
+grep -l "Bad Gateway" .output/public/**/*.html   # 应无输出
+```
+
+**2. 会变的内容要开 `{ swr: true }`。** 不开的话，后台发了新闻，官网要等下次构建才看得见。
+开了之后首屏依然是预渲染的静态 HTML（SEO 与首屏速度不受影响），hydration 后再跟后端对一次，
+有变化就换掉。当前开着的是新闻三处（首页动态 / `/news` 列表 / `/news/[id]` 详情）；
+规范库、CFIR/ERIC/RE-AIM 这类几乎不变的内容故意不开。
+
+`{ swr: true }` 不是万能：搜索引擎和分享卡片只看首屏 HTML，仍是构建期快照。
+要做到"后台一发布、爬虫立刻可见"，得改 `preset: 'node-server'` 实时 SSR，或给发布动作挂重建钩子。
+
+**3. `/news/[id]` 详情页靠爬取生成。** `crawlLinks` 从 `/news` 列表页的 `<NuxtLink>` 发现它们，
+而只有**没配 `linkUrl`** 的条目才会指向站内详情页。构建后新增的这类新闻不会有对应的静态文件，
+需要 Nginx 把未命中的路径回落到 `200.html`（SPA fallback），交给客户端渲染。
