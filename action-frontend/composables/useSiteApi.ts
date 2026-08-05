@@ -37,6 +37,8 @@ interface SiteFetchOptions {
    * 对几乎不变的内容（报告规范库、CFIR/ERIC/RE-AIM 词条）不要开：多一个请求没有收益。
    */
   swr?: boolean
+  /** 查询参数（仅 `useSiteObject` 用；`useSiteList` 有独立的 query 形参） */
+  query?: MaybeRefOrGetter<Record<string, unknown>>
 }
 
 /**
@@ -130,11 +132,16 @@ export function useSiteList<T>(
 
 /**
  * 取单体/树形接口（出参在 `data` 里）。
+ *
+ * `opts.query` 用于出参在 `data`、但需要按参数取的接口（如报告助手按规范代号取 checklist 条目）。
+ * 与 `useSiteList` 的 `query` 同样支持 ref/getter，变化即重取。
  */
 export function useSiteObject<T>(path: string, key?: string, opts: SiteFetchOptions = {}) {
   const { public: { apiBase } } = useRuntimeConfig()
+  const queryRef = computed(() => (opts.query ? toValue(opts.query) : undefined))
 
   const result = useFetch<Envelope<T>>(() => buildUrl(apiBase, path), {
+    query: queryRef,
     key: key ?? `site-object:${path}`,
     transform: (res): Envelope<T> => stripInternal(res),
     default: (): Envelope<T> => ({ code: 0 }),

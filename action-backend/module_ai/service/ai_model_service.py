@@ -9,6 +9,7 @@ from module_ai.dao.ai_model_dao import AiModelDao
 from module_ai.entity.vo.ai_model_vo import AiModelModel, AiModelPageQueryModel, DeleteAiModelModel
 from utils.common_util import CamelCaseUtil
 from utils.crypto_util import CryptoUtil
+from utils.log_util import logger
 
 
 class AiModelService:
@@ -41,6 +42,40 @@ class AiModelService:
                 row['apiKey'] = '********' * 3
 
         return ai_model_list_result
+
+    @classmethod
+    async def get_usable_ai_model_pool_services(
+        cls,
+        query_db: AsyncSession,
+        model_ids: list[int] | None = None,
+        model_types: list[str] | None = None,
+    ) -> list[AiModelModel]:
+        """
+        获取可用模型池service，api_key已解密，按显示顺序排列
+
+        供AI对话、长耗时worker等需要真正发起模型调用的场景使用：调用方按顺序轮询，
+        某个模型限流/欠费/鉴权失败时切换到下一个。解密失败的模型会被跳过（配置损坏不该拖垮整个池子）
+
+        警告：返回值带明文API Key，只能在服务端内部使用，绝不能直接返回给前端
+
+        :param query_db: orm对象
+        :param model_ids: 可选，只取这些模型主键
+        :param model_types: 可选，只取这些模型类型
+        :return: 可用AI模型列表
+        """
+        ai_models = await AiModelDao.get_usable_ai_model_list(query_db, model_ids, model_types)
+
+        pool = []
+        for ai_model in ai_models:
+            result = AiModelModel(**CamelCaseUtil.transform_result(ai_model))
+            try:
+                result.api_key = CryptoUtil.decrypt(result.api_key)
+            except Exception:
+                logger.warning('AI模型[%s]的API Key解密失败，已跳过', result.model_id)
+                continue
+            pool.append(result)
+
+        return pool
 
     @classmethod
     async def check_ai_model_data_scope_services(

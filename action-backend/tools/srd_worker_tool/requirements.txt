@@ -1,0 +1,12 @@
+# SRD worker 运行依赖
+# 引擎本体建议 `pip install -e tools/srd-engine`；下面重复列出它的运行时依赖，
+# 是为了「不装引擎包、直接靠 sys.path 引导」的开发机也能一把装齐。
+
+redis>=5.0            # 队列 / 状态 / 日志 / 停止标志
+httpx>=0.27           # 按 URL 下载待评估 PDF
+
+pydantic>=2.7         # 引擎数据结构
+pyyaml>=6.0           # 引擎判定口径 YAML
+langchain-core>=0.3.60
+langchain-openai>=0.3
+pymupdf>=1.24         # PDF 解析

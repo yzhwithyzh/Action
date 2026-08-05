@@ -1,0 +1,103 @@
+# 文献来源标准化词表：标准名 -> 别名（小写匹配，忽略空白与标点）
+# 用于 3a 的交并集计算。只做归一，不做判定。
+
+PubMed/MEDLINE:
+  - pubmed
+  - medline
+  - medline (ovid)
+  - pubmed/medline
+  - ncbi pubmed
+Embase:
+  - embase
+  - excerpta medica
+  - embase (ovid)
+CENTRAL:
+  - central
+  - cochrane central register of controlled trials
+  - cochrane central
+  - cochrane library
+  - cdsr
+  - cochrane database of systematic reviews
+Web of Science:
+  - web of science
+  - web of knowledge
+  - science citation index
+  - sci-expanded
+  - wos
+Scopus:
+  - scopus
+CINAHL:
+  - cinahl
+  - cumulative index to nursing and allied health literature
+PsycINFO:
+  - psycinfo
+  - psychinfo
+AMED:
+  - amed
+  - allied and complementary medicine database
+CNKI:
+  - cnki
+  - china national knowledge infrastructure
+  - 中国知网
+  - 知网
+WanFang:
+  - wanfang
+  - wan fang
+  - 万方
+  - 万方数据
+VIP:
+  - vip
+  - cqvip
+  - 维普
+  - 中文科技期刊数据库
+SinoMed:
+  - sinomed
+  - cbm
+  - china biology medicine
+  - 中国生物医学文献数据库
+  - 中国生物医学文献服务系统
+KoreaMed:
+  - koreamed
+  - kmbase
+CiNii:
+  - cinii
+  - ichushi
+  - japana centra revuo medicina
+LILACS:
+  - lilacs
+ClinicalTrials.gov:
+  - clinicaltrials.gov
+  - clinical trials.gov
+  - nct registry
+ChiCTR:
+  - chictr
+  - chinese clinical trial registry
+  - 中国临床试验注册中心
+WHO ICTRP:
+  - ictrp
+  - who ictrp
+  - international clinical trials registry platform
+灰色文献:
+  - grey literature
+  - gray literature
+  - conference abstracts
+  - conference proceedings
+  - dissertations
+  - theses
+  - 学位论文
+  - 会议论文
+  - 会议摘要
+手工检索:
+  - hand search
+  - handsearching
+  - hand searching
+  - 手工检索
+  - 手检
+参考文献追溯:
+  - reference list
+  - reference lists
+  - citation tracking
+  - backward citation
+  - snowballing
+  - 参考文献追溯
+  - 引文追踪

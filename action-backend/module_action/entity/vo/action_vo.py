@@ -86,6 +86,85 @@ class DeleteNewsModel(BaseModel):
     news_ids: str = Field(description='需要删除的新闻id，多个以逗号分隔')
 
 
+# ---------------------------------------------------------------- 团队成员
+
+
+class TeamMemberModel(ActionBaseModel):
+    """
+    官网团队成员
+
+    简介分三层，前台各用各的：summary 上卡片、bio 与 contribution 上详情页。
+    """
+
+    member_id: int | None = Field(default=None, description='成员id')
+    group_key: Literal['board', 'core'] | None = Field(
+        default=None, description='所属组（board国际顾问委员会 core核心执行团队）'
+    )
+    name_zh: str | None = Field(default=None, description='姓名（中文）')
+    name_en: str | None = Field(default=None, description='姓名（英文）')
+    honorific: str | None = Field(default=None, description='称谓（Prof./Dr.）')
+    title_zh: str | None = Field(default=None, description='职称/头衔（中文）')
+    title_en: str | None = Field(default=None, description='职称/头衔（英文）')
+    affiliation_zh: str | None = Field(default=None, description='所属机构（中文）')
+    affiliation_en: str | None = Field(default=None, description='所属机构（英文）')
+    role_zh: str | None = Field(default=None, description='在 ACTION 中的角色（中文）')
+    role_en: str | None = Field(default=None, description='在 ACTION 中的角色（英文）')
+    expertise_zh: str | None = Field(default=None, description='研究方向标签（中文，顿号分隔）')
+    expertise_en: str | None = Field(default=None, description='研究方向标签（英文，分号分隔）')
+    summary_zh: str | None = Field(default=None, description='一句话简介（中文）')
+    summary_en: str | None = Field(default=None, description='一句话简介（英文）')
+    bio_zh: str | None = Field(default=None, description='详细履历（中文）')
+    bio_en: str | None = Field(default=None, description='详细履历（英文）')
+    contribution_zh: str | None = Field(default=None, description='对 ACTION 的贡献（中文）')
+    contribution_en: str | None = Field(default=None, description='对 ACTION 的贡献（英文）')
+    avatar_url: str | None = Field(default=None, description='头像地址')
+    homepage_url: str | None = Field(default=None, description='个人主页/学术档案链接')
+    email: str | None = Field(default=None, description='联系邮箱')
+    sort_num: int | None = Field(default=None, description='组内显示顺序')
+    status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
+    create_by: str | None = Field(default=None, description='创建者')
+    create_time: datetime | None = Field(default=None, description='创建时间')
+    update_by: str | None = Field(default=None, description='更新者')
+    update_time: datetime | None = Field(default=None, description='更新时间')
+    remark: str | None = Field(default=None, description='备注')
+
+    @Xss(field_name='name_zh', message='姓名不能包含脚本字符')
+    @NotBlank(field_name='name_zh', message='中文姓名不能为空')
+    @Size(field_name='name_zh', min_length=0, max_length=200, message='中文姓名不能超过200个字符')
+    def get_name_zh(self) -> str | None:
+        return self.name_zh
+
+    def validate_fields(self) -> None:
+        self.get_name_zh()
+
+
+class TeamMemberQueryModel(TeamMemberModel):
+    """
+    团队成员查询模型
+    """
+
+    keyword: str | None = Field(default=None, description='按姓名/机构/简介模糊搜索')
+
+
+class TeamMemberPageQueryModel(TeamMemberQueryModel):
+    """
+    团队成员分页查询模型
+    """
+
+    page_num: int = Field(default=1, description='当前页码')
+    page_size: int = Field(default=10, description='每页记录数')
+
+
+class DeleteTeamMemberModel(BaseModel):
+    """
+    删除团队成员模型
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    member_ids: str = Field(description='需要删除的成员id，多个以逗号分隔')
+
+
 # ---------------------------------------------------------------- 报告规范目录
 
 
@@ -152,6 +231,118 @@ class DeleteGuidelineModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel)
 
     guideline_ids: str = Field(description='需要删除的规范id，多个以逗号分隔')
+
+
+# ---------------------------------------------------------------- 规范 checklist 条目
+
+
+class GuidelineItemModel(ActionBaseModel):
+    """
+    报告规范 checklist 条目
+
+    一份规范可能含多张清单表（如 RCT = CONSORT 主表 + 摘要表 + STRICTA 表），
+    part_no/part_zh/part_en 保留出处；页面按 sort_num 合并成一条流水清单。
+    """
+
+    item_id: int | None = Field(default=None, description='条目id')
+    guideline_id: int | None = Field(default=None, description='所属规范id')
+    part_no: int | None = Field(default=None, description='所属清单表序号')
+    part_zh: str | None = Field(default=None, description='清单表标题（中文）')
+    part_en: str | None = Field(default=None, description='清单表标题（英文）')
+    domain_zh: str | None = Field(default=None, description='章节/主题/领域（中文）')
+    domain_en: str | None = Field(default=None, description='章节/主题/领域（英文）')
+    item_no_zh: str | None = Field(default=None, description='条目号（中文）')
+    item_no_en: str | None = Field(default=None, description='条目号（英文）')
+    content_zh: str | None = Field(default=None, description='条目内容（中文）')
+    content_en: str | None = Field(default=None, description='条目内容（英文）')
+    ext_label_zh: str | None = Field(default=None, description='扩展列列名（中文）')
+    ext_label_en: str | None = Field(default=None, description='扩展列列名（英文）')
+    extension_zh: str | None = Field(default=None, description='扩展/对照条目内容（中文）')
+    extension_en: str | None = Field(default=None, description='扩展/对照条目内容（英文）')
+    sort_num: int | None = Field(default=None, description='规范内显示顺序')
+    status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
+    create_by: str | None = Field(default=None, description='创建者')
+    create_time: datetime | None = Field(default=None, description='创建时间')
+    update_by: str | None = Field(default=None, description='更新者')
+    update_time: datetime | None = Field(default=None, description='更新时间')
+    remark: str | None = Field(default=None, description='备注')
+
+    @Xss(field_name='content_zh', message='条目内容不能包含脚本字符')
+    @NotBlank(field_name='content_zh', message='条目中文内容不能为空')
+    def get_content_zh(self) -> str | None:
+        return self.content_zh
+
+    @Size(field_name='item_no_zh', min_length=0, max_length=64, message='条目号不能超过64个字符')
+    def get_item_no_zh(self) -> str | None:
+        return self.item_no_zh
+
+    def validate_fields(self) -> None:
+        self.get_content_zh()
+        self.get_item_no_zh()
+
+
+class GuidelineItemQueryModel(GuidelineItemModel):
+    """
+    规范条目查询模型
+    """
+
+    guideline_code: str | None = Field(default=None, description='规范代号（按代号取条目，公开接口用）')
+    keyword: str | None = Field(default=None, description='按条目内容/领域模糊搜索')
+
+
+class GuidelineItemPageQueryModel(GuidelineItemQueryModel):
+    """
+    规范条目分页查询模型
+    """
+
+    page_num: int = Field(default=1, description='当前页码')
+    page_size: int = Field(default=10, description='每页记录数')
+
+
+class DeleteGuidelineItemModel(BaseModel):
+    """
+    删除规范条目模型
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    item_ids: str = Field(description='需要删除的条目id，多个以逗号分隔')
+
+
+# ---------------------------------------------------------------- checklist 逐条校验（报告助手第三步）
+
+
+class ChecklistReviewSubmitModel(BaseModel):
+    """
+    提交稿件做 checklist 逐条校验
+
+    公开接口的入参，字段约束直接写在 Field 上（与 CollabRequestSubmitModel 一致，由 pydantic
+    自动校验，不走 @ValidateFields）。稿件正文只在任务队列与 worker 工作目录里流转，
+    **不落业务库** —— 它是用户未发表的研究稿件。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    guideline_code: str = Field(min_length=1, max_length=64, description='规范代号，如 STRICTA')
+    # 下限与 worker 的 MIN_MANUSCRIPT_CHARS 对齐；上限与算法的 max_chars 对齐，超出直接回绝而不是默默截断
+    manuscript: str = Field(min_length=200, max_length=300000, description='稿件全文')
+    locale: Literal['zh', 'en'] = Field(default='zh', description='条目与结论使用的语言')
+
+
+class ChecklistReviewStateModel(BaseModel):
+    """
+    校验任务状态（原样透传 worker 的状态快照）
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    session_id: str = Field(description='任务id')
+    status: str = Field(description='pending/running/completed/failed/stopped')
+    progress_current: int = Field(default=0, description='当前进度')
+    progress_total: int = Field(default=100, description='进度总量')
+    message: str = Field(default='', description='当前阶段说明')
+    error: str = Field(default='', description='失败原因')
+    result: dict | None = Field(default=None, description='完成后的判定结果')
 
 
 # ---------------------------------------------------------------- 研究类型

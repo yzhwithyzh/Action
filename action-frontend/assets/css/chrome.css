@@ -5,11 +5,15 @@ header{position:sticky;top:0;z-index:var(--z-sticky,100);background:rgba(242,246
   .brand-txt b{display:block;font-family:"Spectral","Noto Serif SC",serif;font-weight:700;font-size:19px;color:var(--indigo-900);letter-spacing:.06em;line-height:1.1}
   .brand-txt small{display:block;font-size:11.5px;color:var(--muted);letter-spacing:.01em}
   .menu{display:flex;gap:17px;font-size:15px;font-weight:500}
-  .menu a{color:var(--indigo-700);position:relative;padding:4px 0;transition:color .2s;white-space:nowrap}
-  .menu a::after{content:"";position:absolute;left:0;right:0;bottom:-2px;height:2px;background:var(--cinnabar);transform:scaleX(0);transform-origin:left;transition:transform .3s var(--ease)}
-  .menu a:hover{color:var(--indigo-900)}
-  .menu a:hover::after,.menu a.cur::after{transform:scaleX(1)}
-  .menu a.cur{color:var(--indigo-900);font-weight:600}
+  /* 一律用 `>` 限定在**顶栏那一层**链接上。写成后代选择器 `.menu a` 时，这几条会顺着
+     DOM 漏进 `.grp-panel` 里的下拉项：`position:relative` 给了定位上下文，`::after`
+     就在每个下拉项底下画出一条通栏 2px 朱砂线（当前页与 hover 都画），面板里凭空多出
+     一条像分隔线又像报错的红杠；`white-space:nowrap` 还会让英文说明文案撑破 316px 面板。 */
+  .menu > a{color:var(--indigo-700);position:relative;padding:4px 0;transition:color .2s;white-space:nowrap}
+  .menu > a::after{content:"";position:absolute;left:0;right:0;bottom:-2px;height:2px;background:var(--cinnabar);transform:scaleX(0);transform-origin:left;transition:transform .3s var(--ease)}
+  .menu > a:hover{color:var(--indigo-900)}
+  .menu > a:hover::after,.menu > a.cur::after{transform:scaleX(1)}
+  .menu > a.cur{color:var(--indigo-900);font-weight:600}
   /* 顶栏下拉分组（智能工具）。按钮沿用 .menu a 的字号/颜色/朱砂下划线，
      面板是白底卡片，每项「标题 + 一行说明」——光有名字用户猜不出 SRD 是干嘛的。 */
   /* align-items:stretch + line-height:inherit：按钮盒子必须和相邻 .menu a 等高等基线，
@@ -26,12 +30,26 @@ header{position:sticky;top:0;z-index:var(--z-sticky,100);background:rgba(242,246
   /* 按钮与面板之间有 16px 空隙，补一条透明桥，鼠标移过去时不会中断 hover */
   .grp-panel::before{content:"";position:absolute;top:-18px;left:0;right:0;height:18px}
   .menu-grp.open .grp-panel{opacity:1;visibility:visible;transform:none}
-  .grp-panel a{display:block;padding:11px 13px;border-radius:var(--radius,12px);transition:background .2s}
-  .grp-panel a:hover{background:var(--indigo-100)}
-  .grp-panel a.cur{background:var(--indigo-100);box-shadow:inset 2px 0 0 var(--cinnabar)}
+  /* 右内边距给当前页圆点留位，且**所有项**都留 —— 只给 .cur 留会让文案在切换页面时左右跳。 */
+  .grp-panel a{display:block;position:relative;padding:11px 34px 11px 13px;border-radius:var(--radius,12px);color:var(--indigo-800);transition:background-color .2s var(--ease)}
+  /* 三态要能分开读：hover 是最浅的纸色，当前页常驻天青淡底，当前页再 hover 压深一档。
+     原来 hover 与 .cur 同为 --indigo-100，「你在这一页」和「鼠标在这一项」看着一模一样。 */
+  .grp-panel a:hover{background:var(--paper-2)}
+  .grp-panel a.cur{background:var(--indigo-100)}
+  .grp-panel a.cur:hover{background:var(--indigo-200)}
+  /* 当前页印记：朱砂只做一个 6px 圆点。不用 2px 彩色侧边条 —— DESIGN.md 的
+     One-Warm Rule（朱砂着色面积 ≤5%，只给主行动与关键印记）与侧边条禁令都指着它。
+     朱砂也正是移动端 .mm-sub a.cur 的「当前页」语言，两端说的是同一个词。 */
+  .grp-panel a.cur::after{content:"";position:absolute;top:50%;right:14px;width:6px;height:6px;margin-top:-3px;border-radius:50%;background:var(--cinnabar)}
+  /* 全局 :focus-visible 带 border-radius:4px，会把 12px 圆角的行掰成 4px；
+     负 offset 让 2.5px 焦点环落在行内侧，不会顶破 8px 内边距的面板边缘。 */
+  .grp-panel a:focus-visible{border-radius:var(--radius,12px);outline-offset:-2px}
   .gi-t{display:block;font-size:15px;font-weight:600;color:var(--indigo-900);margin-bottom:3px}
   .gi-d{display:block;font-size:13px;line-height:1.45;color:var(--muted)}
-  @media(prefers-reduced-motion:reduce){.grp-panel,.grp-btn svg{transition-duration:.01ms}}
+  /* 灰字压在有色底上会发灰发脏，且 --muted 对 --indigo-200 只有 3.83:1，不到正文 4.5:1。
+     当前页的说明文字改用背景自己那一支的深色，对两档天青底分别是 7.25:1 / 6.10:1。 */
+  .grp-panel a.cur .gi-d{color:var(--indigo-600)}
+  @media(prefers-reduced-motion:reduce){.grp-panel,.grp-panel a,.grp-btn svg{transition-duration:.01ms}}
   .nav-actions{display:flex;align-items:center;gap:14px}
   .lang{display:inline-flex;align-items:center;gap:6px;font-size:13.5px;font-weight:600;color:var(--indigo-700);background:transparent;border:1.5px solid var(--line);border-radius:999px;padding:9px 15px;min-height:42px;cursor:pointer;transition:border-color .2s,background .2s}
   .lang:hover{border-color:var(--indigo-500);background:var(--indigo-100)}

@@ -1,0 +1,14 @@
+{
+  "1a": "dup",  "1b": "dup",  "2a": "dup",  "2b": "dup",
+  "2c": "dup",  "2d": "dup",  "2e": "diff", "2f": "diff",
+
+  "3a": "dup",  "3b": "dup",  "4a": "dup",
+  "4b": "diff", "5a": "diff", "5b": "diff",
+
+  "6a": "dup",  "6b": "dup",  "6c": "dup",  "6d": "diff", "6e": "dup",
+  "7a": "dup",  "7b": "diff", "7c": "diff", "7d": "diff",
+  "8a": "dup",  "8b": "diff", "8c": "diff", "8d": "diff", "8e": "unclear",
+
+  "9": "dup",   "10a": "dup", "10b": "diff",
+  "11": "diff", "12a": "diff", "12b": "unclear"
+}

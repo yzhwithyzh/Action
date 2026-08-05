@@ -1,9 +1,14 @@
 <script setup lang="ts">
 /**
  * about.html 迁移而来。
- * 模板与样式保持原状；样式已加 .page-about 命名空间，避免 SPA 路由切换时跨页污染。
+ * 模板与样式基本保持原状；样式已加 .page-about 命名空间，避免 SPA 路由切换时跨页污染。
+ *
+ * 例外是「如何组织」里的团队名单：原来是写死在 i18n 里的两组纯文字卡片，
+ * 现改为读 `action_team_member` 表（带头像、按人跳 /team/[id] 详情页），
+ * 对应的 about.s016–s027 / s029–s036 文案键已随之删除。
  */
 const { t } = useI18n()
+const { pick } = useBilingual()
 
 useHead({
   title: t('about._title'),
@@ -11,6 +16,44 @@ useHead({
 })
 
 useReveal()
+
+/**
+ * 团队名单改为从 `action_team_member` 表取，后台「团队成员管理」页可增删改。
+ * swr：名单是后台可随时改的内容，不开这个开关就要等下一次 `npm run generate` 才生效。
+ */
+const { data: teamRes } = await useSiteObject<TeamMemberRow[]>('/team-members', 'site-team-members', { swr: true })
+const members = computed<TeamMemberRow[]>(() => teamRes.value?.data ?? [])
+
+/**
+ * 接口已按「组 → 组内顺序」排好，这里只做分段，不再排序。
+ * 组标题沿用原有的 s015/s028 两条文案，引导语取自 docx 更新版。
+ */
+const groups = computed(() => [
+  {
+    key: 'board' as const,
+    title: t('about.s015'),
+    intro: t('about.team.boardIntro'),
+    rows: members.value.filter((m) => m.groupKey === 'board'),
+  },
+  {
+    key: 'core' as const,
+    title: t('about.s028'),
+    intro: t('about.team.coreIntro'),
+    rows: members.value.filter((m) => m.groupKey === 'core'),
+  },
+])
+
+/** 头像缺失时退回姓名首字母 —— 与迁移前的纯文字圆头像一致 */
+function initials(row: TeamMemberRow): string {
+  const parts = (row.nameEn || row.nameZh || '').split(/[\s-]+/).filter(Boolean)
+
+  return parts.slice(0, 2).map((p) => p[0]?.toUpperCase() ?? '').join('')
+}
+
+/** 卡片副行：机构优先，没有机构（部分执行团队成员未给）时退到职称 */
+function subline(row: TeamMemberRow): string {
+  return pick(row, 'affiliation') || pick(row, 'title')
+}
 
 /**
  * 子栏目 Tab —— 迁移自 about.html 内联脚本。
@@ -102,23 +145,32 @@ onMounted(() => {
         <div class="subh reveal">{{ t('about.s013') }}</div>
         <p class="lead reveal" style="margin-top:0">{{ t('about.s014') }}</p>
 
-        <div class="subh reveal" style="margin-top:26px;color:var(--indigo-500)">{{ t('about.s015') }}</div>
-        <div class="people">
-          <div class="person reveal"><span class="pav" aria-hidden="true">ML</span><span class="px"><b>Myeong Soo Lee</b><span class="aff">{{ t('about.s016') }}</span><span class="role">{{ t('about.s017') }}</span></span></div>
-          <div class="person reveal"><span class="pav" aria-hidden="true">CL</span><span class="px"><b>Cunzhi Liu</b><span class="aff">{{ t('about.s018') }}</span><span class="role">{{ t('about.s019') }}</span></span></div>
-          <div class="person reveal"><span class="pav" aria-hidden="true">YC</span><span class="px"><b>Yaolong Chen</b><span class="aff">{{ t('about.s020') }}</span><span class="role">{{ t('about.s021') }}</span></span></div>
-          <div class="person reveal"><span class="pav" aria-hidden="true">SY</span><span class="px"><b>Shiyan Yan</b><span class="aff">{{ t('about.s022') }}</span><span class="role">{{ t('about.s023') }}</span></span></div>
-          <div class="person reveal"><span class="pav" aria-hidden="true">LL</span><span class="px"><b>Liming Lu</b><span class="aff">{{ t('about.s024') }}</span><span class="role">{{ t('about.s025') }}</span></span></div>
-          <div class="person reveal"><span class="pav" aria-hidden="true">LY</span><span class="px"><b>Lin Yu</b><span class="aff">{{ t('about.s026') }}</span><span class="role">{{ t('about.s027') }}</span></span></div>
-        </div>
+        <template v-for="g in groups" :key="g.key">
+          <div class="subh reveal" style="margin-top:26px;color:var(--indigo-500)">{{ g.title }}</div>
+          <p class="grp-intro reveal">{{ g.intro }}</p>
+          <div class="people">
+            <NuxtLink v-for="m in g.rows" :key="m.memberId" class="person reveal" :to="`/team/${m.memberId}`">
+              <img
+                v-if="m.avatarUrl"
+                class="pav"
+                :src="m.avatarUrl"
+                :alt="pick(m, 'name')"
+                width="76"
+                height="96"
+                loading="lazy"
+              >
+              <span v-else class="pav pav-txt" aria-hidden="true">{{ initials(m) }}</span>
+              <span class="px">
+                <b>{{ displayName(m.honorific, pick(m, 'name')) }}</b>
+                <span v-if="subline(m)" class="aff">{{ subline(m) }}</span>
+                <span v-if="pick(m, 'summary')" class="role">{{ pick(m, 'summary') }}</span>
+                <span class="more">{{ t('about.team.viewProfile') }} &rarr;</span>
+              </span>
+            </NuxtLink>
+          </div>
+        </template>
 
-        <div class="subh reveal" style="margin-top:26px;color:var(--indigo-500)">{{ t('about.s028') }}</div>
-        <div class="team">
-          <div class="tmember reveal"><b>Yuting Duan</b><span class="trole">{{ t('about.s029') }}</span><span class="ttag">{{ t('about.s030') }}</span></div>
-          <div class="tmember reveal"><b>Lin Shi</b><span class="trole">{{ t('about.s031') }}</span><span class="ttag">{{ t('about.s032') }}</span></div>
-          <div class="tmember reveal"><b>Dehui Nie</b><span class="trole">{{ t('about.s033') }}</span><span class="ttag">{{ t('about.s034') }}</span></div>
-          <div class="tmember reveal"><b>Zhirui Xu</b><span class="trole">{{ t('about.s035') }}</span><span class="ttag">{{ t('about.s036') }}</span></div>
-        </div>
+        <p v-if="!members.length" class="grp-intro reveal">{{ t('about.team.empty') }}</p>
       </div>
     </section>
     <!-- ===================== ② 使命与愿景 ===================== -->
@@ -275,19 +327,20 @@ onMounted(() => {
 .page-about .pillar .pi svg{width:22px;height:22px}
 .page-about .pillar b{display:block;font-family:"Spectral","Noto Serif SC",serif;font-weight:600;font-size:1.1rem;color:var(--indigo-900);margin-bottom:7px;line-height:1.25}
 .page-about .pillar p{font-size:13.5px;color:var(--muted);line-height:1.6}
-.page-about .people{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:14px}
-.page-about .person{display:flex;gap:14px;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:18px 20px;transition:.2s var(--ease)}
-.page-about .person:hover{border-color:var(--indigo-200);box-shadow:var(--shadow-sm)}
-.page-about .person .pav{width:46px;height:46px;flex-shrink:0;border-radius:50%;background:var(--indigo-700);color:#fff;display:flex;align-items:center;justify-content:center;font-family:"Spectral",serif;font-weight:700;font-size:18px}
-.page-about .person .px{min-width:0}
+.page-about .grp-intro{font-size:13.5px;color:var(--muted);line-height:1.7;max-width:78ch;margin:-6px 0 16px;text-wrap:pretty}
+.page-about .people{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px}
+.page-about .person{display:flex;gap:16px;background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:18px 20px;transition:.2s var(--ease)}
+.page-about .person:hover{border-color:var(--indigo-200);box-shadow:var(--shadow-sm);transform:translateY(-2px)}
+/* 头像用竖版：docx 里给的多是标准证件照/半身像，横版裁切会切到肩膀以外 */
+.page-about .person .pav{width:76px;height:96px;flex-shrink:0;border-radius:12px;object-fit:cover;object-position:center top;background:var(--indigo-100);border:1px solid var(--line)}
+.page-about .person .pav-txt{display:flex;align-items:center;justify-content:center;background:var(--indigo-700);color:#fff;font-family:"Spectral",serif;font-weight:700;font-size:22px;border-color:transparent}
+.page-about .person .px{min-width:0;display:flex;flex-direction:column}
 .page-about .person b{display:block;font-size:15px;color:var(--indigo-900);font-family:"Source Sans 3","Noto Sans SC",sans-serif;font-weight:700}
 .page-about .person .aff{display:block;font-size:12.5px;color:var(--indigo-600);font-weight:600;margin:2px 0 6px}
-.page-about .person .role{display:block;font-size:12.5px;color:var(--muted);line-height:1.5}
-.page-about .team{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
-.page-about .tmember{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
-.page-about .tmember b{font-size:14.5px;color:var(--indigo-900);font-family:"Source Sans 3","Noto Sans SC",sans-serif;font-weight:700}
-.page-about .tmember .trole{display:block;font-size:12.5px;color:var(--muted);line-height:1.5;margin-top:4px}
-.page-about .tmember .ttag{display:inline-block;font-size:11px;font-weight:700;color:var(--indigo-600);background:var(--indigo-100);border-radius:999px;padding:2px 10px;margin-top:8px}
+/* 简介统一压成 3 行：卡片高度不齐会让整片名单看起来像没排过版 */
+.page-about .person .role{display:-webkit-box;-webkit-line-clamp:3;line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;font-size:12.5px;color:var(--muted);line-height:1.55}
+.page-about .person .more{margin-top:auto;padding-top:9px;font-size:12px;font-weight:700;color:var(--indigo-600);transition:color .2s var(--ease)}
+.page-about .person:hover .more{color:var(--cinnabar)}
 .page-about .mv{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 .page-about .mvcard{border-radius:var(--radius-lg);padding:clamp(24px,3vw,36px);position:relative;overflow:hidden;isolation:isolate}
 .page-about .mvcard.mission{background:var(--indigo-900);color:#fff}

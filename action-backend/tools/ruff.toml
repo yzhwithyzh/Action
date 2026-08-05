@@ -1,0 +1,57 @@
+# worker 工具链的 lint 配置，与 tools/srd-engine/ruff.toml 保持同一套规则。
+line-length = 120
+show-fixes = true
+target-version = "py310"
+unsafe-fixes = true
+
+[lint]
+select = [
+    "ASYNC",  # flake8-async
+    "B",      # flake8-bugbear
+    "A",      # flake8-builtins
+    "C4",     # flake8-comprehensions
+    "ISC",    # flake8-implicit-str-concat
+    "PIE",    # flake8-pie
+    "RSE",    # flake8-raise
+    "RET",    # flake8-return
+    "SIM",    # flake8-simplify
+    "TC",     # flake8-type-checking
+    "FLY",    # flynt
+    "I",      # isort
+    "N",      # pep8-naming
+    "PERF",   # perflint
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "PGH",    # pygrep-hooks
+    "PL",     # pylint
+    "UP",     # pyupgrade
+    "RUF",    # Ruff-specific rules
+]
+ignore = [
+    "B008",   # do not perform function calls in argument defaults
+    "COM812", # trailing comma missing
+    "RET504", # unnecessary assignment before return
+    "SIM105", # use contextlib.suppress
+    "C901",   # too complex
+    "N818",   # exception name should end with Error
+    "E501",   # line too long
+    "RUF001", # 全角标点歧义（中文注释里到处都是）
+    "RUF002",
+    "RUF003",
+    "RUF012", # mutable class attributes should be ClassVar
+    # 生命周期钩子刻意留空：子类按需覆盖，不该强制 @abstractmethod
+    "B027",
+]
+
+[lint.per-file-ignores]
+# 测试里不强制类型标注、允许魔法数字与局部 import
+"**/tests/**" = ["ANN", "PLR2004", "PLR0913", "PLC0415", "S101"]
+
+[lint.pylint]
+max-args = 10
+max-returns = 10
+
+[format]
+docstring-code-format = true
+quote-style = "single"

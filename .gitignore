@@ -59,8 +59,59 @@ action-admin/dist/
 /_bmad/
 /_bmad-output/
 /.impeccable/
+# 设计钩子的会话缓存，含本机绝对路径，且每次编辑都会变
+action-frontend/.impeccable/
 *.docx
 *.xlsx
+
+# ---------------------------------------------------------------
+# worker 工具运行时产物（tools/*_worker_tool 下由框架自动创建）
+# 日志含用户上传文件名、结果目录含评估产物，均不入库
+# ---------------------------------------------------------------
+action-backend/tools/*/logs/
+action-backend/tools/*/temp/
+action-backend/tools/*/checkpoint/
+action-backend/tools/*/results/
+action-backend/tools/*/.extract-cache/
+action-backend/tools/*/*.log
+
+# ---------------------------------------------------------------
+# SRD 引擎的输入语料与跑批产物
+# 系统综述/ 是 62MB 已发表期刊 PDF（版权材料），本仓库有公开 remote，绝不能推送；
+# out*/ 与 .srd-cache*/ 是可重新生成的批量结果与模型缓存。
+# 引擎源码本身（srd_engine/ tests/ examples/ README 等）照常入库。
+# ---------------------------------------------------------------
+action-backend/tools/srd-engine/系统综述/
+action-backend/tools/srd-engine/out/
+action-backend/tools/srd-engine/out-*/
+action-backend/tools/srd-engine/.srd-cache*/
+action-backend/tools/srd-engine/*.txt
+action-backend/tools/srd-engine/gran_eval.json
+action-backend/tools/srd-engine/selfcons2.json
+
+# ---------------------------------------------------------------
+# 投标 / 绩效材料生成脚本
+# 二者的数据来源是 招标材料/ 下的响应文件，并写有具体投标方信息，
+# 与上面「商务材料不得推送到远端」同一条理由
+# ---------------------------------------------------------------
+action-backend/tools/gen_bid_score_table.py
+action-backend/tools/gen_performance_doc.py
+
+# ---------------------------------------------------------------
+# 迁移前的静态站遗留 —— 已由 action-frontend 的 Nuxt 页面取代，
+# 根 assets/ 与 action-frontend/public/assets/ 完全重复
+# ---------------------------------------------------------------
+/*.html
+/assets/
+/*.png
+/add_srd_module.py
+/make_docx.py
+/srd_dump_*.txt
+
+# ---------------------------------------------------------------
+# Claude Code 本地配置与技能包
+# ---------------------------------------------------------------
+/.claude/
 
 # ---------------------------------------------------------------
 # 数据库 / 备份

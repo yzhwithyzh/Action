@@ -9,19 +9,25 @@ from exceptions.exception import ServiceException
 from module_action.dao.action_dao import (
     CollabRequestDao,
     GuidelineDao,
+    GuidelineItemDao,
     ImplementationDao,
     NewsDao,
     SrdDao,
     StudyTypeDao,
+    TeamMemberDao,
 )
 from module_action.entity.vo.action_vo import (
     CfirConstructModel,
     CfirDomainModel,
     CfirStrategyModel,
+    ChecklistReviewStateModel,
+    ChecklistReviewSubmitModel,
     CollabRequestPageQueryModel,
     CollabRequestSubmitModel,
     EricCategoryModel,
     EricStrategyModel,
+    GuidelineItemModel,
+    GuidelineItemPageQueryModel,
     GuidelineModel,
     GuidelinePageQueryModel,
     NewsModel,
@@ -33,6 +39,8 @@ from module_action.entity.vo.action_vo import (
     SrdItemModel,
     StudyTypeModel,
     StudyTypeStatModel,
+    TeamMemberModel,
+    TeamMemberPageQueryModel,
 )
 from utils.common_util import CamelCaseUtil
 
@@ -127,6 +135,110 @@ class NewsService:
             raise ServiceException(message='传入新闻id为空')
         try:
             await NewsDao.delete_news_dao(query_db, id_list)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='删除成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+
+class TeamMemberService:
+    """
+    官网团队成员服务层
+    """
+
+    @classmethod
+    async def get_member_list_services(
+        cls,
+        query_db: AsyncSession,
+        query_object: TeamMemberPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        获取团队成员列表
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取启用中的（官网公开接口传 True）
+        :return: 成员列表
+        """
+        return await TeamMemberDao.get_member_list(query_db, query_object, is_page, only_published)
+
+    @classmethod
+    async def member_detail_services(cls, query_db: AsyncSession, member_id: int) -> TeamMemberModel:
+        """
+        获取团队成员详情
+
+        :param query_db: orm对象
+        :param member_id: 成员id
+        :return: 成员详情
+        """
+        member = await TeamMemberDao.get_member_detail_by_id(query_db, member_id)
+        if not member:
+            raise ServiceException(message='团队成员不存在')
+
+        return TeamMemberModel(**CamelCaseUtil.transform_result(member))
+
+    @classmethod
+    async def add_member_services(cls, query_db: AsyncSession, page_object: TeamMemberModel) -> CrudResponseModel:
+        """
+        新增团队成员
+
+        :param query_db: orm对象
+        :param page_object: 成员对象
+        :return: 新增结果
+        """
+        # 未指定顺序时排到本组末尾，避免新成员挤到委员会名单最前
+        if page_object.sort_num is None:
+            page_object.sort_num = await TeamMemberDao.get_max_sort_num(query_db, page_object.group_key or 'board') + 1
+        try:
+            await TeamMemberDao.add_member_dao(query_db, page_object)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='新增成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def edit_member_services(cls, query_db: AsyncSession, page_object: TeamMemberModel) -> CrudResponseModel:
+        """
+        编辑团队成员
+
+        :param query_db: orm对象
+        :param page_object: 成员对象
+        :return: 编辑结果
+        """
+        if not await TeamMemberDao.get_member_detail_by_id(query_db, page_object.member_id):
+            raise ServiceException(message='团队成员不存在')
+        try:
+            await TeamMemberDao.edit_member_dao(
+                query_db, page_object.model_dump(exclude_unset=True, exclude={'keyword'})
+            )
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='更新成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def delete_member_services(cls, query_db: AsyncSession, member_ids: str) -> CrudResponseModel:
+        """
+        删除团队成员
+
+        :param query_db: orm对象
+        :param member_ids: 成员id字符串，多个以逗号分隔
+        :return: 删除结果
+        """
+        id_list = [int(i) for i in member_ids.split(',') if i.strip()]
+        if not id_list:
+            raise ServiceException(message='传入成员id为空')
+        try:
+            await TeamMemberDao.delete_member_dao(query_db, id_list)
             await query_db.commit()
 
             return CrudResponseModel(is_success=True, message='删除成功')
@@ -236,6 +348,222 @@ class GuidelineService:
         except Exception as e:
             await query_db.rollback()
             raise e
+
+
+class GuidelineItemService:
+    """
+    报告规范 checklist 条目服务层
+
+    条目是报告助手第二步（结构化模板）与第三步（逐条校验）共用的数据源，
+    也是投稿时随稿提交的那份清单，改动会直接影响前台，写操作只走后台鉴权接口。
+    """
+
+    @classmethod
+    async def get_item_list_services(
+        cls,
+        query_db: AsyncSession,
+        query_object: GuidelineItemPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        获取规范条目列表
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取启用中的
+        :return: 条目列表
+        """
+        return await GuidelineItemDao.get_item_list(query_db, query_object, is_page, only_published)
+
+    @classmethod
+    async def item_detail_services(cls, query_db: AsyncSession, item_id: int) -> GuidelineItemModel:
+        """
+        获取规范条目详情
+
+        :param query_db: orm对象
+        :param item_id: 条目id
+        :return: 条目详情
+        """
+        item = await GuidelineItemDao.get_item_detail_by_id(query_db, item_id)
+        if not item:
+            raise ServiceException(message='规范条目不存在')
+
+        return GuidelineItemModel(**CamelCaseUtil.transform_result(item))
+
+    @classmethod
+    async def add_item_services(cls, query_db: AsyncSession, page_object: GuidelineItemModel) -> CrudResponseModel:
+        """
+        新增规范条目
+
+        :param query_db: orm对象
+        :param page_object: 条目对象
+        :return: 新增结果
+        """
+        if not page_object.guideline_id:
+            raise ServiceException(message='新增失败，未指定所属规范')
+        if not await GuidelineDao.get_guideline_detail_by_id(query_db, page_object.guideline_id):
+            raise ServiceException(message='新增失败，所属规范不存在')
+        # 未指定顺序时排到该规范末尾，避免新条目挤在 0 位打乱既有清单
+        if page_object.sort_num is None:
+            page_object.sort_num = await GuidelineItemDao.get_max_sort_num(query_db, page_object.guideline_id) + 1
+        try:
+            await GuidelineItemDao.add_item_dao(query_db, page_object)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='新增成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def edit_item_services(cls, query_db: AsyncSession, page_object: GuidelineItemModel) -> CrudResponseModel:
+        """
+        编辑规范条目
+
+        :param query_db: orm对象
+        :param page_object: 条目对象
+        :return: 编辑结果
+        """
+        if not await GuidelineItemDao.get_item_detail_by_id(query_db, page_object.item_id):
+            raise ServiceException(message='规范条目不存在')
+        if page_object.guideline_id and not await GuidelineDao.get_guideline_detail_by_id(
+            query_db, page_object.guideline_id
+        ):
+            raise ServiceException(message='修改失败，所属规范不存在')
+        try:
+            await GuidelineItemDao.edit_item_dao(
+                query_db, page_object.model_dump(exclude_unset=True, exclude={'guideline_code', 'keyword'})
+            )
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='更新成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def delete_item_services(cls, query_db: AsyncSession, item_ids: str) -> CrudResponseModel:
+        """
+        删除规范条目
+
+        :param query_db: orm对象
+        :param item_ids: 条目id字符串，多个以逗号分隔
+        :return: 删除结果
+        """
+        id_list = [int(i) for i in item_ids.split(',') if i.strip()]
+        if not id_list:
+            raise ServiceException(message='传入条目id为空')
+        try:
+            await GuidelineItemDao.delete_item_dao(query_db, id_list)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='删除成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+
+class ChecklistReviewService:
+    """
+    checklist 逐条校验服务层（报告助手第三步）
+
+    这里只做投递与查询，真正干活的是 `tools/checklist_worker_tool` 常驻 worker：
+    后端把稿件与规范代号 rpush 进 Redis 队列，worker 取条目、调模型、写状态，
+    两个进程互不依赖 —— worker 挂了不影响官网，后端重启也不影响在跑的任务。
+    """
+
+    @classmethod
+    def _client(cls) -> Any:
+        """延迟导入 worker 配置：tools 包依赖 redis 等库，不该拖累未用到该功能的进程启动。"""
+        from tools.checklist_worker_tool.config.worker_config import CONFIG  # noqa: PLC0415
+        from tools.common.task_client import TaskClient  # noqa: PLC0415
+
+        return TaskClient(CONFIG)
+
+    @classmethod
+    async def submit_review_services(
+        cls, query_db: AsyncSession, submit: ChecklistReviewSubmitModel, user_id: int | None = None
+    ) -> str:
+        """
+        提交一次校验，返回任务id
+
+        :param query_db: orm对象
+        :param submit: 提交模型
+        :param user_id: 访客用户id，用于记账
+        :return: 任务id（session_id）
+        """
+        guideline = await GuidelineDao.get_guideline_by_code(query_db, submit.guideline_code)
+        if not guideline:
+            raise ServiceException(message=f'报告规范 {submit.guideline_code} 不存在')
+
+        # 条目为空时 worker 也会失败，但那要等排队+启动，不如在这里直接回绝
+        items = await GuidelineItemDao.get_item_list(
+            query_db,
+            GuidelineItemPageQueryModel(guidelineId=guideline.guideline_id),
+            is_page=False,
+            only_published=True,
+        )
+        if not items:
+            raise ServiceException(message=f'报告规范 {submit.guideline_code} 尚未录入 checklist 条目')
+
+        payload = {
+            'guideline_code': guideline.code,
+            'guideline_id': guideline.guideline_id,
+            'manuscript': submit.manuscript,
+            'locale': submit.locale,
+            'user_id': user_id,
+        }
+        try:
+            async with cls._client() as client:
+                return await client.submit(payload)
+        except ServiceException:
+            raise
+        except Exception as e:
+            raise ServiceException(message=f'校验任务提交失败，请稍后重试：{type(e).__name__}') from e
+
+    @classmethod
+    async def review_state_services(cls, session_id: str) -> ChecklistReviewStateModel:
+        """
+        查询校验任务状态
+
+        :param session_id: 任务id
+        :return: 任务状态
+        """
+        try:
+            async with cls._client() as client:
+                state = await client.status(session_id)
+        except Exception as e:
+            raise ServiceException(message=f'校验任务状态查询失败：{type(e).__name__}') from e
+        if not state:
+            raise ServiceException(message='校验任务不存在或已过期')
+
+        return ChecklistReviewStateModel(
+            sessionId=session_id,
+            status=str(state.get('status') or ''),
+            progressCurrent=int(state.get('progress_current') or 0),
+            progressTotal=int(state.get('progress_total') or 100),
+            message=str(state.get('message') or ''),
+            error=str(state.get('error') or ''),
+            result=state.get('result') if isinstance(state.get('result'), dict) else None,
+        )
+
+    @classmethod
+    async def stop_review_services(cls, session_id: str) -> CrudResponseModel:
+        """
+        请求停止校验任务
+
+        :param session_id: 任务id
+        :return: 操作结果
+        """
+        try:
+            async with cls._client() as client:
+                await client.stop(session_id)
+        except Exception as e:
+            raise ServiceException(message=f'停止失败：{type(e).__name__}') from e
+
+        return CrudResponseModel(is_success=True, message='已请求停止')
 
 
 class StudyTypeService:

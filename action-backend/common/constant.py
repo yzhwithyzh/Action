@@ -257,6 +257,8 @@ class ApiNamespace:
     ACTION_GUEST_LOGIN: 官网访客登录接口命名空间
     ACTION_GUEST_ME: 官网访客当前用户信息接口命名空间
     ACTION_GUEST_LOGOUT: 官网访客登出接口命名空间
+    ACTION_CHECKLIST_REVIEW: 官网报告助手 checklist 逐条校验接口命名空间
+    ACTION_TEAM_AVATAR: 官网团队成员头像上传接口命名空间
     """
 
     LOGIN = 'login'
@@ -370,6 +372,8 @@ class ApiNamespace:
     ACTION_GUEST_LOGIN = 'action:guest:login'
     ACTION_GUEST_ME = 'action:guest:me'
     ACTION_GUEST_LOGOUT = 'action:guest:logout'
+    ACTION_CHECKLIST_REVIEW = 'action:checklist:review'
+    ACTION_TEAM_AVATAR = 'action:team:avatar'
 
 
 class ApiGroup:

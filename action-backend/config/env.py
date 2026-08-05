@@ -162,6 +162,48 @@ class MailSettings(BaseSettings):
     mail_from_alias: str = 'ACTION'
 
 
+class OssSettings(BaseSettings):
+    """
+    阿里云 OSS 配置
+
+    官网内容里的图片（团队成员头像等）存 OSS，不落后端磁盘：官网是 SSG 静态站，
+    图片跟着后端机器走会让换机/多副本部署时前台开天窗。凭据一律从 .env 读取，
+    不得硬编码；oss_enabled 为 False 时上传接口直接报错，不做静默降级 ——
+    「传了但没存上」比「传不了」难排查得多。
+
+    oss_public_base_url 留空时按 `https://{bucket}.{endpoint}` 拼公网地址；
+    配了 CDN 或自定义域名就填那个（不要带结尾斜杠）。
+    """
+
+    oss_enabled: bool = False
+    oss_access_key_id: str = ''
+    oss_access_key_secret: str = ''
+    oss_endpoint: str = 'oss-cn-guangzhou.aliyuncs.com'
+    oss_bucket: str = 'action-gmu'
+    oss_public_base_url: str = ''
+    # 对象键前缀，便于在同一个桶里按用途分目录
+    oss_dir_prefix: str = 'site'
+    # 上传时随对象声明的 ACL。留空 = 继承桶的 ACL（桶需为公共读）。
+    # 只有在桶保持私有、且**没有**开启「阻止公共访问」时才填 public-read；
+    # 开了阻止公共访问还带这个头，OSS 会以
+    # `AccessDenied: Put public object acl is not allowed` 拒掉整个 PUT。
+    oss_object_acl: str = ''
+    oss_timeout_seconds: int = 30
+
+    @computed_field
+    @property
+    def public_base_url(self) -> str:
+        """
+        公网访问基址（无结尾斜杠）
+
+        :return: 图片外链前缀
+        """
+        if self.oss_public_base_url:
+            return self.oss_public_base_url.rstrip('/')
+
+        return f'https://{self.oss_bucket}.{self.oss_endpoint}'
+
+
 class GenSettings:
     """
     代码生成配置
@@ -314,6 +356,12 @@ class GetConfig:
         # 实例上传配置
         return UploadSettings()
 
+    def get_oss_config(self) -> OssSettings:
+        """
+        获取阿里云OSS配置
+        """
+        return OssSettings()
+
     @staticmethod
     def parse_cli_args() -> None:
         """
@@ -369,3 +417,5 @@ MailConfig = get_config.get_mail_config()
 GenConfig = get_config.get_gen_config()
 # 上传配置
 UploadConfig = get_config.get_upload_config()
+# 阿里云OSS配置
+OssConfig = get_config.get_oss_config()

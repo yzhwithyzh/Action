@@ -59,6 +59,39 @@ class AiModelDao:
         return ai_model_list
 
     @classmethod
+    async def get_usable_ai_model_list(
+        cls,
+        db: AsyncSession,
+        model_ids: list[int] | None = None,
+        model_types: list[str] | None = None,
+    ) -> list[AiModels]:
+        """
+        获取可直接发起调用的AI模型列表（启用中且配了API Key），按显示顺序排列
+
+        与get_ai_model_list的区别：这里不看数据权限、不分页，是给后台任务/worker轮询用的模型池，
+        调用方拿到后需要自行解密api_key
+
+        :param db: orm对象
+        :param model_ids: 可选，只取这些模型主键
+        :param model_types: 可选，只取这些模型类型
+        :return: AI模型信息对象列表
+        """
+        query = (
+            select(AiModels)
+            .where(
+                AiModels.status == '0',
+                AiModels.api_key.isnot(None),
+                AiModels.api_key != '',
+                AiModels.model_id.in_(model_ids) if model_ids else True,
+                AiModels.model_type.in_(model_types) if model_types else True,
+            )
+            .order_by(AiModels.model_sort, AiModels.model_id)
+        )
+        ai_model_list = (await db.execute(query)).scalars().all()
+
+        return list(ai_model_list)
+
+    @classmethod
     async def add_ai_model_dao(cls, db: AsyncSession, ai_model: AiModelModel) -> AiModels:
         """
         新增AI模型数据库操作

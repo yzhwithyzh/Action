@@ -15,6 +15,7 @@ from module_action.entity.do.action_do import (
     ActionEricStrategy,
     ActionGuestProfile,
     ActionGuideline,
+    ActionGuidelineItem,
     ActionNews,
     ActionReaimDimension,
     ActionSrdAssessment,
@@ -24,13 +25,18 @@ from module_action.entity.do.action_do import (
     ActionStudyType,
     ActionStudyTypeGuideline,
     ActionStudyTypeStat,
+    ActionTeamMember,
 )
 from module_action.entity.vo.action_vo import (
     CollabRequestPageQueryModel,
+    GuidelineItemModel,
+    GuidelineItemPageQueryModel,
     GuidelineModel,
     GuidelinePageQueryModel,
     NewsModel,
     NewsPageQueryModel,
+    TeamMemberModel,
+    TeamMemberPageQueryModel,
 )
 from module_admin.entity.do.user_do import SysUser
 from utils.page_util import PageUtil
@@ -141,6 +147,139 @@ class NewsDao:
         """
         await db.execute(
             update(ActionNews).where(ActionNews.news_id.in_(news_ids)).values(del_flag='2', update_time=datetime.now())
+        )
+
+
+class TeamMemberDao:
+    """
+    官网团队成员数据库操作层
+    """
+
+    @classmethod
+    async def get_member_detail_by_id(cls, db: AsyncSession, member_id: int) -> ActionTeamMember | None:
+        """
+        根据成员id获取详情
+
+        :param db: orm对象
+        :param member_id: 成员id
+        :return: 成员对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionTeamMember).where(
+                        ActionTeamMember.member_id == member_id, ActionTeamMember.del_flag == '0'
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_member_list(
+        cls,
+        db: AsyncSession,
+        query_object: TeamMemberPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        根据查询参数获取团队成员列表
+
+        排序按「组 → 组内顺序」：group_key 的 'board' 字母序恰好在 'core' 之前，
+        与页面上顾问委员会在前、执行团队在后的呈现一致，无需额外的组序字段。
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取启用中的
+        :return: 成员列表
+        """
+        conditions = [
+            ActionTeamMember.del_flag == '0',
+            ActionTeamMember.status == '0' if only_published else True,
+            ActionTeamMember.group_key == query_object.group_key if query_object.group_key else True,
+            ActionTeamMember.status == query_object.status if query_object.status and not only_published else True,
+        ]
+        if query_object.keyword:
+            kw = f'%{query_object.keyword}%'
+            conditions.append(
+                ActionTeamMember.name_zh.like(kw)
+                | ActionTeamMember.name_en.like(kw)
+                | ActionTeamMember.affiliation_zh.like(kw)
+                | ActionTeamMember.affiliation_en.like(kw)
+                | ActionTeamMember.summary_zh.like(kw)
+                | ActionTeamMember.summary_en.like(kw)
+            )
+
+        query = (
+            select(ActionTeamMember)
+            .where(*conditions)
+            .order_by(ActionTeamMember.group_key, ActionTeamMember.sort_num, ActionTeamMember.member_id)
+            .distinct()
+        )
+
+        return await PageUtil.paginate(db, query, query_object.page_num, query_object.page_size, is_page)
+
+    @classmethod
+    async def get_max_sort_num(cls, db: AsyncSession, group_key: str) -> int:
+        """
+        取某组下已有成员的最大 sort_num，供新增成员默认排到组末尾
+
+        :param db: orm对象
+        :param group_key: 所属组
+        :return: 最大显示顺序，无成员时返回 -1
+        """
+        result = (
+            await db.execute(
+                select(func.max(ActionTeamMember.sort_num)).where(
+                    ActionTeamMember.group_key == group_key, ActionTeamMember.del_flag == '0'
+                )
+            )
+        ).scalar()
+
+        return -1 if result is None else int(result)
+
+    @classmethod
+    async def add_member_dao(cls, db: AsyncSession, member: TeamMemberModel) -> ActionTeamMember:
+        """
+        新增团队成员
+
+        :param db: orm对象
+        :param member: 成员对象
+        :return: 新增的成员对象
+        """
+        db_member = ActionTeamMember(**member.model_dump(exclude_unset=True, exclude={'keyword'}))
+        db.add(db_member)
+        await db.flush()
+
+        return db_member
+
+    @classmethod
+    async def edit_member_dao(cls, db: AsyncSession, member: dict) -> None:
+        """
+        编辑团队成员
+
+        :param db: orm对象
+        :param member: 需要更新的成员字典
+        :return: None
+        """
+        await db.execute(update(ActionTeamMember), [member])
+
+    @classmethod
+    async def delete_member_dao(cls, db: AsyncSession, member_ids: list[int]) -> None:
+        """
+        逻辑删除团队成员
+
+        :param db: orm对象
+        :param member_ids: 成员id列表
+        :return: None
+        """
+        await db.execute(
+            update(ActionTeamMember)
+            .where(ActionTeamMember.member_id.in_(member_ids))
+            .values(del_flag='2', update_time=datetime.now())
         )
 
 
@@ -262,6 +401,147 @@ class GuidelineDao:
         await db.execute(
             update(ActionGuideline)
             .where(ActionGuideline.guideline_id.in_(guideline_ids))
+            .values(del_flag='2', update_time=datetime.now())
+        )
+
+
+class GuidelineItemDao:
+    """
+    报告规范 checklist 条目数据库操作层
+    """
+
+    @classmethod
+    async def get_item_detail_by_id(cls, db: AsyncSession, item_id: int) -> ActionGuidelineItem | None:
+        """
+        根据条目id获取详情
+
+        :param db: orm对象
+        :param item_id: 条目id
+        :return: 条目对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionGuidelineItem).where(
+                        ActionGuidelineItem.item_id == item_id, ActionGuidelineItem.del_flag == '0'
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_item_list(
+        cls,
+        db: AsyncSession,
+        query_object: GuidelineItemPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        根据查询参数获取规范条目列表
+
+        guideline_code 走 action_guideline 子查询解析成 guideline_id，
+        公开接口不必先查一次规范再查条目。
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取启用中的
+        :return: 条目列表
+        """
+        conditions = [
+            ActionGuidelineItem.del_flag == '0',
+            ActionGuidelineItem.status == '0' if only_published else True,
+            ActionGuidelineItem.guideline_id == query_object.guideline_id if query_object.guideline_id else True,
+            ActionGuidelineItem.part_no == query_object.part_no if query_object.part_no else True,
+        ]
+        if query_object.guideline_code:
+            conditions.append(
+                ActionGuidelineItem.guideline_id.in_(
+                    select(ActionGuideline.guideline_id).where(
+                        func.lower(ActionGuideline.code) == query_object.guideline_code.lower(),
+                        ActionGuideline.del_flag == '0',
+                    )
+                )
+            )
+        if query_object.keyword:
+            kw = f'%{query_object.keyword}%'
+            conditions.append(
+                ActionGuidelineItem.content_zh.like(kw)
+                | ActionGuidelineItem.content_en.like(kw)
+                | ActionGuidelineItem.domain_zh.like(kw)
+                | ActionGuidelineItem.domain_en.like(kw)
+                | ActionGuidelineItem.item_no_zh.like(kw)
+            )
+
+        query = (
+            select(ActionGuidelineItem)
+            .where(*conditions)
+            .order_by(ActionGuidelineItem.guideline_id, ActionGuidelineItem.sort_num, ActionGuidelineItem.item_id)
+            .distinct()
+        )
+
+        return await PageUtil.paginate(db, query, query_object.page_num, query_object.page_size, is_page)
+
+    @classmethod
+    async def get_max_sort_num(cls, db: AsyncSession, guideline_id: int) -> int:
+        """
+        取某规范下已有条目的最大 sort_num，供新增条目默认排到末尾
+
+        :param db: orm对象
+        :param guideline_id: 规范id
+        :return: 最大显示顺序，无条目时返回 -1
+        """
+        result = (
+            await db.execute(
+                select(func.max(ActionGuidelineItem.sort_num)).where(
+                    ActionGuidelineItem.guideline_id == guideline_id, ActionGuidelineItem.del_flag == '0'
+                )
+            )
+        ).scalar()
+
+        return -1 if result is None else int(result)
+
+    @classmethod
+    async def add_item_dao(cls, db: AsyncSession, item: GuidelineItemModel) -> ActionGuidelineItem:
+        """
+        新增规范条目
+
+        :param db: orm对象
+        :param item: 条目对象
+        :return: 新增的条目对象
+        """
+        db_item = ActionGuidelineItem(**item.model_dump(exclude_unset=True, exclude={'guideline_code', 'keyword'}))
+        db.add(db_item)
+        await db.flush()
+
+        return db_item
+
+    @classmethod
+    async def edit_item_dao(cls, db: AsyncSession, item: dict) -> None:
+        """
+        编辑规范条目
+
+        :param db: orm对象
+        :param item: 需要更新的条目字典
+        :return: None
+        """
+        await db.execute(update(ActionGuidelineItem), [item])
+
+    @classmethod
+    async def delete_item_dao(cls, db: AsyncSession, item_ids: list[int]) -> None:
+        """
+        逻辑删除规范条目
+
+        :param db: orm对象
+        :param item_ids: 条目id列表
+        :return: None
+        """
+        await db.execute(
+            update(ActionGuidelineItem)
+            .where(ActionGuidelineItem.item_id.in_(item_ids))
             .values(del_flag='2', update_time=datetime.now())
         )
 

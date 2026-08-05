@@ -1,0 +1,138 @@
+# 效应指标 / 数据类型 / 偏倚风险工具 / 合成方法 的标准化词表
+# 结构：<类别>: {标准名: [别名...]}
+
+effect_measures:
+  MD:
+    - md
+    - mean difference
+    - 均数差
+    - 均数差值
+    - weighted mean difference
+    - wmd
+  SMD:
+    - smd
+    - standardised mean difference
+    - standardized mean difference
+    - 标准化均数差
+    - hedges g
+    - cohen d
+  RR:
+    - rr
+    - risk ratio
+    - relative risk
+    - 相对危险度
+    - 危险比
+  OR:
+    - or
+    - odds ratio
+    - 比值比
+  HR:
+    - hr
+    - hazard ratio
+    - 风险比
+  RD:
+    - rd
+    - risk difference
+    - 危险度差值
+  IRR:
+    - irr
+    - incidence rate ratio
+    - rate ratio
+
+data_types:
+  二分类:
+    - dichotomous
+    - binary
+    - 二分类
+    - 二分类变量
+  连续:
+    - continuous
+    - 连续
+    - 连续变量
+  计数:
+    - count
+    - counts
+    - 计数
+    - 计数资料
+  生存:
+    - time-to-event
+    - survival
+    - 生存
+    - 时间事件
+  等级:
+    - ordinal
+    - 等级
+    - 有序分类
+
+rob_tools:
+  RoB 2:
+    - rob 2
+    - rob2
+    - rob-2
+    - risk of bias 2
+    - cochrane risk of bias 2
+    - cochrane rob 2
+  Cochrane RoB 1:
+    - cochrane risk of bias tool
+    - cochrane collaboration risk of bias
+    - rob 1
+    - cochrane 偏倚风险评估工具
+    - cochrane 手册偏倚风险
+  ROBINS-I:
+    - robins-i
+    - robins i
+  ROBINS-E:
+    - robins-e
+  NOS:
+    - newcastle-ottawa
+    - nos
+    - 纽卡斯尔-渥太华
+  JBI:
+    - jbi
+    - joanna briggs
+  Jadad:
+    - jadad
+    - 改良 jadad
+  AMSTAR 2:
+    - amstar
+    - amstar 2
+  ROBIS:
+    - robis
+
+synthesis_methods:
+  Meta分析:
+    - meta-analysis
+    - meta analysis
+    - 荟萃分析
+    - meta 分析
+    - pairwise meta-analysis
+  网状Meta分析:
+    - network meta-analysis
+    - nma
+    - 网状 meta
+    - 网络 meta
+  叙述性综合:
+    - narrative synthesis
+    - narrative summary
+    - 叙述性综合
+    - 描述性综合
+    - qualitative synthesis
+  SWiM:
+    - swim
+    - synthesis without meta-analysis
+  Vote counting:
+    - vote counting
+    - vote-counting
+    - 计票法
+
+certainty_methods:
+  GRADE:
+    - grade
+    - grading of recommendations
+    - 证据质量分级
+    - grade 分级
+  未使用:
+    - not used
+    - no formal grading
+    - 未使用
+    - 未进行证据分级

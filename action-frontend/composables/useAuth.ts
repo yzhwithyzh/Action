@@ -315,5 +315,11 @@ export function useAuth() {
     if (res.ok && res.envelope?.data) guest.value = res.envelope.data
   }
 
-  return { guest, isLoggedIn, sendCode, register, login, logout, fetchMe }
+  /**
+   * 带登录态调用官网接口。
+   *
+   * 暴露 `call` 是给报告助手这类「需要访客身份的业务接口」用的（如第三步的 checklist 校验）：
+   * 401 清理、限流提示、FastAPI 422 字段错误、超时文案这几件事只该有一份实现。
+   */
+  return { guest, isLoggedIn, sendCode, register, login, logout, fetchMe, authedCall: call }
 }

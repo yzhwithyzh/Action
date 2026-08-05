@@ -51,6 +51,58 @@ class ActionNews(Base):
     remark = Column(String(500), nullable=True, comment='备注')
 
 
+class ActionTeamMember(Base):
+    """
+    官网-团队成员
+
+    「关于我们」页的国际顾问委员会与核心执行团队，按 group_key 分组。
+    简介分三层：summary（卡片一句话）、bio（详情页履历）、contribution（对 ACTION 的贡献）。
+    """
+
+    __tablename__ = 'action_team_member'
+    __table_args__ = {'comment': '官网-团队成员'}
+
+    member_id = Column(Integer, primary_key=True, autoincrement=True, comment='成员id')
+    group_key = Column(
+        String(32),
+        nullable=False,
+        server_default=text("'board'"),
+        comment='所属组（board国际顾问委员会 core核心执行团队）',
+    )
+    name_zh = Column(String(200), nullable=False, comment='姓名（中文）')
+    name_en = Column(String(200), nullable=True, server_default=text("''"), comment='姓名（英文）')
+    honorific = Column(String(32), nullable=True, server_default=text("''"), comment='称谓（Prof./Dr.）')
+    title_zh = Column(String(300), nullable=True, server_default=text("''"), comment='职称/头衔（中文）')
+    title_en = Column(String(500), nullable=True, server_default=text("''"), comment='职称/头衔（英文）')
+    affiliation_zh = Column(String(500), nullable=True, server_default=text("''"), comment='所属机构（中文）')
+    affiliation_en = Column(String(800), nullable=True, server_default=text("''"), comment='所属机构（英文）')
+    role_zh = Column(String(300), nullable=True, server_default=text("''"), comment='在 ACTION 中的角色（中文）')
+    role_en = Column(String(500), nullable=True, server_default=text("''"), comment='在 ACTION 中的角色（英文）')
+    expertise_zh = Column(
+        String(500), nullable=True, server_default=text("''"), comment='研究方向标签（中文，顿号分隔）'
+    )
+    expertise_en = Column(
+        String(800), nullable=True, server_default=text("''"), comment='研究方向标签（英文，分号分隔）'
+    )
+    summary_zh = Column(Text, nullable=True, comment='一句话简介（中文）')
+    summary_en = Column(Text, nullable=True, comment='一句话简介（英文）')
+    bio_zh = Column(Text, nullable=True, comment='详细履历（中文）')
+    bio_en = Column(Text, nullable=True, comment='详细履历（英文）')
+    contribution_zh = Column(Text, nullable=True, comment='对 ACTION 的贡献（中文）')
+    contribution_en = Column(Text, nullable=True, comment='对 ACTION 的贡献（英文）')
+    avatar_url = Column(String(300), nullable=True, server_default=text("''"), comment='头像地址')
+    homepage_url = Column(String(500), nullable=True, server_default=text("''"), comment='个人主页/学术档案链接')
+    email = Column(String(200), nullable=True, server_default=text("''"), comment='联系邮箱')
+    sort_num = Column(Integer, nullable=True, server_default='0', comment='组内显示顺序')
+    status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_by = Column(String(64), nullable=True, server_default=text("''"), comment='创建者')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_by = Column(String(64), nullable=True, server_default=text("''"), comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+    remark = Column(String(500), nullable=True, comment='备注')
+
+
 class ActionGuideline(Base):
     """
     官网-报告规范目录
@@ -85,6 +137,39 @@ class ActionGuideline(Base):
     logo_url = Column(String(300), nullable=True, server_default="''", comment='标识图地址')
     release_state = Column(String(32), nullable=True, server_default="'open'", comment='开放状态（open/beta/soon）')
     sort_num = Column(Integer, nullable=True, server_default='0', comment='显示顺序')
+    status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_by = Column(String(64), nullable=True, server_default="''", comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+    remark = Column(String(500), nullable=True, comment='备注')
+
+
+class ActionGuidelineItem(Base):
+    """
+    官网-报告规范checklist条目
+    """
+
+    __tablename__ = 'action_guideline_item'
+    __table_args__ = {'comment': '官网-报告规范checklist条目'}
+
+    item_id = Column(Integer, primary_key=True, autoincrement=True, comment='条目id')
+    guideline_id = Column(Integer, nullable=False, comment='所属规范id')
+    part_no = Column(Integer, nullable=True, server_default='1', comment='所属清单表序号（一份规范可能含多张表）')
+    part_zh = Column(String(300), nullable=True, server_default="''", comment='清单表标题（中文）')
+    part_en = Column(String(500), nullable=True, server_default="''", comment='清单表标题（英文）')
+    domain_zh = Column(String(300), nullable=True, server_default="''", comment='章节/主题/领域（中文）')
+    domain_en = Column(String(500), nullable=True, server_default="''", comment='章节/主题/领域（英文）')
+    item_no_zh = Column(String(64), nullable=True, server_default="''", comment='条目号（中文，如 1a）')
+    item_no_en = Column(String(64), nullable=True, server_default="''", comment='条目号（英文，如 1a）')
+    content_zh = Column(Text, nullable=True, comment='条目内容（中文）')
+    content_en = Column(Text, nullable=True, comment='条目内容（英文）')
+    ext_label_zh = Column(String(200), nullable=True, server_default="''", comment='扩展列列名（中文）')
+    ext_label_en = Column(String(300), nullable=True, server_default="''", comment='扩展列列名（英文）')
+    extension_zh = Column(Text, nullable=True, comment='扩展/对照条目内容（中文）')
+    extension_en = Column(Text, nullable=True, comment='扩展/对照条目内容（英文）')
+    sort_num = Column(Integer, nullable=True, server_default='0', comment='规范内显示顺序')
     status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
     del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
     create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')

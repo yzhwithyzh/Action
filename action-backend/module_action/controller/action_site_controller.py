@@ -11,6 +11,8 @@ from common.router import APIRouterPro
 from common.vo import DataResponseModel, DynamicResponseModel, PageResponseModel, ResponseBaseModel
 from module_action.entity.vo.action_vo import (
     CfirDomainModel,
+    ChecklistReviewStateModel,
+    ChecklistReviewSubmitModel,
     CollabRequestSubmitModel,
     GuestEmailCodeModel,
     GuestInfoModel,
@@ -18,6 +20,9 @@ from module_action.entity.vo.action_vo import (
     GuestPublicInfoModel,
     GuestRegisterModel,
     GuestTokenModel,
+    GuidelineItemModel,
+    GuidelineItemPageQueryModel,
+    GuidelineItemQueryModel,
     GuidelineModel,
     GuidelinePageQueryModel,
     NewsModel,
@@ -25,14 +30,19 @@ from module_action.entity.vo.action_vo import (
     ReaimDimensionModel,
     SrdAssessmentModel,
     StudyTypeModel,
+    TeamMemberModel,
+    TeamMemberPageQueryModel,
 )
 from module_action.service.action_service import (
+    ChecklistReviewService,
     CollabRequestService,
+    GuidelineItemService,
     GuidelineService,
     ImplementationService,
     NewsService,
     SrdService,
     StudyTypeService,
+    TeamMemberService,
 )
 from module_action.service.guest_auth_service import GuestAuthService
 from utils.log_util import logger
@@ -89,6 +99,44 @@ async def get_site_news_detail(
 
 
 @action_site_controller.get(
+    '/team-members',
+    summary='获取团队成员列表',
+    description=(
+        '官网公开接口，返回启用中的国际顾问委员会与核心执行团队成员，'
+        '已按「组 → 组内顺序」排好，前台按 groupKey 分段渲染。'
+    ),
+    response_model=DataResponseModel[list[TeamMemberModel]],
+)
+async def get_site_team_members(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    group_key: str | None = Query(default=None, alias='groupKey', description='所属组（board/core），留空取全部'),
+) -> Response:
+    page_query = TeamMemberPageQueryModel(groupKey=group_key) if group_key else TeamMemberPageQueryModel()
+    result = await TeamMemberService.get_member_list_services(query_db, page_query, only_published=True)
+    logger.info('获取团队成员列表成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/team-members/{member_id}',
+    summary='获取团队成员详情',
+    description='官网公开接口，供成员详情页展示完整履历与对 ACTION 的贡献',
+    response_model=DataResponseModel[TeamMemberModel],
+)
+async def get_site_team_member_detail(
+    request: Request,
+    member_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await TeamMemberService.member_detail_services(query_db, member_id)
+    logger.info(f'获取团队成员{member_id}详情成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
     '/guidelines',
     summary='获取报告规范目录',
     description='官网公开接口，返回启用中的报告规范目录',
@@ -105,6 +153,33 @@ async def get_site_guideline_list(
     logger.info('获取报告规范目录成功')
 
     return ResponseUtil.success(model_content=result)
+
+
+@action_site_controller.get(
+    '/guideline-items',
+    summary='获取某份规范的 checklist 条目',
+    description=(
+        '官网公开接口，供报告助手第二步（结构化模板）与第三步（逐条校验）取条目。'
+        '按 guidelineCode 或 guidelineId 取，多张清单表已按 sortNum 合并成一条流水清单。'
+    ),
+    response_model=DataResponseModel[list[GuidelineItemModel]],
+)
+async def get_site_guideline_items(
+    request: Request,
+    item_query: Annotated[GuidelineItemQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    if not item_query.guideline_code and not item_query.guideline_id:
+        # 不给过滤条件会把 6 份规范 282 条全量吐出去，对公开接口没意义
+        return ResponseUtil.failure(msg='请指定 guidelineCode 或 guidelineId')
+    # 必须 by_alias：本模块的 VO 用了 alias_generator=to_camel 且没开 populate_by_name，
+    # 传 snake_case 字段名会被 pydantic 静默丢掉（extra 默认 ignore），
+    # 于是 guideline_code/guideline_id 双双落空、上面的守卫形同虚设，接口会把 282 条全量吐出。
+    page_query = GuidelineItemPageQueryModel(**item_query.model_dump(by_alias=True))
+    result = await GuidelineItemService.get_item_list_services(query_db, page_query, only_published=True)
+    logger.info('获取规范条目成功')
+
+    return ResponseUtil.success(data=result)
 
 
 @action_site_controller.get(
@@ -185,6 +260,65 @@ async def get_site_srd_sample(
     logger.info('获取SRD示例评估成功')
 
     return ResponseUtil.success(data=result)
+
+
+# ---------------------------------------------------------------- 报告助手第三步：checklist 逐条校验
+#
+# 提交接口会触发几十次模型调用，必须挂限流且要求访客登录 —— 匿名放开等于把账单交给公网。
+# 稿件正文只进 Redis 队列与 worker 工作目录，不落业务库：那是用户未发表的研究稿件。
+
+
+@action_site_controller.post(
+    '/checklist-review',
+    summary='提交稿件做 checklist 逐条校验',
+    description='报告助手第三步。提交后立即返回任务id，结果通过状态接口轮询获取',
+    response_model=DataResponseModel[str],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_CHECKLIST_REVIEW, preset=ApiRateLimitPreset.USER_RESOURCE_EXECUTION)
+async def submit_site_checklist_review(
+    request: Request,
+    submit: ChecklistReviewSubmitModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    session_id = await ChecklistReviewService.submit_review_services(query_db, submit, current_guest.user_id)
+    logger.info(f'checklist 校验任务已提交：{session_id}')
+
+    return ResponseUtil.success(data=session_id, msg='已提交，正在校验')
+
+
+@action_site_controller.get(
+    '/checklist-review/{session_id}',
+    summary='查询 checklist 校验任务状态',
+    description='报告助手第三步的轮询接口，完成后 result 里带逐条判定',
+    response_model=DataResponseModel[ChecklistReviewStateModel],
+)
+async def get_site_checklist_review(
+    request: Request,
+    session_id: str,
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ChecklistReviewService.review_state_services(session_id)
+    logger.info(f'查询 checklist 校验任务 {session_id} 状态成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.post(
+    '/checklist-review/{session_id}/stop',
+    summary='停止 checklist 校验任务',
+    description='报告助手第三步的中止按钮',
+    response_model=ResponseBaseModel,
+)
+async def stop_site_checklist_review(
+    request: Request,
+    session_id: str,
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ChecklistReviewService.stop_review_services(session_id)
+    logger.info(f'已请求停止 checklist 校验任务 {session_id}')
+
+    return ResponseUtil.success(msg=result.message)
 
 
 @action_site_controller.post(
