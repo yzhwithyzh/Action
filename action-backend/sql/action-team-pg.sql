@@ -5,6 +5,9 @@
 -- 该版为每位成员补了头像与详细履历。头像已抽出并压缩到 action-frontend/public/team/*.jpg，
 -- 本表只存相对路径，换图直接替换同名文件或在后台改 avatar_url。
 --
+-- 顾问委员会的 Akihiko Ozaki 来自更后一版《How we are organised(3).docx》，
+-- 按该文档的排列插在 Myeong Soo Lee 之后（board 组 sort_num 2，其后各位顺延）。
+--
 -- 成员的日常增删改走后台「团队成员管理」页面（action:teamMember:*），不要手改本文件。
 --
 -- 关于 name_zh：docx 与仓库里其余材料通篇只给了拉丁文姓名，没有一处中文名可核对。
@@ -13,6 +16,8 @@
 -- 4 位韩国籍成员（Myeong Soo Lee / Ye-seul Lee / Changsop Yang / Tae-Hun Kim）不译：
 -- 예슬(Ye-seul) 本身没有对应汉字，其余三位的汉字名同样无从确认；
 -- 中文学术站对外籍学者保留罗马字姓名是通行做法。
+-- 日籍的 Akihiko Ozaki 同理保留罗马字（其汉字名与所在医院的汉字写法在材料里都没有出处，
+-- 按读音倒推等于替甲方拍板）；甲方若给出汉字名，直接在后台「团队成员管理」页改。
 -- ----------------------------
 
 begin;
@@ -98,6 +103,20 @@ values
  'As a key member of the RIGHT Working Group, he delivers top-tier methodological guidance to ACTION, supporting the construction of acupuncture reporting standards, evidence assessment tools and global popularization of standardized clinical research norms.',
  'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/myeong-soo-lee.jpg', 1, '0', '0', 'migration', current_timestamp),
 
+('board', 'Akihiko Ozaki', 'Akihiko Ozaki', 'Prof.',
+ '乳腺与甲状腺中心主任（医学博士）', 'Director, Breast & Thyroid Center, MD, PhD',
+ '日本福岛 Jyoban 医院', 'Jyoban Hospital, Fukushima, Japan',
+ 'AI 研究伦理与研究透明化', 'AI research ethics & research transparency',
+ '卫生政策、研究透明化、利益冲突治理、灾难医学、AI 临床支持系统',
+ 'Health policy; Research transparency; Conflict-of-interest governance; Disaster medicine; AI-based clinical support systems',
+ '日本 Yen For Docs 数据库创建者，在 The Lancet、BMJ Evidence-Based Medicine 等期刊发表同行评议论文 426 余篇，并参与研制生成式 AI 医学研究报告规范 GAMER。',
+ 'Founder of the Yen For Docs database; author of 426+ peer-reviewed papers in journals including The Lancet and BMJ Evidence-Based Medicine, and co-developer of the GAMER reporting guideline for generative AI in medical research.',
+ 'Akihiko Ozaki 教授，医学博士，现任日本福岛 Jyoban 医院乳腺与甲状腺中心主任。他是一位兼具临床实践与公共卫生双重专长的医师科学家，核心研究涵盖卫生政策、研究透明化、利益冲突治理、灾难医学以及基于 AI 的临床支持系统研发。他创建了 Yen For Docs 数据库——该数据库系统分析日本医药企业向医疗从业者的支付情况，在日本全国范围内广受认可。他已在 The Lancet、BMJ Evidence-Based Medicine 等期刊发表同行评议论文 426 余篇，并参与研制了面向医学研究中生成式 AI 的报告规范 GAMER。',
+ 'Prof. Akihiko Ozaki, MD, PhD, serves as Director of the Breast & Thyroid Center at Jyoban Hospital, Fukushima, Japan. A physician-researcher with dual expertise in clinical practice and public health, his core research covers health policy, research transparency, conflicts of interest governance, disaster medicine, and the development of AI-based clinical support systems. He is the founder of Yen For Docs, a nationally recognized database systematically analyzing industry payments to healthcare professionals in Japan. He has published over 426 peer-reviewed papers in journals including The Lancet and BMJ Evidence-Based Medicine, and co-developed the GAMER reporting guideline for generative AI in medical research.',
+ '作为 ACTION 的国际顾问，他在 AI 研究伦理、报告标准化与研究透明化治理方面提供权威指导，进一步夯实平台智能研究工具的方法学严谨性与伦理框架。',
+ 'As an international advisor to ACTION, he provides authoritative guidance on AI research ethics, reporting standardization and research transparency governance, further strengthening the methodological rigor and ethical framework of the platform''s intelligent research tools.',
+ 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/akihiko-ozaki.jpg', 2, '0', '0', 'migration', current_timestamp),
+
 ('board', '刘存志', 'Cunzhi Liu', 'Prof.',
  '副校长', 'Vice President',
  '北京中医药大学', 'Beijing University of Chinese Medicine',
@@ -109,7 +128,7 @@ values
  'Prof. Cunzhi Liu, Vice President of Beijing University of Chinese Medicine, is a top-tier acupuncture scholar awarded the National Science Fund for Distinguished Young Scholars and the Qihuang Scholar title. His research focuses on acupuncture clinical efficacy evaluation and underlying mechanisms. He has published over 300 high-impact articles in journals like JAMA Internal Medicine and is recognized as one of the world''s most influential acupuncture scientists.',
  '他领衔针灸疗效评价重点实验室，为 ACTION 的真实世界临床证据库、案例示范模块，以及报告规范在国内针刺试验中的落地应用提供坚实的学术支撑。',
  'Leading the Key Laboratory for Acupuncture Therapy Evaluation, he provides solid academic backing for ACTION''s real-world clinical evidence library, case demonstration modules and the application of standardized reporting specifications in domestic acupuncture trials.',
- 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/cunzhi-liu.jpg', 2, '0', '0', 'migration', current_timestamp),
+ 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/cunzhi-liu.jpg', 3, '0', '0', 'migration', current_timestamp),
 
 ('board', '闫世艳', 'Shiyan Yan', 'Prof.',
  '研究员、博士生导师', 'Researcher and doctoral supervisor',
@@ -122,7 +141,7 @@ values
  'Prof. Shiyan Yan is a researcher and doctoral supervisor at Beijing University of Chinese Medicine, a visiting scholar in data science at Stanford University, and an academic backbone of acupuncture methodology research. Her core research focuses on acupuncture clinical efficacy evaluation, innovative trial design, statistical methodologies and the development of acupuncture research reporting standards. She has presided over 11 national-level projects, published more than 160 academic papers and acts as an editorial board member for multiple authoritative acupuncture journals.',
  '她为 ACTION 智能平台贡献临床统计核查与试验设计规范方面的专业能力，赋能平台的报告质量自动核查工具与针刺临床研究标准化写作模板。',
  'For the ACTION intelligent platform, she contributes professional expertise in clinical statistical verification and trial design norms, empowering the platform''s automatic reporting quality checking tools and standardized writing templates for acupuncture clinical studies.',
- 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/shiyan-yan.jpg', 3, '0', '0', 'migration', current_timestamp),
+ 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/shiyan-yan.jpg', 4, '0', '0', 'migration', current_timestamp),
 
 ('board', '卢立明', 'Liming Lu', 'Prof.',
  '针灸大数据实验室负责人', 'Head, Acupuncture Big Data Lab',
@@ -135,7 +154,7 @@ values
  'Prof. Liming Lu heads the Acupuncture Big Data Lab at Guangzhou University of Chinese Medicine and is an internationally acclaimed acupuncture methodologist. He developed RIGHT for Acupuncture, the world''s first reporting guideline for acupuncture clinical practice guidelines, which forms the core normative foundation of ACTION. Listed in Stanford''s World''s Top 2% Scientists, he has released over 300 peer-reviewed works, including a landmark acupuncture evidence map covered by TIME Magazine.',
  '他为 ACTION 的智能写作模板、报告质量自动核查工具，以及研究规范向临床日常与期刊编辑实践的转化提供核心专业支持。',
  'He contributes core expertise to ACTION''s intelligent writing templates, automatic reporting quality inspection tools and the translation of research standards into routine clinical and journal editorial practice.',
- 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/liming-lu.jpg', 4, '0', '0', 'migration', current_timestamp),
+ 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/liming-lu.jpg', 5, '0', '0', 'migration', current_timestamp),
 
 ('board', '于林', 'Lin Yu', 'Prof.',
  '院长、教授、博士生导师', 'President, professor and doctoral supervisor',
@@ -148,7 +167,7 @@ values
  'Prof. Lin Yu is the President of the Affiliated Hospital of Traditional Chinese Medicine of Guangzhou Medical University (Guangzhou Hospital of Acupuncture), professor and doctoral supervisor, and director of the Guangzhou Institute of Acupuncture Clinical Medicine. He is a leading expert in the integrated Chinese-Western medicine treatment of mental disorders, and has long promoted the grassroots promotion and translational application of acupuncture technology.',
  '他在针刺报告规范的真实世界适用性与基层转化价值方面，为 ACTION 提供临床实践层面的指导。',
  'He provides clinical practice guidance for ACTION on the real-world applicability and grassroots transformation value of acupuncture reporting standards.',
- 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/lin-yu.jpg', 5, '0', '0', 'migration', current_timestamp),
+ 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/lin-yu.jpg', 6, '0', '0', 'migration', current_timestamp),
 
 ('board', '陈全福', 'Quanfu Chen', 'Prof.',
  '副院长、主任医师、博士生导师', 'Vice President, chief physician and doctoral supervisor',
@@ -161,7 +180,7 @@ values
  'Prof. Quanfu Chen, MD, chief physician and doctoral supervisor, is Vice President and Cardiovascular Clinical PI at The Affiliated TCM Hospital of Guangzhou Medical University. He received mentorship from national TCM master Prof. Zhang Daning and Academician Wu Yiling, and is one of China''s outstanding national clinical TCM talents. He holds leading academic positions in numerous national and provincial integrated medicine committees. His research concentrates on integrated Chinese-Western cardiovascular and critical care medicine, with core academic characteristics of acupuncture-herbal combined therapy. He also applies behavioral psychology and cognitive neuroscience to advance clinical quality management.',
  '他以务实的临床洞察支持 ACTION，帮助规范真实世界中针药并用研究方案的设计与报告。',
  'He supports ACTION with practical clinical insights for standardizing real-world acupuncture and herbal combined research protocols.',
- 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/quanfu-chen.jpg', 6, '0', '0', 'migration', current_timestamp);
+ 'https://action-gmu.oss-cn-guangzhou.aliyuncs.com/site/team/quanfu-chen.jpg', 7, '0', '0', 'migration', current_timestamp);
 
 -- ---------------------------------------------------------------- 核心执行团队
 
