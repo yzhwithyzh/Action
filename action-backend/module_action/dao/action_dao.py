@@ -15,9 +15,11 @@ from module_action.entity.do.action_do import (
     ActionEricStrategy,
     ActionGuestProfile,
     ActionGuideline,
+    ActionGuidelineCategory,
     ActionGuidelineItem,
     ActionNews,
     ActionReaimDimension,
+    ActionResourceLink,
     ActionSrdAssessment,
     ActionSrdDomain,
     ActionSrdGroup,
@@ -29,12 +31,16 @@ from module_action.entity.do.action_do import (
 )
 from module_action.entity.vo.action_vo import (
     CollabRequestPageQueryModel,
+    GuidelineCategoryModel,
+    GuidelineCategoryPageQueryModel,
     GuidelineItemModel,
     GuidelineItemPageQueryModel,
     GuidelineModel,
     GuidelinePageQueryModel,
     NewsModel,
     NewsPageQueryModel,
+    ResourceLinkModel,
+    ResourceLinkPageQueryModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
 )
@@ -283,6 +289,129 @@ class TeamMemberDao:
         )
 
 
+class ResourceLinkDao:
+    """
+    官网资源中心链接数据库操作层
+    """
+
+    @classmethod
+    async def get_link_detail_by_id(cls, db: AsyncSession, link_id: int) -> ActionResourceLink | None:
+        """
+        根据资源id获取详情
+
+        :param db: orm对象
+        :param link_id: 资源id
+        :return: 资源对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionResourceLink).where(
+                        ActionResourceLink.link_id == link_id, ActionResourceLink.del_flag == '0'
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_link_list(
+        cls,
+        db: AsyncSession,
+        query_object: ResourceLinkPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        根据查询参数获取资源中心链接列表
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取启用中的
+        :return: 资源列表
+        """
+        conditions = [
+            ActionResourceLink.del_flag == '0',
+            ActionResourceLink.status == '0' if only_published else True,
+            ActionResourceLink.status == query_object.status if query_object.status and not only_published else True,
+        ]
+        if query_object.keyword:
+            kw = f'%{query_object.keyword}%'
+            conditions.append(
+                ActionResourceLink.name_zh.like(kw)
+                | ActionResourceLink.name_en.like(kw)
+                | ActionResourceLink.summary_zh.like(kw)
+                | ActionResourceLink.summary_en.like(kw)
+                | ActionResourceLink.url.like(kw)
+            )
+
+        query = (
+            select(ActionResourceLink)
+            .where(*conditions)
+            .order_by(ActionResourceLink.sort_num, ActionResourceLink.link_id)
+            .distinct()
+        )
+
+        return await PageUtil.paginate(db, query, query_object.page_num, query_object.page_size, is_page)
+
+    @classmethod
+    async def get_max_sort_num(cls, db: AsyncSession) -> int:
+        """
+        取已有资源的最大 sort_num，供新增资源默认排到末尾
+
+        :param db: orm对象
+        :return: 最大显示顺序，无记录时返回 -1
+        """
+        result = (
+            await db.execute(select(func.max(ActionResourceLink.sort_num)).where(ActionResourceLink.del_flag == '0'))
+        ).scalar()
+
+        return -1 if result is None else int(result)
+
+    @classmethod
+    async def add_link_dao(cls, db: AsyncSession, link: ResourceLinkModel) -> ActionResourceLink:
+        """
+        新增资源中心链接
+
+        :param db: orm对象
+        :param link: 资源对象
+        :return: 新增的资源对象
+        """
+        db_link = ActionResourceLink(**link.model_dump(exclude_unset=True, exclude={'keyword'}))
+        db.add(db_link)
+        await db.flush()
+
+        return db_link
+
+    @classmethod
+    async def edit_link_dao(cls, db: AsyncSession, link: dict) -> None:
+        """
+        编辑资源中心链接
+
+        :param db: orm对象
+        :param link: 需要更新的资源字典
+        :return: None
+        """
+        await db.execute(update(ActionResourceLink), [link])
+
+    @classmethod
+    async def delete_link_dao(cls, db: AsyncSession, link_ids: list[int]) -> None:
+        """
+        逻辑删除资源中心链接
+
+        :param db: orm对象
+        :param link_ids: 资源id列表
+        :return: None
+        """
+        await db.execute(
+            update(ActionResourceLink)
+            .where(ActionResourceLink.link_id.in_(link_ids))
+            .values(del_flag='2', update_time=datetime.now())
+        )
+
+
 class GuidelineDao:
     """
     官网报告规范目录数据库操作层
@@ -347,21 +476,66 @@ class GuidelineDao:
         :param only_published: 是否只取启用中的
         :return: 规范列表
         """
+        conditions = [
+            ActionGuideline.del_flag == '0',
+            ActionGuideline.status == '0' if only_published else True,
+            ActionGuideline.name_zh.like(f'%{query_object.name_zh}%') if query_object.name_zh else True,
+            func.lower(ActionGuideline.code).like(f'%{query_object.code.lower()}%') if query_object.code else True,
+            ActionGuideline.study_type == query_object.study_type if query_object.study_type else True,
+            ActionGuideline.release_state == query_object.release_state if query_object.release_state else True,
+            ActionGuideline.status == query_object.status if query_object.status and not only_published else True,
+        ]
+        if query_object.keyword:
+            kw = f'%{query_object.keyword}%'
+            conditions.append(
+                ActionGuideline.code.like(kw)
+                | ActionGuideline.name_zh.like(kw)
+                | ActionGuideline.name_en.like(kw)
+                | ActionGuideline.summary_zh.like(kw)
+                | ActionGuideline.summary_en.like(kw)
+            )
+
         query = (
             select(ActionGuideline)
-            .where(
-                ActionGuideline.del_flag == '0',
-                ActionGuideline.status == '0' if only_published else True,
-                ActionGuideline.name_zh.like(f'%{query_object.name_zh}%') if query_object.name_zh else True,
-                func.lower(ActionGuideline.code).like(f'%{query_object.code.lower()}%') if query_object.code else True,
-                ActionGuideline.study_type == query_object.study_type if query_object.study_type else True,
-                ActionGuideline.release_state == query_object.release_state if query_object.release_state else True,
-            )
+            .where(*conditions)
             .order_by(ActionGuideline.sort_num, ActionGuideline.guideline_id)
             .distinct()
         )
 
         return await PageUtil.paginate(db, query, query_object.page_num, query_object.page_size, is_page)
+
+    @classmethod
+    async def get_max_sort_num(cls, db: AsyncSession) -> int:
+        """
+        取已有规范的最大 sort_num，供新增规范默认排到目录末尾
+
+        :param db: orm对象
+        :return: 最大显示顺序，无记录时返回 -1
+        """
+        result = (
+            await db.execute(select(func.max(ActionGuideline.sort_num)).where(ActionGuideline.del_flag == '0'))
+        ).scalar()
+
+        return -1 if result is None else int(result)
+
+    @classmethod
+    async def count_by_study_type(cls, db: AsyncSession, study_type: str) -> int:
+        """
+        统计某个分类下还挂着多少份规范，供删除分类前做占用校验
+
+        :param db: orm对象
+        :param study_type: 分类标识
+        :return: 规范数量
+        """
+        result = (
+            await db.execute(
+                select(func.count(ActionGuideline.guideline_id)).where(
+                    ActionGuideline.study_type == study_type, ActionGuideline.del_flag == '0'
+                )
+            )
+        ).scalar()
+
+        return int(result or 0)
 
     @classmethod
     async def add_guideline_dao(cls, db: AsyncSession, guideline: GuidelineModel) -> ActionGuideline:
@@ -372,7 +546,7 @@ class GuidelineDao:
         :param guideline: 规范对象
         :return: 新增的规范对象
         """
-        db_guideline = ActionGuideline(**guideline.model_dump(exclude_unset=True))
+        db_guideline = ActionGuideline(**guideline.model_dump(exclude_unset=True, exclude={'keyword'}))
         db.add(db_guideline)
         await db.flush()
 
@@ -401,6 +575,153 @@ class GuidelineDao:
         await db.execute(
             update(ActionGuideline)
             .where(ActionGuideline.guideline_id.in_(guideline_ids))
+            .values(del_flag='2', update_time=datetime.now())
+        )
+
+
+class GuidelineCategoryDao:
+    """
+    官网报告规范分类数据库操作层
+    """
+
+    @classmethod
+    async def get_category_detail_by_id(cls, db: AsyncSession, cat_id: int) -> ActionGuidelineCategory | None:
+        """
+        根据分类id获取详情
+
+        :param db: orm对象
+        :param cat_id: 分类id
+        :return: 分类对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionGuidelineCategory).where(
+                        ActionGuidelineCategory.cat_id == cat_id, ActionGuidelineCategory.del_flag == '0'
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_category_by_key(cls, db: AsyncSession, cat_key: str) -> ActionGuidelineCategory | None:
+        """
+        根据分类标识获取分类
+
+        :param db: orm对象
+        :param cat_key: 分类标识
+        :return: 分类对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionGuidelineCategory).where(
+                        ActionGuidelineCategory.cat_key == cat_key, ActionGuidelineCategory.del_flag == '0'
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_category_list(
+        cls,
+        db: AsyncSession,
+        query_object: GuidelineCategoryPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        根据查询参数获取报告规范分类列表
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取启用中的
+        :return: 分类列表
+        """
+        conditions = [
+            ActionGuidelineCategory.del_flag == '0',
+            ActionGuidelineCategory.status == '0' if only_published else True,
+            ActionGuidelineCategory.cat_key == query_object.cat_key if query_object.cat_key else True,
+            ActionGuidelineCategory.status == query_object.status
+            if query_object.status and not only_published
+            else True,
+        ]
+        if query_object.keyword:
+            kw = f'%{query_object.keyword}%'
+            conditions.append(
+                ActionGuidelineCategory.cat_key.like(kw)
+                | ActionGuidelineCategory.name_zh.like(kw)
+                | ActionGuidelineCategory.name_en.like(kw)
+            )
+
+        query = (
+            select(ActionGuidelineCategory)
+            .where(*conditions)
+            .order_by(ActionGuidelineCategory.sort_num, ActionGuidelineCategory.cat_id)
+            .distinct()
+        )
+
+        return await PageUtil.paginate(db, query, query_object.page_num, query_object.page_size, is_page)
+
+    @classmethod
+    async def get_max_sort_num(cls, db: AsyncSession) -> int:
+        """
+        取已有分类的最大 sort_num，供新增分类默认排到筛选条末尾
+
+        :param db: orm对象
+        :return: 最大显示顺序，无记录时返回 -1
+        """
+        result = (
+            await db.execute(
+                select(func.max(ActionGuidelineCategory.sort_num)).where(ActionGuidelineCategory.del_flag == '0')
+            )
+        ).scalar()
+
+        return -1 if result is None else int(result)
+
+    @classmethod
+    async def add_category_dao(cls, db: AsyncSession, category: GuidelineCategoryModel) -> ActionGuidelineCategory:
+        """
+        新增报告规范分类
+
+        :param db: orm对象
+        :param category: 分类对象
+        :return: 新增的分类对象
+        """
+        db_category = ActionGuidelineCategory(**category.model_dump(exclude_unset=True, exclude={'keyword'}))
+        db.add(db_category)
+        await db.flush()
+
+        return db_category
+
+    @classmethod
+    async def edit_category_dao(cls, db: AsyncSession, category: dict) -> None:
+        """
+        编辑报告规范分类
+
+        :param db: orm对象
+        :param category: 需要更新的分类字典
+        :return: None
+        """
+        await db.execute(update(ActionGuidelineCategory), [category])
+
+    @classmethod
+    async def delete_category_dao(cls, db: AsyncSession, cat_ids: list[int]) -> None:
+        """
+        逻辑删除报告规范分类
+
+        :param db: orm对象
+        :param cat_ids: 分类id列表
+        :return: None
+        """
+        await db.execute(
+            update(ActionGuidelineCategory)
+            .where(ActionGuidelineCategory.cat_id.in_(cat_ids))
             .values(del_flag='2', update_time=datetime.now())
         )
 
@@ -863,6 +1184,171 @@ class SrdDao:
             )
             .scalars()
             .all()
+        )
+
+    # ------------------------------------------------------------------ 任务记录
+
+    @classmethod
+    async def get_assessment_by_session(cls, db: AsyncSession, session_id: str) -> ActionSrdAssessment | None:
+        """
+        根据 worker 任务id获取评估记录
+
+        :param db: orm对象
+        :param session_id: worker任务id
+        :return: 评估对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionSrdAssessment).where(
+                        ActionSrdAssessment.session_id == session_id, ActionSrdAssessment.del_flag == '0'
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def add_assessment_dao(cls, db: AsyncSession, values: dict[str, Any]) -> ActionSrdAssessment:
+        """
+        新增评估记录
+
+        :param db: orm对象
+        :param values: 列名到值的映射
+        :return: 新增的评估对象
+        """
+        row = ActionSrdAssessment(**values)
+        db.add(row)
+        await db.flush()
+
+        return row
+
+    @classmethod
+    async def edit_assessment_dao(cls, db: AsyncSession, assessment_id: int, values: dict[str, Any]) -> None:
+        """
+        更新评估记录
+
+        :param db: orm对象
+        :param assessment_id: 评估id
+        :param values: 列名到值的映射
+        :return:
+        """
+        await db.execute(
+            update(ActionSrdAssessment).where(ActionSrdAssessment.assessment_id == assessment_id).values(**values)
+        )
+
+    @classmethod
+    async def get_user_assessments(cls, db: AsyncSession, user_id: int, limit: int) -> list[ActionSrdAssessment]:
+        """
+        获取某访客的评估历史（新的在前）
+
+        :param db: orm对象
+        :param user_id: 访客用户id
+        :param limit: 返回条数上限
+        :return: 评估列表
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionSrdAssessment)
+                    .where(ActionSrdAssessment.user_id == user_id, ActionSrdAssessment.del_flag == '0')
+                    .order_by(ActionSrdAssessment.assessment_id.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def clear_result_tree(cls, db: AsyncSession, assessment_id: int) -> None:
+        """
+        清空一次评估已落库的领域/分组/条目
+
+        重跑同一个 session_id（worker 支持断点续跑）时先清后写，否则会叠出两套 34 条目。
+
+        :param db: orm对象
+        :param assessment_id: 评估id
+        :return:
+        """
+        domain_ids = list(
+            (
+                await db.execute(
+                    select(ActionSrdDomain.domain_id).where(ActionSrdDomain.assessment_id == assessment_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if domain_ids:
+            group_ids = list(
+                (await db.execute(select(ActionSrdGroup.group_id).where(ActionSrdGroup.domain_id.in_(domain_ids))))
+                .scalars()
+                .all()
+            )
+            if group_ids:
+                await db.execute(delete(ActionSrdItem).where(ActionSrdItem.group_id.in_(group_ids)))
+            await db.execute(delete(ActionSrdGroup).where(ActionSrdGroup.domain_id.in_(domain_ids)))
+            await db.execute(delete(ActionSrdDomain).where(ActionSrdDomain.assessment_id == assessment_id))
+
+    @classmethod
+    async def add_domain_dao(cls, db: AsyncSession, values: dict[str, Any]) -> ActionSrdDomain:
+        """
+        新增领域
+
+        :param db: orm对象
+        :param values: 列名到值的映射
+        :return: 新增的领域对象
+        """
+        row = ActionSrdDomain(**values)
+        db.add(row)
+        await db.flush()
+
+        return row
+
+    @classmethod
+    async def add_group_dao(cls, db: AsyncSession, values: dict[str, Any]) -> ActionSrdGroup:
+        """
+        新增分组
+
+        :param db: orm对象
+        :param values: 列名到值的映射
+        :return: 新增的分组对象
+        """
+        row = ActionSrdGroup(**values)
+        db.add(row)
+        await db.flush()
+
+        return row
+
+    @classmethod
+    async def add_items_dao(cls, db: AsyncSession, rows: list[dict[str, Any]]) -> None:
+        """
+        批量新增条目
+
+        :param db: orm对象
+        :param rows: 列名到值的映射列表
+        :return:
+        """
+        if not rows:
+            return
+        db.add_all([ActionSrdItem(**r) for r in rows])
+        await db.flush()
+
+    @classmethod
+    async def soft_delete_assessment_dao(cls, db: AsyncSession, assessment_id: int) -> None:
+        """
+        逻辑删除评估记录（领域/分组/条目保持不动，跟着主记录一起看不见）
+
+        :param db: orm对象
+        :param assessment_id: 评估id
+        :return:
+        """
+        await db.execute(
+            update(ActionSrdAssessment)
+            .where(ActionSrdAssessment.assessment_id == assessment_id)
+            .values(del_flag='2', update_time=datetime.now())
         )
 
 

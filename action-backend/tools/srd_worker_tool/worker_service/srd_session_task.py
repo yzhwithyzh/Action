@@ -44,7 +44,7 @@ from urllib.parse import unquote, urlparse
 
 from tools.common.base_session_task import BaseSessionTask, TaskPayloadError
 from tools.common.checkpoint_json_manager import safe_name
-from tools.common.model_registry import load_llm_models
+from tools.common.model_registry import load_llm_models, model_id_from_ref, save_structured_method
 from tools.srd_worker_tool.config.worker_config import (
     EXTRACT_CACHE_DIR,
     RESULT_DIR,
@@ -78,6 +78,10 @@ DOWNLOAD_TIMEOUT = 120.0
 
 # 断点文件名（存在 checkpoint/{session_id}/ 下）
 CHECKPOINT_RESULT = 'result'
+
+
+class SrdUnjudgeableError(RuntimeError):
+    """跑完了，但一条都没评出来 —— 这不是一份能交付的报告，按失败处理。"""
 
 
 class SrdSessionTask(BaseSessionTask):
@@ -130,6 +134,7 @@ class SrdSessionTask(BaseSessionTask):
         await self.log.write_info('【3/4】评估中（解析 → 抽取 → 判定 → 聚合）')
         result = await self._assess(path_a, path_b)
         await self.raise_if_stopped()
+        self._reject_if_unjudgeable(result)
 
         await self.log.write_info('【4/4】写出结果')
         self.checkpoint.save(CHECKPOINT_RESULT, result.model_dump(mode='json'))
@@ -259,6 +264,7 @@ class SrdSessionTask(BaseSessionTask):
                     'temperature': float(m.temperature) if m.temperature is not None else 0.0,
                     'max_tokens': m.max_tokens,
                     'ref': m.ref,
+                    'structured_method': m.structured_method,
                     **tuning,  # payload 的调参覆盖库里的默认值
                 }
             )
@@ -349,7 +355,7 @@ class SrdSessionTask(BaseSessionTask):
             f'模型 {runner.cfg.label}（池内 {len(self._pool)} 个）｜粒度 {engine_cfg.judge_granularity}'
             f'｜并发 {engine_cfg.max_concurrency}｜抽取缓存 {EXTRACT_CACHE_DIR.name}'
         )
-        return await assess(
+        result = await assess(
             path_a,
             path_b,
             cfg=engine_cfg,
@@ -359,6 +365,40 @@ class SrdSessionTask(BaseSessionTask):
             title_b=str(self._spec_b.get('title') or ''),
             on_progress=self._on_engine_progress,
         )
+        await self._persist_structured_methods(runner)
+        return result
+
+    @staticmethod
+    def _reject_if_unjudgeable(result: AssessmentResult) -> None:
+        """一条都没评出来 → 判任务失败，别把它当成一份报告交出去。
+
+        实测踩过一次（session 04f9a90…）：判定阶段的输出被截断，34 条全部 unclear，
+        结果却以 `[success] 结论：无重复` 收尾 —— 「什么都没判出来」和
+        「两篇综述毫无重复」在前台长得一模一样，用户会拿它当结论。
+        引擎那边已经把 `overall_level` 判成 None（不落进四档），这里再把任务本身判失败：
+        断点没落、抽取缓存还在，重新入队同一个 session_id 接着跑就行，不用重花抽取的钱。
+        """
+        if result.overall_score_max:
+            return
+        total = len(result.items)
+        raise SrdUnjudgeableError(
+            f'{total} 个条目全部无法评分（证据不足或判定输出被截断），没有可交付的结论。'
+            f'抽取结果与断点已保留，可直接重跑；持续失败请检查模型的最大输出长度（ai_models.max_tokens）'
+            f'或把判定粒度调成 per_group'
+        )
+
+    async def _persist_structured_methods(self, runner: LlmRunner) -> None:
+        """把运行时探测出来的结构化输出方式回写进 ai_models，下个任务不用再撞一次墙。
+
+        只对来自数据库的池子做，且 `save_structured_method` 里还会再挡一道
+        「列非空就不覆盖」—— 人工钉死的值优先于探测结果。
+        """
+        if self._pool_source != 'db':
+            return
+        for identity, method in runner.resolved_methods().items():
+            model_id = model_id_from_ref(identity)
+            if model_id and await save_structured_method(model_id, method):
+                await self.log.write_info(f'已记住 {identity} 的结构化输出方式：{method}')
 
     def _on_engine_progress(self, stage: str, done: int, total: int, detail: str) -> None:
         """引擎的同步回调 → 折算成 0–100 的总进度。别在这里 await。"""

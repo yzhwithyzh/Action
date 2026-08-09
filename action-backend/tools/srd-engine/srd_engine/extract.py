@@ -40,9 +40,14 @@ _BATCH_SECTIONS: dict[str, tuple[str, ...]] = {
     'quality': ('risk of bias', 'grade', 'certainty', 'publication bias', 'funding', 'interest',
                 'limitation', 'discussion', '偏倚', '质量', '利益冲突', '局限', '讨论'),
 }
-#: 失败或抽空的批次最多补跑几轮（含首轮）。只补一轮：模型连着两次吐空壳，
-#: 多半是这篇文献的正文有问题，再刷也是白花钱。
-MAX_EXTRACT_ROUNDS = 2
+#: 失败或抽空的批次最多补跑几轮（含首轮）。
+#:
+#: 值得多补几轮：抽取是「一篇抽一次、34 条判定都吃这一份 facet」，一个批次抽空，
+#: 这篇参与的**每一对**配对的对应条目全判 unclear —— 一次失败被放大几十倍。
+#: 而补跑只重跑失败的那个批次（1 次调用），比在判定层加重试便宜得多。
+#: 实测 10 对那轮：6 次抽空里第 2 轮救回 3 次，剩下 3 次的 result 批次直接
+#: 造成 90 条 unclear（占全部 unclear 的一半）。
+MAX_EXTRACT_ROUNDS = 3
 
 BATCH_SCHEMA: dict[str, type[BaseModel]] = {
     'topic': TopicFacets,
@@ -118,8 +123,10 @@ async def extract_doc(
 ) -> tuple[ExtractDoc, list[str]]:
     """4 个批次并发抽取，返回 (ExtractDoc, 告警列表)。
 
-    正常情况下就是 4 次调用；失败或抽空的批次会**再补跑一轮**（见 `is_empty_facets`），
-    只有超长文献才会因切块而更多。
+    正常情况下就是 4 次调用；失败或抽空的批次会补跑（见 `MAX_EXTRACT_ROUNDS`
+    与 `is_empty_facets`），只有超长文献才会因切块而更多。
+    最终仍没抽出来的批次记在 `notes` 里，`ExtractDoc.failed_batches` 读得到 ——
+    调用方据此决定要不要写缓存（`pipeline.prepare_extract` 就是这么做的）。
     """
     cfg = cfg or EngineConfig()
     batches = list(BATCH_SCHEMA)
@@ -150,7 +157,7 @@ async def extract_doc(
         if not failed or attempt == MAX_EXTRACT_ROUNDS:
             pending = failed
             break
-        warnings.append(f'抽取批次 {"、".join(failed)} 失败或抽空，重试一轮')
+        warnings.append(f'抽取批次 {"、".join(failed)} 失败或抽空，重试（第 {attempt + 1}/{MAX_EXTRACT_ROUNDS} 轮）')
         pending = failed
 
     warnings.extend(n for n in notes.values() if n)

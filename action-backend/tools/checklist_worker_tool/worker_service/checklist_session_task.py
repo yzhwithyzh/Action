@@ -32,7 +32,7 @@ from typing import Any
 from tools.checklist_worker_tool.config.worker_config import RESULT_DIR, ensure_engine_importable
 from tools.checklist_worker_tool.engine.audit import AuditConfig, ChecklistItem, audit
 from tools.common.base_session_task import BaseSessionTask, TaskPayloadError
-from tools.common.model_registry import load_llm_models
+from tools.common.model_registry import load_llm_models, model_id_from_ref, save_structured_method
 
 ensure_engine_importable()
 
@@ -107,8 +107,16 @@ class ChecklistSessionTask(BaseSessionTask):
 
         result = await audit(self._runner, self._manuscript, items, cfg, on_progress)
         await self.raise_if_stopped()
+        await self._persist_structured_methods(self._runner)
 
         return await self._finalize(result, items)
+
+    async def _persist_structured_methods(self, runner: LlmRunner) -> None:
+        """把探测出来的结构化输出方式回写进 ai_models（列为空时才写，人工钉死的不覆盖）。"""
+        for identity, method in runner.resolved_methods().items():
+            model_id = model_id_from_ref(identity)
+            if model_id and await save_structured_method(model_id, method):
+                await self.log.write_info(f'已记住 {identity} 的结构化输出方式：{method}')
 
     # ================================================================== 条目
 
@@ -197,6 +205,7 @@ class ChecklistSessionTask(BaseSessionTask):
                 temperature=float(m.temperature) if m.temperature is not None else 0.0,
                 max_tokens=m.max_tokens,
                 ref=m.ref,
+                structured_method=m.structured_method,
             )
             for m in models
         ]

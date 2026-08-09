@@ -61,6 +61,11 @@ async def prepare_extract(
     variant = cache.cache_variant(cfg.extract_scope)
     if cache_dir:
         cached = cache.load(cache_dir, doc, runner.cfg.model, variant)
+        if cached is not None and cached.failed_batches:
+            # 上一轮把残缺的 facet 存下来了（0.7.0 之前会这么干）。复用它等于把一次
+            # 抽取失败永久固化：这篇参与的每一对配对都会从空壳里读，整批判 unclear。
+            on_progress('extract', 0, 1, f'{label} 缓存里有失败批次，重抽')
+            cached = None
         if cached is not None:
             on_progress('extract', 1, 1, f'{label} 命中抽取缓存')
             # 把缓存里存的告警一并带出来，保证二次运行的审计痕迹与首次一致（评审 P7）
@@ -68,8 +73,12 @@ async def prepare_extract(
 
     on_progress('extract', 0, 1, f'{label} 开始抽取')
     extract, warnings = await extract_doc(runner, doc, title=title, cfg=cfg)
-    if cache_dir:
+    if cache_dir and not extract.failed_batches:
+        # 只缓存完整的 facet。抽取是「一篇抽一次、34 条判定都吃这一份」，
+        # 残缺的一份存下来，代价是后面每一对配对都跟着错，而且再也不会重抽。
         cache.save(cache_dir, doc, runner.cfg.model, extract, variant)
+    elif cache_dir:
+        warnings.append(f'批次 {"、".join(extract.failed_batches)} 未抽出，本篇不写缓存（下次重跑会重抽）')
     on_progress('extract', 1, 1, f'{label} 抽取完成')
     return extract, warnings
 

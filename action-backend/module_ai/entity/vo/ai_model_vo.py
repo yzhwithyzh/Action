@@ -25,6 +25,12 @@ class AiModelModel(BaseModel):
     support_reasoning: Literal['Y', 'N'] | None = Field(default=None, description='是否支持推理(深度思考)')
     support_images: Literal['Y', 'N'] | None = Field(default=None, description='是否支持图片')
     model_type: str | None = Field(default=None, description='模型类型')
+    # 结构化输出（让模型按给定 JSON 结构回话）的实现方式。厂商支持情况按模型不同，
+    # 留空 = 交给 worker 运行时探测并回写；探测错了可以在这里手动钉死
+    # '' 也收：前端清空下拉框传的是空串，不该因此把整条保存请求打回
+    structured_method: (
+        Literal['', 'auto', 'json_schema', 'function_calling', 'json_mode', 'text'] | None
+    ) = Field(default=None, description='结构化输出方式')
     status: Literal['0', '1'] | None = Field(default=None, description='模型状态')
     user_id: int | None = Field(default=None, description='用户ID')
     dept_id: int | None = Field(default=None, description='部门ID')

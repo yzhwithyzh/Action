@@ -37,6 +37,9 @@ class LlmModelInfo:
     temperature: float | None = None
     max_tokens: int | None = None
     model_type: str = ''
+    #: 结构化输出方式（json_schema / function_calling / json_mode / text）。
+    #: 空 = 库里没指定，交给调用方运行时探测；探测出来的结果由 `save_structured_method` 回写。
+    structured_method: str = ''
 
     @property
     def ref(self) -> str:
@@ -76,9 +79,51 @@ async def load_llm_models(
             temperature=item.temperature,
             max_tokens=item.max_tokens,
             model_type=(item.model_type or '').strip(),
+            structured_method=(item.structured_method or '').strip(),
         )
         for item in pool
         if item.model_id and item.model_code and item.api_key
     ]
     logger.info('从 ai_models 取到 %d 个可用模型: %s', len(models), '、'.join(m.label for m in models))
     return models
+
+
+def model_id_from_ref(ref: str) -> int | None:
+    """`ai_models:3` → 3。不是本表的标识（比如环境变量兜底的模型）返回 None。"""
+    prefix = 'ai_models:'
+    tail = ref[len(prefix) :] if ref.startswith(prefix) else ''
+    return int(tail) if tail.isdigit() else None
+
+
+async def save_structured_method(model_id: int, method: str) -> bool:
+    """把运行时探测出来的结构化输出方式回写进 `ai_models.structured_method`。
+
+    只在这一列**为空**时写：非空说明是人工钉死的，探测结果不该盖掉人的决定
+    （钉错了也是人的问题，改回空值就能重新探测）。
+
+    为什么值得回写：探测这件事本身很贵 —— 它是拿一个真实请求去撞墙的，
+    而那个请求带着整篇综述正文，实测撞一次要几分钟。不回写的话每个任务都要重撞一次。
+    写失败只记日志：这是配置自愈，不是业务数据，不该让它把任务带崩。
+    """
+    from config.database import AsyncSessionLocal  # noqa: PLC0415
+    from module_ai.entity.do.ai_model_do import AiModels  # noqa: PLC0415
+    from sqlalchemy import update  # noqa: PLC0415
+
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(
+                update(AiModels)
+                .where(
+                    AiModels.model_id == model_id,
+                    (AiModels.structured_method.is_(None)) | (AiModels.structured_method == ''),
+                )
+                .values(structured_method=method)
+            )
+            await session.commit()
+    except Exception as exc:
+        logger.warning('回写 ai_models.structured_method 失败 [%s]: %s', model_id, exc)
+        return False
+    written = bool(result.rowcount)
+    if written:
+        logger.info('已回写 ai_models[%s].structured_method = %s', model_id, method)
+    return written

@@ -1,3 +1,4 @@
+import re
 from datetime import date, datetime
 from typing import Literal
 
@@ -165,6 +166,93 @@ class DeleteTeamMemberModel(BaseModel):
     member_ids: str = Field(description='需要删除的成员id，多个以逗号分隔')
 
 
+# ---------------------------------------------------------------- 资源中心链接
+
+
+class ResourceLinkModel(ActionBaseModel):
+    """
+    官网资源中心链接
+
+    首页「国际报告规范组织与循证枢纽」一段的外链卡片。EQUATOR、Cochrane 这类专名
+    中英两栏填同一串即可，`nameEn` 留空时前台按 `useBilingual` 的规则回落中文。
+    """
+
+    link_id: int | None = Field(default=None, description='资源id')
+    name_zh: str | None = Field(default=None, description='名称（中文）')
+    name_en: str | None = Field(default=None, description='名称（英文）')
+    summary_zh: str | None = Field(default=None, description='一句话说明（中文）')
+    summary_en: str | None = Field(default=None, description='一句话说明（英文）')
+    url: str | None = Field(default=None, description='外部地址（前台一律新标签页打开）')
+    logo_url: str | None = Field(default=None, description='标识图地址，留空则前台不画图')
+    sort_num: int | None = Field(default=None, description='卡片显示顺序')
+    status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
+    create_by: str | None = Field(default=None, description='创建者')
+    create_time: datetime | None = Field(default=None, description='创建时间')
+    update_by: str | None = Field(default=None, description='更新者')
+    update_time: datetime | None = Field(default=None, description='更新时间')
+    remark: str | None = Field(default=None, description='备注')
+
+    @Xss(field_name='name_zh', message='名称不能包含脚本字符')
+    @NotBlank(field_name='name_zh', message='中文名称不能为空')
+    @Size(field_name='name_zh', min_length=0, max_length=200, message='中文名称不能超过200个字符')
+    def get_name_zh(self) -> str | None:
+        return self.name_zh
+
+    @NotBlank(field_name='url', message='链接地址不能为空')
+    @Size(field_name='url', min_length=0, max_length=500, message='链接地址不能超过500个字符')
+    def get_url(self) -> str | None:
+        return self.url
+
+    @field_validator('url')
+    @classmethod
+    def check_url(cls, v: str | None) -> str | None:
+        """
+        只收 http(s) 绝对地址。
+
+        这个值直接进前台 `<a href>` 且带 `target="_blank"`，放开协议等于把
+        `javascript:` 之类的注入面留给后台文本框；站内路径也不该走这里 ——
+        本段陈列的就是外部组织与循证枢纽。
+        """
+        if v is None or v == '':
+            return v
+        url = v.strip()
+        if not re.match(r'^https?://\S+$', url):
+            raise ModelValidatorException(message='链接地址必须是以 http:// 或 https:// 开头的完整外部地址')
+
+        return url
+
+    def validate_fields(self) -> None:
+        self.get_name_zh()
+        self.get_url()
+
+
+class ResourceLinkQueryModel(ResourceLinkModel):
+    """
+    资源中心链接查询模型
+    """
+
+    keyword: str | None = Field(default=None, description='按名称/说明/地址模糊搜索')
+
+
+class ResourceLinkPageQueryModel(ResourceLinkQueryModel):
+    """
+    资源中心链接分页查询模型
+    """
+
+    page_num: int = Field(default=1, description='当前页码')
+    page_size: int = Field(default=10, description='每页记录数')
+
+
+class DeleteResourceLinkModel(BaseModel):
+    """
+    删除资源中心链接模型
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    link_ids: str = Field(description='需要删除的资源id，多个以逗号分隔')
+
+
 # ---------------------------------------------------------------- 报告规范目录
 
 
@@ -177,7 +265,9 @@ class GuidelineModel(ActionBaseModel):
     code: str | None = Field(default=None, description='规范代号')
     name_zh: str | None = Field(default=None, description='名称（中文）')
     name_en: str | None = Field(default=None, description='名称（英文）')
-    study_type: str | None = Field(default=None, description='适用研究类型')
+    study_type: str | None = Field(
+        default=None, description='适用研究类型（取 action_guideline_category.cat_key，写接口会校验存在）'
+    )
     summary_zh: str | None = Field(default=None, description='简介（中文）')
     summary_en: str | None = Field(default=None, description='简介（英文）')
     version: str | None = Field(default=None, description='版本')
@@ -214,7 +304,15 @@ class GuidelineModel(ActionBaseModel):
         self.get_name_zh()
 
 
-class GuidelinePageQueryModel(GuidelineModel):
+class GuidelineQueryModel(GuidelineModel):
+    """
+    报告规范查询模型
+    """
+
+    keyword: str | None = Field(default=None, description='按代号/名称/简介模糊搜索')
+
+
+class GuidelinePageQueryModel(GuidelineQueryModel):
     """
     报告规范分页查询模型
     """
@@ -231,6 +329,88 @@ class DeleteGuidelineModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel)
 
     guideline_ids: str = Field(description='需要删除的规范id，多个以逗号分隔')
+
+
+# ---------------------------------------------------------------- 报告规范分类
+
+
+class GuidelineCategoryModel(ActionBaseModel):
+    """
+    官网报告规范分类
+
+    规范页第①段筛选条的词表。`cat_key` 即 `GuidelineModel.study_type` 的取值域，
+    前台按它把规范归到各个 chip 下，卡片上的「研究设计」标签也取本表的中英名称。
+    """
+
+    cat_id: int | None = Field(default=None, description='分类id')
+    cat_key: str | None = Field(default=None, description='分类标识（取值即 action_guideline.study_type）')
+    name_zh: str | None = Field(default=None, description='名称（中文）')
+    name_en: str | None = Field(default=None, description='名称（英文）')
+    icon_paths: str | None = Field(default=None, description='卡片图标的 SVG path d 属性，一行一条')
+    sort_num: int | None = Field(default=None, description='筛选条中的显示顺序')
+    status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
+    create_by: str | None = Field(default=None, description='创建者')
+    create_time: datetime | None = Field(default=None, description='创建时间')
+    update_by: str | None = Field(default=None, description='更新者')
+    update_time: datetime | None = Field(default=None, description='更新时间')
+    remark: str | None = Field(default=None, description='备注')
+
+    @Xss(field_name='name_zh', message='名称不能包含脚本字符')
+    @NotBlank(field_name='name_zh', message='中文名称不能为空')
+    @Size(field_name='name_zh', min_length=0, max_length=200, message='中文名称不能超过200个字符')
+    def get_name_zh(self) -> str | None:
+        return self.name_zh
+
+    @NotBlank(field_name='cat_key', message='分类标识不能为空')
+    @Size(field_name='cat_key', min_length=0, max_length=32, message='分类标识不能超过32个字符')
+    def get_cat_key(self) -> str | None:
+        return self.cat_key
+
+    @field_validator('cat_key')
+    @classmethod
+    def check_cat_key(cls, v: str | None) -> str | None:
+        """
+        分类标识要进 URL 查询参数、也要当前端的 chip key 用，限死小写字母/数字/下划线/连字符。
+        放开会让「同一个分类大小写写岔」变成两个筛不到一起的 chip。
+        """
+        if v is None or v == '':
+            return v
+        key = v.strip()
+        if not re.fullmatch(r'[a-z0-9_-]+', key):
+            raise ModelValidatorException(message='分类标识只能包含小写字母、数字、下划线与连字符')
+
+        return key
+
+    def validate_fields(self) -> None:
+        self.get_cat_key()
+        self.get_name_zh()
+
+
+class GuidelineCategoryQueryModel(GuidelineCategoryModel):
+    """
+    报告规范分类查询模型
+    """
+
+    keyword: str | None = Field(default=None, description='按标识/名称模糊搜索')
+
+
+class GuidelineCategoryPageQueryModel(GuidelineCategoryQueryModel):
+    """
+    报告规范分类分页查询模型
+    """
+
+    page_num: int = Field(default=1, description='当前页码')
+    page_size: int = Field(default=10, description='每页记录数')
+
+
+class DeleteGuidelineCategoryModel(BaseModel):
+    """
+    删除报告规范分类模型
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    cat_ids: str = Field(description='需要删除的分类id，多个以逗号分隔')
 
 
 # ---------------------------------------------------------------- 规范 checklist 条目
@@ -463,18 +643,33 @@ class ReaimDimensionModel(ActionBaseModel):
 
 # ---------------------------------------------------------------- SRD
 
+#: 条目评分（新版 Excel 表 1 的四列 + 引擎自己的第五态）。
+#: **分越低越重复**：0 完全相同 / 1 部分相同 / 2 部分不同 / 3 完全不同 / unclear 证据不足。
+#: 与领域、整体的「重复百分比」方向相反，前端渲染时别把两者混成一个色阶。
+SrdRating = Literal['0', '1', '2', '3', 'unclear']
+
+#: 任务状态，取值与 tools/common/task_store.py 的 STATUS_* 一致
+SrdRunStatus = Literal['pending', 'running', 'completed', 'failed', 'stopped']
+
 
 class SrdItemModel(ActionBaseModel):
     """
     SRD 评估条目
+
+    条目层只有评分，没有「重复程度」与百分比 —— 后者是领域与整体才有的量，
+    由这些分数按 `srd-engine/aggregate.py` 的公式算出。
     """
 
     item_id: int | None = Field(default=None, description='条目id')
     code: str | None = Field(default=None, description='条目编号')
     question_zh: str | None = Field(default=None, description='评估问题（中文）')
     question_en: str | None = Field(default=None, description='评估问题（英文）')
-    level: DupLevel | None = Field(default=None, description='重复程度')
-    pct: int | None = Field(default=None, description='重复度百分比')
+    rating: SrdRating | None = Field(default=None, description='条目评分')
+    score: int | None = Field(default=None, description='评分对应分数0-3；证据不足为空')
+    confidence: str | None = Field(default=None, description='判定把握（high/medium/low）')
+    needs_review: Literal['0', '1'] | None = Field(default=None, description='是否需人工复核')
+    review_note: str | None = Field(default=None, description='复核提示')
+    evidence_card: str | None = Field(default=None, description='代码算出的客观事实')
     basis_zh: str | None = Field(default=None, description='判定依据（中文）')
     basis_en: str | None = Field(default=None, description='判定依据（英文）')
     cite_a_zh: str | None = Field(default=None, description='综述A原文引用（中文）')
@@ -507,6 +702,14 @@ class SrdDomainModel(ActionBaseModel):
     is_key: Literal['0', '1'] | None = Field(default=None, description='是否关键领域')
     level: DupLevel | None = Field(default=None, description='重复程度')
     pct: int | None = Field(default=None, description='重复度百分比')
+    score_sum: int | None = Field(default=None, description='领域得分（分越低越重复）')
+    score_max: int | None = Field(default=None, description='可评分条目满分=3×可评分条目数')
+    score_max_full: int | None = Field(default=None, description='名义满分=3×条目数')
+    dup_count: int | None = Field(default=None, description='偏重复条目数（评分0/1）')
+    diff_count: int | None = Field(default=None, description='偏不同条目数（评分2/3）')
+    unclear_count: int | None = Field(default=None, description='证据不足条目数')
+    evidence_sufficient: Literal['0', '1'] | None = Field(default=None, description='证据是否充分')
+    near_boundary: Literal['0', '1'] | None = Field(default=None, description='是否临近分箱边界')
     groups: list[SrdGroupModel] = Field(default_factory=list, description='分组列表')
 
 
@@ -516,16 +719,73 @@ class SrdAssessmentModel(ActionBaseModel):
     """
 
     assessment_id: int | None = Field(default=None, description='评估id')
+    session_id: str | None = Field(default=None, description='worker任务id')
+    run_status: SrdRunStatus | None = Field(default=None, description='任务状态')
+    progress: int | None = Field(default=None, description='进度百分比0-100')
+    error_msg: str | None = Field(default=None, description='失败原因')
+    file_a_name: str | None = Field(default=None, description='综述A上传文件名')
+    file_b_name: str | None = Field(default=None, description='综述B上传文件名')
     review_a_title_zh: str | None = Field(default=None, description='综述A标题（中文）')
     review_a_title_en: str | None = Field(default=None, description='综述A标题（英文）')
     review_b_title_zh: str | None = Field(default=None, description='综述B标题（中文）')
     review_b_title_en: str | None = Field(default=None, description='综述B标题（英文）')
     overall_level: DupLevel | None = Field(default=None, description='整体判定')
     overall_pct: int | None = Field(default=None, description='整体重复度百分比')
+    overall_score_sum: int | None = Field(default=None, description='整体得分')
+    overall_score_max: int | None = Field(default=None, description='可评分条目满分')
+    overall_score_max_full: int | None = Field(default=None, description='名义满分（102）')
     overall_reason_zh: str | None = Field(default=None, description='整体判定理由（中文）')
     overall_reason_en: str | None = Field(default=None, description='整体判定理由（英文）')
+    provisional: Literal['0', '1'] | None = Field(default=None, description='关键领域证据不足，结论仅供参考')
+    unclear_count: int | None = Field(default=None, description='证据不足条目数')
+    review_count: int | None = Field(default=None, description='待人工复核条目数')
+    model_name: str | None = Field(default=None, description='判定所用模型')
+    engine_version: str | None = Field(default=None, description='引擎版本')
+    llm_calls: int | None = Field(default=None, description='模型调用次数')
+    seconds: float | None = Field(default=None, description='耗时（秒）')
+    create_time: datetime | None = Field(default=None, description='提交时间')
+    finish_time: datetime | None = Field(default=None, description='完成时间')
     is_sample: Literal['0', '1'] | None = Field(default=None, description='是否示例数据')
     domains: list[SrdDomainModel] = Field(default_factory=list, description='领域列表')
+
+
+class SrdHistoryModel(ActionBaseModel):
+    """
+    「我的评估历史」列表行 —— 只带列表要显示的字段，不带 34 条目明细
+    """
+
+    assessment_id: int | None = Field(default=None, description='评估id')
+    session_id: str | None = Field(default=None, description='worker任务id')
+    run_status: SrdRunStatus | None = Field(default=None, description='任务状态')
+    progress: int | None = Field(default=None, description='进度百分比0-100')
+    error_msg: str | None = Field(default=None, description='失败原因')
+    review_a_title_zh: str | None = Field(default=None, description='综述A标题（中文）')
+    review_a_title_en: str | None = Field(default=None, description='综述A标题（英文）')
+    review_b_title_zh: str | None = Field(default=None, description='综述B标题（中文）')
+    review_b_title_en: str | None = Field(default=None, description='综述B标题（英文）')
+    overall_level: DupLevel | None = Field(default=None, description='整体判定')
+    overall_pct: int | None = Field(default=None, description='整体重复度百分比')
+    overall_score_sum: int | None = Field(default=None, description='整体得分')
+    overall_score_max: int | None = Field(default=None, description='可评分条目满分')
+    provisional: Literal['0', '1'] | None = Field(default=None, description='结论是否仅供参考')
+    create_time: datetime | None = Field(default=None, description='提交时间')
+    finish_time: datetime | None = Field(default=None, description='完成时间')
+
+
+class SrdRunStateModel(ActionBaseModel):
+    """
+    评估任务的轮询快照
+
+    任务跑完那一刻由轮询接口把引擎结果落库，所以 `assessmentId` 一定有值 ——
+    前端拿到 completed 后直接按 id 取详情，不必再解一遍 worker 的摘要。
+    """
+
+    session_id: str = Field(description='任务id')
+    assessment_id: int | None = Field(default=None, description='评估记录id')
+    run_status: SrdRunStatus = Field(description='任务状态')
+    progress: int = Field(default=0, description='进度百分比0-100')
+    message: str = Field(default='', description='当前阶段说明')
+    error_msg: str = Field(default='', description='失败原因')
 
 
 # ---------------------------------------------------------------- 协作申请

@@ -1,21 +1,33 @@
+import asyncio
+import contextlib
+import json
+import shutil
+import uuid
 from collections import defaultdict
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any
+from pathlib import Path
+from typing import Any, ClassVar
 
+from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.vo import CrudResponseModel, PageModel
+from config.env import UploadConfig
 from exceptions.exception import ServiceException
 from module_action.dao.action_dao import (
     CollabRequestDao,
+    GuidelineCategoryDao,
     GuidelineDao,
     GuidelineItemDao,
     ImplementationDao,
     NewsDao,
+    ResourceLinkDao,
     SrdDao,
     StudyTypeDao,
     TeamMemberDao,
 )
+from module_action.entity.do.action_do import ActionSrdAssessment
 from module_action.entity.vo.action_vo import (
     CfirConstructModel,
     CfirDomainModel,
@@ -26,6 +38,8 @@ from module_action.entity.vo.action_vo import (
     CollabRequestSubmitModel,
     EricCategoryModel,
     EricStrategyModel,
+    GuidelineCategoryModel,
+    GuidelineCategoryPageQueryModel,
     GuidelineItemModel,
     GuidelineItemPageQueryModel,
     GuidelineModel,
@@ -33,16 +47,21 @@ from module_action.entity.vo.action_vo import (
     NewsModel,
     NewsPageQueryModel,
     ReaimDimensionModel,
+    ResourceLinkModel,
+    ResourceLinkPageQueryModel,
     SrdAssessmentModel,
     SrdDomainModel,
     SrdGroupModel,
+    SrdHistoryModel,
     SrdItemModel,
+    SrdRunStateModel,
     StudyTypeModel,
     StudyTypeStatModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
 )
 from utils.common_util import CamelCaseUtil
+from utils.log_util import logger
 
 
 class NewsService:
@@ -247,6 +266,114 @@ class TeamMemberService:
             raise e
 
 
+class ResourceLinkService:
+    """
+    官网资源中心链接服务层
+
+    首页「国际报告规范组织与循证枢纽」一段的外链卡片，纯陈列数据，
+    没有别的表引用它，因此增删改都不带占用校验。
+    """
+
+    @classmethod
+    async def get_link_list_services(
+        cls,
+        query_db: AsyncSession,
+        query_object: ResourceLinkPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        获取资源中心链接列表
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取启用中的（官网公开接口传 True）
+        :return: 资源列表
+        """
+        return await ResourceLinkDao.get_link_list(query_db, query_object, is_page, only_published)
+
+    @classmethod
+    async def link_detail_services(cls, query_db: AsyncSession, link_id: int) -> ResourceLinkModel:
+        """
+        获取资源中心链接详情
+
+        :param query_db: orm对象
+        :param link_id: 资源id
+        :return: 资源详情
+        """
+        link = await ResourceLinkDao.get_link_detail_by_id(query_db, link_id)
+        if not link:
+            raise ServiceException(message='资源中心链接不存在')
+
+        return ResourceLinkModel(**CamelCaseUtil.transform_result(link))
+
+    @classmethod
+    async def add_link_services(cls, query_db: AsyncSession, page_object: ResourceLinkModel) -> CrudResponseModel:
+        """
+        新增资源中心链接
+
+        :param query_db: orm对象
+        :param page_object: 资源对象
+        :return: 新增结果
+        """
+        # 未指定顺序时排到末尾，避免新资源挤到 EQUATOR 前面
+        if page_object.sort_num is None:
+            page_object.sort_num = await ResourceLinkDao.get_max_sort_num(query_db) + 1
+        try:
+            await ResourceLinkDao.add_link_dao(query_db, page_object)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='新增成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def edit_link_services(cls, query_db: AsyncSession, page_object: ResourceLinkModel) -> CrudResponseModel:
+        """
+        编辑资源中心链接
+
+        :param query_db: orm对象
+        :param page_object: 资源对象
+        :return: 编辑结果
+        """
+        link_info = await ResourceLinkDao.get_link_detail_by_id(query_db, page_object.link_id)
+        if not link_info:
+            raise ServiceException(message='资源中心链接不存在')
+        try:
+            await ResourceLinkDao.edit_link_dao(
+                query_db, page_object.model_dump(exclude_unset=True, exclude={'keyword'})
+            )
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='更新成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def delete_link_services(cls, query_db: AsyncSession, link_ids: str) -> CrudResponseModel:
+        """
+        删除资源中心链接
+
+        :param query_db: orm对象
+        :param link_ids: 资源id字符串，多个以逗号分隔
+        :return: 删除结果
+        """
+        id_list = [int(i) for i in link_ids.split(',') if i.strip()]
+        if not id_list:
+            raise ServiceException(message='传入资源id为空')
+        try:
+            await ResourceLinkDao.delete_link_dao(query_db, id_list)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='删除成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+
 class GuidelineService:
     """
     官网报告规范目录服务层
@@ -284,6 +411,24 @@ class GuidelineService:
         return GuidelineModel(**CamelCaseUtil.transform_result(guideline))
 
     @classmethod
+    async def _assert_study_type_exists(cls, query_db: AsyncSession, study_type: str | None) -> None:
+        """
+        校验分类标识确实在 action_guideline_category 里
+
+        规范页的筛选条与卡片上的「研究设计」标签都靠 study_type 去分类表取值。写进一个表外的值，
+        这份规范在前台就会「哪个筛选按钮都点不出来、标签还是空白」—— 这正是分类入库前的老毛病，
+        所以在写入口就拦住，而不是等前台去兜底。
+
+        :param query_db: orm对象
+        :param study_type: 分类标识，留空表示不归类（允许）
+        :return: None
+        """
+        if not study_type:
+            return
+        if not await GuidelineCategoryDao.get_category_by_key(query_db, study_type):
+            raise ServiceException(message=f'研究设计分类 {study_type} 不存在，请先在「规范分类管理」中添加')
+
+    @classmethod
     async def add_guideline_services(cls, query_db: AsyncSession, page_object: GuidelineModel) -> CrudResponseModel:
         """
         新增报告规范
@@ -294,6 +439,10 @@ class GuidelineService:
         """
         if await GuidelineDao.get_guideline_by_code(query_db, page_object.code):
             raise ServiceException(message=f'新增失败，规范代号 {page_object.code} 已存在')
+        await cls._assert_study_type_exists(query_db, page_object.study_type)
+        # 未指定顺序时排到目录末尾，避免新规范挤到 STRICTA 前面
+        if page_object.sort_num is None:
+            page_object.sort_num = await GuidelineDao.get_max_sort_num(query_db) + 1
         try:
             await GuidelineDao.add_guideline_dao(query_db, page_object)
             await query_db.commit()
@@ -319,8 +468,11 @@ class GuidelineService:
             exist = await GuidelineDao.get_guideline_by_code(query_db, page_object.code)
             if exist and exist.guideline_id != page_object.guideline_id:
                 raise ServiceException(message=f'修改失败，规范代号 {page_object.code} 已存在')
+        await cls._assert_study_type_exists(query_db, page_object.study_type)
         try:
-            await GuidelineDao.edit_guideline_dao(query_db, page_object.model_dump(exclude_unset=True))
+            await GuidelineDao.edit_guideline_dao(
+                query_db, page_object.model_dump(exclude_unset=True, exclude={'keyword'})
+            )
             await query_db.commit()
 
             return CrudResponseModel(is_success=True, message='更新成功')
@@ -342,6 +494,144 @@ class GuidelineService:
             raise ServiceException(message='传入规范id为空')
         try:
             await GuidelineDao.delete_guideline_dao(query_db, id_list)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='删除成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+
+class GuidelineCategoryService:
+    """
+    官网报告规范分类服务层
+
+    规范页第①段筛选条的词表。分类标识（cat_key）就是 action_guideline.study_type 的取值域，
+    改键、停用、删除都会立刻反映到前台，因此这几件事都带占用校验。
+    """
+
+    @classmethod
+    async def get_category_list_services(
+        cls,
+        query_db: AsyncSession,
+        query_object: GuidelineCategoryPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        获取报告规范分类列表
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取启用中的（官网公开接口传 True）
+        :return: 分类列表
+        """
+        return await GuidelineCategoryDao.get_category_list(query_db, query_object, is_page, only_published)
+
+    @classmethod
+    async def category_detail_services(cls, query_db: AsyncSession, cat_id: int) -> GuidelineCategoryModel:
+        """
+        获取报告规范分类详情
+
+        :param query_db: orm对象
+        :param cat_id: 分类id
+        :return: 分类详情
+        """
+        category = await GuidelineCategoryDao.get_category_detail_by_id(query_db, cat_id)
+        if not category:
+            raise ServiceException(message='报告规范分类不存在')
+
+        return GuidelineCategoryModel(**CamelCaseUtil.transform_result(category))
+
+    @classmethod
+    async def add_category_services(
+        cls, query_db: AsyncSession, page_object: GuidelineCategoryModel
+    ) -> CrudResponseModel:
+        """
+        新增报告规范分类
+
+        :param query_db: orm对象
+        :param page_object: 分类对象
+        :return: 新增结果
+        """
+        if await GuidelineCategoryDao.get_category_by_key(query_db, page_object.cat_key):
+            raise ServiceException(message=f'新增失败，分类标识 {page_object.cat_key} 已存在')
+        # 未指定顺序时排到筛选条末尾，避免新分类挤到「随机对照试验」前面
+        if page_object.sort_num is None:
+            page_object.sort_num = await GuidelineCategoryDao.get_max_sort_num(query_db) + 1
+        try:
+            await GuidelineCategoryDao.add_category_dao(query_db, page_object)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='新增成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def edit_category_services(
+        cls, query_db: AsyncSession, page_object: GuidelineCategoryModel
+    ) -> CrudResponseModel:
+        """
+        编辑报告规范分类
+
+        :param query_db: orm对象
+        :param page_object: 分类对象
+        :return: 编辑结果
+        """
+        category_info = await GuidelineCategoryDao.get_category_detail_by_id(query_db, page_object.cat_id)
+        if not category_info:
+            raise ServiceException(message='报告规范分类不存在')
+        if page_object.cat_key:
+            exist = await GuidelineCategoryDao.get_category_by_key(query_db, page_object.cat_key)
+            if exist and exist.cat_id != page_object.cat_id:
+                raise ServiceException(message=f'修改失败，分类标识 {page_object.cat_key} 已存在')
+            # 改键等于把这批规范的 study_type 指向一个不存在的分类，它们会立刻从前台筛选条上消失。
+            # 名称随便改（前台跟着变），键不许在有占用时改。
+            if page_object.cat_key != category_info.cat_key:
+                used = await GuidelineDao.count_by_study_type(query_db, category_info.cat_key)
+                if used:
+                    raise ServiceException(
+                        message=f'修改失败，已有 {used} 份规范挂在分类标识 {category_info.cat_key} 下；'
+                        f'请先在「规范目录管理」中改掉这些规范的研究设计，或只改名称不改标识'
+                    )
+        try:
+            await GuidelineCategoryDao.edit_category_dao(
+                query_db, page_object.model_dump(exclude_unset=True, exclude={'keyword'})
+            )
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='更新成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def delete_category_services(cls, query_db: AsyncSession, cat_ids: str) -> CrudResponseModel:
+        """
+        删除报告规范分类
+
+        :param query_db: orm对象
+        :param cat_ids: 分类id字符串，多个以逗号分隔
+        :return: 删除结果
+        """
+        id_list = [int(i) for i in cat_ids.split(',') if i.strip()]
+        if not id_list:
+            raise ServiceException(message='传入分类id为空')
+        # 删掉还有规范在用的分类，那些规范在前台会变成「筛不出来 + 标签空白」，正是分类入库要消灭的状态
+        for cat_id in id_list:
+            category = await GuidelineCategoryDao.get_category_detail_by_id(query_db, cat_id)
+            if not category:
+                continue
+            used = await GuidelineDao.count_by_study_type(query_db, category.cat_key)
+            if used:
+                raise ServiceException(
+                    message=f'删除失败，分类「{category.name_zh}」下还有 {used} 份规范；'
+                    f'请先在「规范目录管理」中改掉这些规范的研究设计'
+                )
+        try:
+            await GuidelineCategoryDao.delete_category_dao(query_db, id_list)
             await query_db.commit()
 
             return CrudResponseModel(is_success=True, message='删除成功')
@@ -728,20 +1018,670 @@ class ImplementationService:
         ]
 
 
+@dataclass(frozen=True)
+class _SrdRun:
+    """
+    一次 SRD 评估的运行态快照（普通值，不是 ORM 对象）
+
+    投递 → 轮询 → 落库这条链路要连着提交好几次事务，而会话是 `expire_on_commit=True`：
+    commit 之后 ORM 实例全部失效，再读属性就要发懒加载，在 async 会话里直接抛
+    `MissingGreenlet`。所以这条链路一律只在这个快照上走。
+    """
+
+    assessment_id: int
+    session_id: str
+    user_id: int | None
+    run_status: str
+    progress: int
+    error_msg: str
+
+
 class SrdService:
     """
     SRD 系统综述重复性评估服务层
+
+    三件事：**投递**（存 PDF → 入队 → 落一行 pending 记录）、**轮询**（读 worker 状态，
+    跑完就把引擎结果落库）、**回看**（我的历史 + 按 id 取详情）。
+
+    干活的是 `tools/srd_worker_tool` 常驻 worker（Redis 队列驱动），后端不碰算法。
+    两个进程之间除了 Redis 还共享一件东西：**文件系统** ——
+    输入 PDF 由后端写进 `vf_admin/private_upload_path/srd/`、以 `path` 交给 worker，
+    结果 `result.json` 由 worker 写进自己的 `results/`、后端按摘要里的路径读回来。
+    这是刻意的：用户上传的综述 PDF 不该进那个整桶公共读的 OSS 桶。
+    代价是 **worker 必须与后端同机（或挂同一份存储）**，部署时别拆开。
     """
+
+    #: 上传上限。系统综述 PDF 常规在 1–5MB，30MB 足够带附录；再大多半是扫描件（引擎也解析不出文字）
+    MAX_PDF_BYTES = 30 * 1024 * 1024
+    #: 单个访客最多能看到多少条历史
+    HISTORY_LIMIT = 30
+    #: 同一访客同时在跑的评估数上限 —— 一次评估是几十次模型调用，不设闸等于把账单交给公网
+    MAX_RUNNING_PER_USER = 2
+
+    #: 评分 → 分数。与 `srd_engine.schemas.RATING_SCORE` 同一张表；
+    #: 这里不 import 引擎（后端进程不该为了 5 个键去加载 pydantic 模型与 yaml 口径），
+    #: 但两处必须一致，改引擎的评分档位时记得同步这里。
+    RATING_SCORE: ClassVar[dict[str, int | None]] = {'0': 0, '1': 1, '2': 2, '3': 3, 'unclear': None}
+
+    # ------------------------------------------------------------------ 投递
+
+    @classmethod
+    def _client(cls) -> Any:
+        """延迟导入 worker 配置：tools 包依赖 redis 等库，不该拖累未用到该功能的进程启动。"""
+        from tools.common.task_client import TaskClient  # noqa: PLC0415
+        from tools.srd_worker_tool.config.worker_config import CONFIG  # noqa: PLC0415
+
+        return TaskClient(CONFIG)
+
+    @classmethod
+    def _session_dir(cls, session_id: str) -> Path:
+        """
+        某次评估的输入目录
+
+        一次评估一个目录（目录名就是 session_id），跑完整个目录删掉即可 ——
+        不必再把两条服务器本地路径存进业务表。
+
+        :param session_id: 任务id
+        :return: 目录路径
+        """
+        return Path(UploadConfig.PRIVATE_UPLOAD_PATH) / 'srd' / session_id
+
+    @classmethod
+    async def _save_pdf(cls, upload: UploadFile, label: str, session_dir: Path) -> tuple[Path, str]:
+        """
+        校验并落盘一个上传的 PDF
+
+        只认 PDF：引擎的解析器（pymupdf）也只吃 PDF，放行别的格式只会在 worker 里
+        跑到一半才失败，用户白等几分钟。扩展名不可信，按文件头判。
+
+        :param upload: 上传文件
+        :param label: A / B，仅用于报错文案与文件名
+        :param session_dir: 本次评估的输入目录
+        :return: (落盘路径, 原始文件名)
+        """
+        limit_mb = cls.MAX_PDF_BYTES // 1024 // 1024
+        # 先看 Starlette 解析 multipart 时记下的大小，再决定要不要整份读进内存 ——
+        # 只靠 read() 之后判长度的话，一发 500MB 的请求就是 500MB 的驻留内存
+        if upload.size is not None and upload.size > cls.MAX_PDF_BYTES:
+            raise ServiceException(message=f'综述{label} 超过 {limit_mb}MB 上限')
+
+        content = await upload.read()
+        if not content:
+            raise ServiceException(message=f'综述{label} 的文件为空')
+        if len(content) > cls.MAX_PDF_BYTES:
+            raise ServiceException(message=f'综述{label} 超过 {limit_mb}MB 上限')
+        if not content.startswith(b'%PDF'):
+            raise ServiceException(message=f'综述{label} 不是 PDF 文件')
+
+        await asyncio.to_thread(session_dir.mkdir, parents=True, exist_ok=True)
+        # 文件名不取用户给的：那是攻击面（路径穿越、超长名、非法字符），而且引擎只看内容
+        target = session_dir / f'{label}.pdf'
+        await asyncio.to_thread(target.write_bytes, content)
+
+        return target, (upload.filename or f'review_{label}.pdf')
+
+    @classmethod
+    def _title_from_filename(cls, filename: str) -> str:
+        """
+        用文件名当占位标题
+
+        真实标题由引擎从正文里抽（`AssessmentResult.review_a_title`），跑完会覆盖掉这个值。
+        但 `review_a_title_zh` 是 not null，提交那一刻必须先有个能看的东西 ——
+        历史列表在任务还没跑完时显示的就是它。
+
+        :param filename: 原始文件名
+        :return: 去掉扩展名的文件名
+        """
+        stem = Path(filename).stem.strip()
+
+        return (stem or filename)[:600]
+
+    @classmethod
+    async def submit_assessment_services(
+        cls, query_db: AsyncSession, user_id: int, file_a: UploadFile, file_b: UploadFile
+    ) -> str:
+        """
+        提交一次 A/B 配对评估
+
+        :param query_db: orm对象
+        :param user_id: 访客用户id
+        :param file_a: 综述A的PDF
+        :param file_b: 综述B的PDF
+        :return: 任务id（session_id）
+        """
+        running = [
+            r
+            for r in await SrdDao.get_user_assessments(query_db, user_id, cls.HISTORY_LIMIT)
+            if r.run_status in ('pending', 'running')
+        ]
+        if len(running) >= cls.MAX_RUNNING_PER_USER:
+            raise ServiceException(message=f'你已有 {len(running)} 个评估在进行中，请等它跑完再提交')
+
+        # session_id 自己先生成：输入目录以它命名，跑完按 id 就能整目录删掉
+        session_id = uuid.uuid4().hex
+        session_dir = cls._session_dir(session_id)
+        try:
+            path_a, name_a = await cls._save_pdf(file_a, 'A', session_dir)
+            path_b, name_b = await cls._save_pdf(file_b, 'B', session_dir)
+        except Exception:
+            await asyncio.to_thread(shutil.rmtree, session_dir, True)
+            raise
+
+        title_a = cls._title_from_filename(name_a)
+        title_b = cls._title_from_filename(name_b)
+        payload = {
+            'user_id': user_id,
+            'review_a': {'path': str(path_a.resolve()), 'title': title_a},
+            'review_b': {'path': str(path_b.resolve()), 'title': title_b},
+        }
+        try:
+            async with cls._client() as client:
+                await client.submit(payload, session_id=session_id)
+        except Exception as e:
+            # 入队失败就别把 PDF 留在盘上：没有任何东西会再来读它
+            await asyncio.to_thread(shutil.rmtree, session_dir, True)
+            raise ServiceException(message=f'评估任务提交失败，请稍后重试：{type(e).__name__}') from e
+
+        try:
+            await SrdDao.add_assessment_dao(
+                query_db,
+                {
+                    'session_id': session_id,
+                    'user_id': user_id,
+                    'run_status': 'pending',
+                    'progress': 0,
+                    'file_a_name': name_a[:255],
+                    'file_b_name': name_b[:255],
+                    'review_a_title_zh': title_a,
+                    'review_b_title_zh': title_b,
+                    'is_sample': '0',
+                    'status': '0',
+                    'del_flag': '0',
+                    'create_by': str(user_id),
+                    'create_time': datetime.now(),
+                },
+            )
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            # 队列里已经有这个任务了，落库却失败：没有记录就没人会去轮询它，
+            # 让它白跑几十次模型调用不如立刻叫停。
+            with contextlib.suppress(Exception):
+                async with cls._client() as client:
+                    await client.stop(session_id)
+            await asyncio.to_thread(shutil.rmtree, session_dir, True)
+            raise e
+
+        return session_id
+
+    # ------------------------------------------------------------------ 轮询与落库
+
+    @classmethod
+    def _snapshot(cls, record: ActionSrdAssessment) -> _SrdRun:
+        """
+        把 ORM 记录里这条链路要用的几个字段抄成普通值
+
+        **这一步不是多余的**：会话是 `expire_on_commit=True`（`config/database.py` 的默认），
+        commit 之后所有 ORM 实例都会失效，再读任何属性都要发一次懒加载 ——
+        而懒加载在 async 会话里直接抛 `MissingGreenlet`。下面这条链路要连着提交好几次
+        （改状态、写结果树），所以一律只在普通值上走。
+
+        :param record: 评估记录
+        :return: 运行态快照
+        """
+        return _SrdRun(
+            assessment_id=record.assessment_id,
+            session_id=record.session_id or '',
+            user_id=record.user_id,
+            run_status=record.run_status or 'pending',
+            progress=record.progress or 0,
+            error_msg=record.error_msg or '',
+        )
+
+    @classmethod
+    async def run_state_services(cls, query_db: AsyncSession, session_id: str, user_id: int) -> SrdRunStateModel:
+        """
+        查询任务状态；跑完顺手把引擎结果落库
+
+        落库放在轮询里而不是 worker 里，是为了让 worker 保持「只认 Redis 不认数据库」——
+        它已经为了模型池连了一次库，再让它写业务表就等于把两个系统焊死。
+        代价是「用户关掉页面就没人来落库」，由 `list_history_services` 兜底对账。
+
+        :param query_db: orm对象
+        :param session_id: 任务id
+        :param user_id: 访客用户id（越权保护）
+        :return: 任务快照
+        """
+        record = await SrdDao.get_assessment_by_session(query_db, session_id)
+        if not record or record.user_id != user_id:
+            raise ServiceException(message='评估任务不存在')
+        run = cls._snapshot(record)
+
+        state = await cls._fetch_worker_state(session_id)
+        if state is None:
+            # Redis 里的任务状态有 TTL；已经落库过的记录不受影响，没落过的就是真过期了
+            if run.run_status in ('pending', 'running'):
+                run = await cls._mark_failed(query_db, run, '任务状态已过期，请重新提交')
+        else:
+            run = await cls._sync_run(query_db, run, state)
+
+        return SrdRunStateModel(
+            sessionId=run.session_id,
+            assessmentId=run.assessment_id,
+            runStatus=run.run_status,
+            progress=run.progress,
+            message=str((state or {}).get('message') or ''),
+            errorMsg=run.error_msg,
+        )
+
+    @classmethod
+    async def _fetch_worker_state(cls, session_id: str) -> dict[str, Any] | None:
+        """
+        读 worker 的任务状态快照
+
+        :param session_id: 任务id
+        :return: 状态字典；任务不存在或已过期时为 None
+        """
+        try:
+            async with cls._client() as client:
+                return await client.status(session_id)
+        except Exception as e:
+            raise ServiceException(message=f'评估任务状态查询失败：{type(e).__name__}') from e
+
+    @classmethod
+    async def _commit_values(cls, query_db: AsyncSession, run: _SrdRun, values: dict[str, Any]) -> _SrdRun:
+        """
+        更新评估记录并返回改过的快照
+
+        :param query_db: orm对象
+        :param run: 运行态快照
+        :param values: 列名到值的映射
+        :return: 更新后的快照
+        """
+        try:
+            await SrdDao.edit_assessment_dao(query_db, run.assessment_id, values)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return replace(
+            run,
+            run_status=str(values.get('run_status', run.run_status)),
+            progress=int(values.get('progress', run.progress)),
+            error_msg=str(values.get('error_msg', run.error_msg)),
+        )
+
+    @classmethod
+    async def _mark_failed(cls, query_db: AsyncSession, run: _SrdRun, error: str) -> _SrdRun:
+        """
+        把记录标记为失败
+
+        :param query_db: orm对象
+        :param run: 运行态快照
+        :param error: 失败原因
+        :return: 更新后的快照
+        """
+        return await cls._commit_values(
+            query_db, run, {'run_status': 'failed', 'error_msg': error[:500], 'finish_time': datetime.now()}
+        )
+
+    @classmethod
+    async def _sync_run(cls, query_db: AsyncSession, run: _SrdRun, state: dict[str, Any]) -> _SrdRun:
+        """
+        把 worker 的状态同步进库；首次看到 completed 时把整棵结果树写进来
+
+        已经是 completed 的记录直接跳过 —— 前端会一直轮询到拿着结果离开页面，
+        没有这道闸就会每 3 秒重写一次 34 条目。
+
+        :param query_db: orm对象
+        :param run: 运行态快照
+        :param state: worker 状态快照
+        :return: 更新后的快照
+        """
+        if run.run_status == 'completed':
+            return run
+
+        status = str(state.get('status') or 'pending')
+        current = int(state.get('progress_current') or 0)
+        total = int(state.get('progress_total') or 100) or 100
+        progress = min(100, round(current / total * 100))
+
+        if status == 'completed':
+            summary = state.get('result') if isinstance(state.get('result'), dict) else {}
+            done = await cls._persist_result(query_db, run, summary if isinstance(summary, dict) else {})
+            await cls._cleanup_inputs(run.session_id)
+
+            return done
+
+        values: dict[str, Any] = {'run_status': status, 'progress': progress}
+        if status in ('failed', 'stopped'):
+            values['error_msg'] = (str(state.get('error') or '') or ('已停止' if status == 'stopped' else '评估失败'))[
+                :500
+            ]
+            values['finish_time'] = datetime.now()
+            await cls._cleanup_inputs(run.session_id)
+
+        return await cls._commit_values(query_db, run, values)
+
+    @classmethod
+    async def _cleanup_inputs(cls, session_id: str | None) -> None:
+        """
+        删掉这次评估的输入 PDF
+
+        任务到终态后没人再读它们，而它们是用户上传的原文，不该无限期留在服务器上。
+        删不掉只记日志：清理失败不该让一份跑完的报告落不了库。
+
+        :param session_id: 任务id
+        :return:
+        """
+        if not session_id:
+            return
+        try:
+            await asyncio.to_thread(shutil.rmtree, cls._session_dir(session_id), True)
+        except OSError as e:
+            logger.warning(f'SRD 输入文件清理失败 {session_id}: {type(e).__name__}: {e}')
+
+    @classmethod
+    async def _persist_result(cls, query_db: AsyncSession, run: _SrdRun, summary: dict[str, Any]) -> _SrdRun:
+        """
+        把引擎结果写进 评估 / 领域 / 分组 / 条目 四张表
+
+        摘要里只有领域级数字与一张 `ratings` 表，34 条目的理由与引用在
+        `result.json` 里（摘要的 `files.json` 给了路径）。读不到就判失败而不是
+        只落一半 —— 一份没有判定依据的报告，用户会拿它当结论。
+
+        整棵树在**一个事务**里写：中途炸掉会回滚成「还没落库」，下次轮询重来一遍，
+        而不是留下半棵只有两个领域的结果树。
+
+        :param query_db: orm对象
+        :param run: 运行态快照
+        :param summary: worker 摘要
+        :return: 更新后的快照
+        """
+        detail = await cls._load_result_json(summary)
+        if detail is None:
+            return await cls._mark_failed(
+                query_db, run, '评估已完成但读不到结果文件：后端与 worker 需共享文件系统（详见 SrdService 说明）'
+            )
+
+        try:
+            # 断点续跑的任务可能已经落过一次，先清后写，否则会叠出两套 34 条目
+            await SrdDao.clear_result_tree(query_db, run.assessment_id)
+            await SrdDao.edit_assessment_dao(query_db, run.assessment_id, cls._assessment_values(detail, summary))
+            for d in detail.get('domains') or []:
+                domain = await SrdDao.add_domain_dao(
+                    query_db, {'assessment_id': run.assessment_id, **cls._domain_values(d)}
+                )
+                for gi, g in enumerate(d.get('groups') or []):
+                    group = await SrdDao.add_group_dao(
+                        query_db,
+                        {
+                            'domain_id': domain.domain_id,
+                            'code': str(g.get('code') or '')[:32],
+                            'name_zh': str(g.get('name_zh') or '')[:300],
+                            'name_en': str(g.get('name_en') or '')[:500],
+                            'sort_num': gi,
+                        },
+                    )
+                    await SrdDao.add_items_dao(
+                        query_db,
+                        [
+                            {'group_id': group.group_id, 'sort_num': ii, **cls._item_values(it)}
+                            for ii, it in enumerate(g.get('items') or [])
+                        ],
+                    )
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return replace(run, run_status='completed', progress=100, error_msg='')
+
+    @classmethod
+    async def _load_result_json(cls, summary: dict[str, Any]) -> dict[str, Any] | None:
+        """
+        读 worker 落盘的 `result.json`
+
+        :param summary: worker 摘要（`files.json` 是绝对路径）
+        :return: 完整结果；读不到则 None
+        """
+        raw_path = ((summary.get('files') or {}) if isinstance(summary.get('files'), dict) else {}).get('json')
+        if not raw_path:
+            return None
+        path = Path(str(raw_path))
+        try:
+            text = await asyncio.to_thread(path.read_text, 'utf-8')
+
+            return json.loads(text)
+        except (OSError, ValueError) as e:
+            logger.error(f'SRD 结果文件读取失败 {path}: {type(e).__name__}: {e}')
+
+            return None
+
+    @classmethod
+    def _assessment_values(cls, detail: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
+        """
+        结果 → 评估表的列值
+
+        :param detail: result.json
+        :param summary: worker 摘要（用量与模型信息只有它有）
+        :return: 列名到值的映射
+        """
+        return {
+            'run_status': 'completed',
+            'progress': 100,
+            'error_msg': '',
+            'review_a_title_zh': str(detail.get('review_a_title') or '')[:600] or '综述 A',
+            'review_b_title_zh': str(detail.get('review_b_title') or '')[:600] or '综述 B',
+            'overall_level': detail.get('overall_level'),
+            'overall_pct': int(detail.get('overall_pct') or 0),
+            'overall_score_sum': int(detail.get('overall_score_sum') or 0),
+            'overall_score_max': int(detail.get('overall_score_max') or 0),
+            'overall_score_max_full': int(detail.get('overall_score_max_full') or 0),
+            'overall_reason_zh': detail.get('overall_reason_zh') or '',
+            'overall_reason_en': detail.get('overall_reason_en') or '',
+            'provisional': '1' if detail.get('provisional') else '0',
+            'unclear_count': int(detail.get('unclear_count') or 0),
+            'review_count': int(detail.get('review_count') or 0),
+            'model_name': str(detail.get('model') or summary.get('model') or '')[:200],
+            'engine_version': str(detail.get('engine_version') or '')[:64],
+            'prompt_version': str(detail.get('prompt_version') or '')[:64],
+            'criteria_version': str(detail.get('criteria_version') or '')[:64],
+            'llm_calls': int(detail.get('llm_calls') or 0),
+            'token_in': int(detail.get('token_in') or 0),
+            'token_out': int(detail.get('token_out') or 0),
+            'seconds': float(summary.get('seconds') or 0),
+            'finish_time': datetime.now(),
+            'update_time': datetime.now(),
+        }
+
+    @classmethod
+    def _domain_values(cls, d: dict[str, Any]) -> dict[str, Any]:
+        """
+        结果 → 领域表的列值
+
+        :param d: result.json 里的一个领域
+        :return: 列名到值的映射
+        """
+        return {
+            'seq': int(d.get('seq') or 0),
+            # 引擎的名字带「领域 1：」前缀，前台模板自己会拼序号，存进去就成了「领域 1 · 领域 1：研究主题」
+            'name_zh': cls._strip_domain_prefix(str(d.get('name_zh') or ''), '：')[:200],
+            'name_en': cls._strip_domain_prefix(str(d.get('name_en') or ''), ': ')[:300],
+            'is_key': '1' if d.get('is_key') else '0',
+            'level': d.get('level'),
+            'pct': int(d.get('pct') or 0),
+            'score_sum': int(d.get('score_sum') or 0),
+            'score_max': int(d.get('score_max') or 0),
+            'score_max_full': int(d.get('score_max_full') or 0),
+            'dup_count': int(d.get('dup_count') or 0),
+            'diff_count': int(d.get('diff_count') or 0),
+            'unclear_count': int(d.get('unclear_count') or 0),
+            'evidence_sufficient': '0' if d.get('evidence_sufficient') is False else '1',
+            'near_boundary': '1' if d.get('near_boundary') else '0',
+        }
+
+    @staticmethod
+    def _strip_domain_prefix(name: str, sep: str) -> str:
+        """
+        去掉「领域 1：」/「Domain 1: 」前缀
+
+        :param name: 引擎给的领域名
+        :param sep: 分隔符
+        :return: 裸名称
+        """
+        return name.split(sep, 1)[-1].strip() if sep in name else name.strip()
+
+    @classmethod
+    def _item_values(cls, it: dict[str, Any]) -> dict[str, Any]:
+        """
+        结果 → 条目表的列值
+
+        引擎的引用字段是「原文逐字 `cite_a` + 中文翻译 `cite_a_zh`」，而库里是
+        `cite_a_zh` / `cite_a_en` 一对双语列。原文既然保持原语言，就放进 `*_en`
+        那一格：前台 `pick()` 在英文缺失时回落中文，原文本就是中文的那些条目
+        两边同值，显示不会重影。
+
+        :param it: result.json 里的一个条目
+        :return: 列名到值的映射
+        """
+        rating = str(it.get('override_rating') or it.get('rating') or 'unclear')
+        if rating not in cls.RATING_SCORE:
+            rating = 'unclear'
+        reason_zh = str(it.get('override_reason_zh') or it.get('reason_zh') or '')
+
+        return {
+            'code': str(it.get('code') or '')[:32],
+            'question_zh': it.get('question_zh') or '',
+            'question_en': it.get('question_en') or '',
+            'rating': rating,
+            'score': cls.RATING_SCORE[rating],
+            'confidence': str(it.get('confidence') or 'medium')[:16],
+            'needs_review': '1' if it.get('needs_review') else '0',
+            'review_note': str(it.get('review_note') or '')[:500],
+            'evidence_card': it.get('evidence_card') or '',
+            'basis_zh': reason_zh,
+            'basis_en': it.get('reason_en') or '',
+            'cite_a_zh': it.get('cite_a_zh') or '',
+            'cite_a_en': it.get('cite_a') or '',
+            'cite_b_zh': it.get('cite_b_zh') or '',
+            'cite_b_en': it.get('cite_b') or '',
+        }
+
+    # ------------------------------------------------------------------ 控制与回看
+
+    @classmethod
+    async def stop_run_services(cls, query_db: AsyncSession, session_id: str, user_id: int) -> CrudResponseModel:
+        """
+        请求停止评估任务
+
+        :param query_db: orm对象
+        :param session_id: 任务id
+        :param user_id: 访客用户id
+        :return: 操作结果
+        """
+        record = await SrdDao.get_assessment_by_session(query_db, session_id)
+        if not record or record.user_id != user_id:
+            raise ServiceException(message='评估任务不存在')
+        try:
+            async with cls._client() as client:
+                await client.stop(session_id)
+        except Exception as e:
+            raise ServiceException(message=f'停止失败：{type(e).__name__}') from e
+
+        return CrudResponseModel(is_success=True, message='已请求停止')
+
+    @classmethod
+    async def list_history_services(cls, query_db: AsyncSession, user_id: int) -> list[SrdHistoryModel]:
+        """
+        我的评估历史
+
+        顺手对账：用户关掉页面后没人再轮询，跑完的任务会一直挂在 running。
+        这里对未终结的记录补查一次 worker 状态，把结果补落库。
+
+        对账与取列表分成两趟：对账要提交事务，而提交会让第一趟查出来的 ORM 对象全部失效
+        （见 `_snapshot`），所以对账只在快照上做，改完再重新查一次列表。
+
+        :param query_db: orm对象
+        :param user_id: 访客用户id
+        :return: 历史列表
+        """
+        pending = [
+            cls._snapshot(r)
+            for r in await SrdDao.get_user_assessments(query_db, user_id, cls.HISTORY_LIMIT)
+            if r.run_status in ('pending', 'running') and r.session_id
+        ]
+        for run in pending:
+            try:
+                state = await cls._fetch_worker_state(run.session_id)
+                if state is None:
+                    await cls._mark_failed(query_db, run, '任务状态已过期，请重新提交')
+                    continue
+                await cls._sync_run(query_db, run, state)
+            except Exception as e:
+                # 对账是顺带做的，Redis 抖一下不该让整个历史列表打不开
+                logger.warning(f'SRD 历史对账失败 {run.session_id}: {type(e).__name__}: {e}')
+
+        records = await SrdDao.get_user_assessments(query_db, user_id, cls.HISTORY_LIMIT)
+
+        return [
+            SrdHistoryModel(
+                assessmentId=r.assessment_id,
+                sessionId=r.session_id,
+                runStatus=r.run_status,
+                progress=r.progress,
+                errorMsg=r.error_msg,
+                reviewATitleZh=r.review_a_title_zh,
+                reviewATitleEn=r.review_a_title_en,
+                reviewBTitleZh=r.review_b_title_zh,
+                reviewBTitleEn=r.review_b_title_en,
+                overallLevel=r.overall_level,
+                overallPct=r.overall_pct,
+                overallScoreSum=r.overall_score_sum,
+                overallScoreMax=r.overall_score_max,
+                provisional=r.provisional,
+                createTime=r.create_time,
+                finishTime=r.finish_time,
+            )
+            for r in records
+        ]
+
+    @classmethod
+    async def delete_history_services(cls, query_db: AsyncSession, assessment_id: int, user_id: int) -> CrudResponseModel:
+        """
+        删除一条评估历史（逻辑删除）
+
+        :param query_db: orm对象
+        :param assessment_id: 评估id
+        :param user_id: 访客用户id
+        :return: 操作结果
+        """
+        record = await SrdDao.get_assessment_by_id(query_db, assessment_id)
+        if not record or record.user_id != user_id:
+            raise ServiceException(message='评估记录不存在')
+        try:
+            await SrdDao.soft_delete_assessment_dao(query_db, assessment_id)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return CrudResponseModel(is_success=True, message='删除成功')
 
     @classmethod
     async def get_assessment_services(
-        cls, query_db: AsyncSession, assessment_id: int | None = None
+        cls, query_db: AsyncSession, assessment_id: int | None = None, user_id: int | None = None
     ) -> SrdAssessmentModel:
         """
         获取完整的 SRD 评估（评估 -> 领域 -> 分组 -> 条目）
 
+        示例评估（`is_sample='1'`）对所有人可见；真实评估只有本人能看
+        —— 里面是用户自己上传的两篇文献的逐条比对，不是公开数据。
+
         :param query_db: orm对象
         :param assessment_id: 评估id；不传则取示例评估
+        :param user_id: 访客用户id，取真实评估时必传
         :return: 评估详情
         """
         assessment = (
@@ -750,6 +1690,9 @@ class SrdService:
             else await SrdDao.get_sample_assessment(query_db)
         )
         if not assessment:
+            raise ServiceException(message='评估记录不存在')
+        if assessment.is_sample != '1' and assessment.user_id != user_id:
+            # 「不存在」而不是「无权访问」：后者等于告诉调用方这个 id 是真的
             raise ServiceException(message='评估记录不存在')
 
         domains = await SrdDao.get_domains(query_db, assessment.assessment_id)
@@ -766,8 +1709,12 @@ class SrdService:
                     code=it.code,
                     questionZh=it.question_zh,
                     questionEn=it.question_en,
-                    level=it.level,
-                    pct=it.pct,
+                    rating=it.rating,
+                    score=it.score,
+                    confidence=it.confidence,
+                    needsReview=it.needs_review,
+                    reviewNote=it.review_note,
+                    evidenceCard=it.evidence_card,
                     basisZh=it.basis_zh,
                     basisEn=it.basis_en,
                     citeAZh=it.cite_a_zh,
@@ -791,14 +1738,32 @@ class SrdService:
 
         return SrdAssessmentModel(
             assessmentId=assessment.assessment_id,
+            sessionId=assessment.session_id,
+            runStatus=assessment.run_status,
+            progress=assessment.progress,
+            errorMsg=assessment.error_msg,
+            fileAName=assessment.file_a_name,
+            fileBName=assessment.file_b_name,
             reviewATitleZh=assessment.review_a_title_zh,
             reviewATitleEn=assessment.review_a_title_en,
             reviewBTitleZh=assessment.review_b_title_zh,
             reviewBTitleEn=assessment.review_b_title_en,
             overallLevel=assessment.overall_level,
             overallPct=assessment.overall_pct,
+            overallScoreSum=assessment.overall_score_sum,
+            overallScoreMax=assessment.overall_score_max,
+            overallScoreMaxFull=assessment.overall_score_max_full,
             overallReasonZh=assessment.overall_reason_zh,
             overallReasonEn=assessment.overall_reason_en,
+            provisional=assessment.provisional,
+            unclearCount=assessment.unclear_count,
+            reviewCount=assessment.review_count,
+            modelName=assessment.model_name,
+            engineVersion=assessment.engine_version,
+            llmCalls=assessment.llm_calls,
+            seconds=float(assessment.seconds) if assessment.seconds is not None else None,
+            createTime=assessment.create_time,
+            finishTime=assessment.finish_time,
             isSample=assessment.is_sample,
             domains=[
                 SrdDomainModel(
@@ -809,6 +1774,14 @@ class SrdService:
                     isKey=d.is_key,
                     level=d.level,
                     pct=d.pct,
+                    scoreSum=d.score_sum,
+                    scoreMax=d.score_max,
+                    scoreMaxFull=d.score_max_full,
+                    dupCount=d.dup_count,
+                    diffCount=d.diff_count,
+                    unclearCount=d.unclear_count,
+                    evidenceSufficient=d.evidence_sufficient,
+                    nearBoundary=d.near_boundary,
                     groups=group_map.get(d.domain_id, []),
                 )
                 for d in domains

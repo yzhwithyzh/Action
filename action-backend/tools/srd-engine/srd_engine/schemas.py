@@ -254,6 +254,19 @@ class ExtractDoc(BaseModel):
                     '否则缓存命中时审计痕迹会全部消失，同一份报告两次跑出两套痕迹',
     )
 
+    @property
+    def failed_batches(self) -> list[str]:
+        """最终没抽出来的批次（重试过仍失败或全空）。
+
+        判据就是 `notes` 里 `extract.py` 落下的那句 `抽取批次 X 失败…`。
+        「重试一轮」那条不算 —— 它记的是过程，重试成功后不会再有失败行。
+        """
+        return [
+            n.split('抽取批次 ')[1].split(' ')[0]
+            for n in self.notes
+            if n.startswith('抽取批次 ') and ('失败：' in n or '返回空结果' in n)
+        ]
+
     def get_path(self, path: str) -> object | None:
         """按 "topic.intervention" 这样的点号路径取 facet。"""
         node = self

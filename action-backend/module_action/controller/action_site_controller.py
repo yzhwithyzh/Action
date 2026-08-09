@@ -1,6 +1,8 @@
+import re
 from typing import Annotated
 
-from fastapi import Query, Request, Response
+from fastapi import File, Query, Request, Response, UploadFile
+from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.annotation.rate_limit_annotation import ApiRateLimit, ApiRateLimitPreset
@@ -20,6 +22,8 @@ from module_action.entity.vo.action_vo import (
     GuestPublicInfoModel,
     GuestRegisterModel,
     GuestTokenModel,
+    GuidelineCategoryModel,
+    GuidelineCategoryPageQueryModel,
     GuidelineItemModel,
     GuidelineItemPageQueryModel,
     GuidelineItemQueryModel,
@@ -28,7 +32,11 @@ from module_action.entity.vo.action_vo import (
     NewsModel,
     NewsPageQueryModel,
     ReaimDimensionModel,
+    ResourceLinkModel,
+    ResourceLinkPageQueryModel,
     SrdAssessmentModel,
+    SrdHistoryModel,
+    SrdRunStateModel,
     StudyTypeModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
@@ -36,16 +44,19 @@ from module_action.entity.vo.action_vo import (
 from module_action.service.action_service import (
     ChecklistReviewService,
     CollabRequestService,
+    GuidelineCategoryService,
     GuidelineItemService,
     GuidelineService,
     ImplementationService,
     NewsService,
+    ResourceLinkService,
     SrdService,
     StudyTypeService,
     TeamMemberService,
 )
 from module_action.service.guest_auth_service import GuestAuthService
 from utils.log_util import logger
+from utils.oss_util import OssUtil
 from utils.response_util import ResponseUtil
 
 # 官网公开接口：**不挂 PreAuthDependency**。
@@ -137,6 +148,27 @@ async def get_site_team_member_detail(
 
 
 @action_site_controller.get(
+    '/resource-links',
+    summary='获取资源中心链接',
+    description=(
+        '官网公开接口，返回启用中的资源中心外链，已按 sortNum 排好。'
+        '首页「国际报告规范组织与循证枢纽」一段按本接口渲染，栏目标题与导语仍在前端 i18n。'
+    ),
+    response_model=DataResponseModel[list[ResourceLinkModel]],
+)
+async def get_site_resource_links(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await ResourceLinkService.get_link_list_services(
+        query_db, ResourceLinkPageQueryModel(), only_published=True
+    )
+    logger.info('获取资源中心链接成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
     '/guidelines',
     summary='获取报告规范目录',
     description='官网公开接口，返回启用中的报告规范目录',
@@ -153,6 +185,100 @@ async def get_site_guideline_list(
     logger.info('获取报告规范目录成功')
 
     return ResponseUtil.success(model_content=result)
+
+
+@action_site_controller.get(
+    '/guidelines/{guideline_id}',
+    summary='获取报告规范详情',
+    description=(
+        '官网公开接口，供规范原文阅读页（`/guideline/[id]`）取名称、版本与中英文 PDF 直链。'
+        '与团队成员详情同理：已停用的规范仍可按 id 直达，但不会出现在目录列表里。'
+    ),
+    response_model=DataResponseModel[GuidelineModel],
+)
+async def get_site_guideline_detail(
+    request: Request,
+    guideline_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await GuidelineService.guideline_detail_services(query_db, guideline_id)
+    logger.info(f'获取报告规范{guideline_id}详情成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/guidelines/{guideline_id}/file',
+    summary='内嵌预览报告规范原文',
+    description=(
+        '官网公开接口，把 OSS 上的规范原文 PDF 以 `Content-Disposition: inline` 转发出来，'
+        '供 `/guideline/[id]` 页的 `<iframe>` 直接渲染。'
+        '**不要改回让前台直连 OSS**：阿里云对默认域名下的所有对象强制加 attachment 响应头'
+        '（`x-oss-force-download: true`），iframe 里点开只会触发下载、页面一片空白。'
+        '下载按钮仍走 OSS 直链 —— 那个场景要的正是 attachment。'
+    ),
+    response_class=Response,
+    responses={200: {'content': {'application/pdf': {}}, 'description': '规范原文 PDF'}},
+)
+async def get_site_guideline_file(
+    request: Request,
+    guideline_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    lang: Annotated[str, Query(pattern='^(zh|en)$', description='原文语言版本')] = 'zh',
+) -> Response:
+    guideline = await GuidelineService.guideline_detail_services(query_db, guideline_id)
+    wanted, other = (
+        (guideline.file_url_zh, guideline.file_url_en) if lang == 'zh' else (guideline.file_url_en, guideline.file_url_zh)
+    )
+    # 只有一种语言有原文时回落到另一种：与前台「两版都有才给切换按钮」的取值口径保持一致。
+    # served_lang 跟着回落一起改，否则下载下来的文件名会写成没送出去的那一版
+    url, served_lang = (wanted or '').strip(), lang
+    if not url:
+        url, served_lang = (other or '').strip(), ('en' if lang == 'zh' else 'zh')
+    if not url:
+        return ResponseUtil.failure(msg='该规范暂未上传原文')
+
+    # 只把自家 OSS 上的 PDF 内联转发。放开这两个条件的代价：任意 URL 转发是 SSRF，
+    # 而把 text/html 之类以 inline 挂到本站域名下，等于给了一个同源的脚本执行面。
+    if not url.lower().split('?')[0].endswith('.pdf') or not OssUtil.is_own_public_url(url):
+        return RedirectResponse(url)
+
+    content = await OssUtil.fetch_public_object(url)
+    # 文件名只留 ASCII 安全字符：code 由后台录入，直接拼进响应头会被换行/引号截断
+    safe_code = re.sub(r'[^A-Za-z0-9._-]', '', guideline.code or 'guideline') or 'guideline'
+    logger.info(f'预览报告规范{guideline_id}原文（{served_lang}）')
+
+    return Response(
+        content=content,
+        media_type='application/pdf',
+        headers={
+            'Content-Disposition': f'inline; filename="{safe_code}-{served_lang}.pdf"',
+            # 原文换版要靠后台重新上传（对象键是随机名，URL 会变），这里可以放心缓存
+            'Cache-Control': 'public, max-age=3600',
+        },
+    )
+
+
+@action_site_controller.get(
+    '/guideline-categories',
+    summary='获取报告规范分类',
+    description=(
+        '官网公开接口，返回启用中的研究设计分类，已按 sortNum 排好。'
+        '规范页第①段的筛选条按本接口渲染，卡片上的「研究设计」标签与图标也取自这里；'
+        '与规范的对应关系是 category.catKey == guideline.studyType。'
+    ),
+    response_model=DataResponseModel[list[GuidelineCategoryModel]],
+)
+async def get_site_guideline_categories(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await GuidelineCategoryService.get_category_list_services(
+        query_db, GuidelineCategoryPageQueryModel(), only_published=True
+    )
+    logger.info('获取报告规范分类成功')
+
+    return ResponseUtil.success(data=result)
 
 
 @action_site_controller.get(
@@ -260,6 +386,122 @@ async def get_site_srd_sample(
     logger.info('获取SRD示例评估成功')
 
     return ResponseUtil.success(data=result)
+
+
+# ---------------------------------------------------------------- SRD 真实评估
+#
+# 与 checklist 校验同理：一次评估是几十次模型调用，必须挂限流且要求访客登录。
+# 上传的两篇 PDF 只落后端私有目录（供同机的 worker 读），既不进业务库也不进那个
+# 整桶公共读的 OSS 桶；任务到终态后由服务层删掉。评估结果本人可见，示例对所有人可见。
+
+
+@action_site_controller.post(
+    '/srd/assessments',
+    summary='提交两篇系统综述做重复性评估',
+    description='上传 A/B 两篇 PDF，立即返回任务id，结果通过状态接口轮询获取',
+    response_model=DataResponseModel[str],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_SRD_ASSESS, preset=ApiRateLimitPreset.USER_RESOURCE_EXECUTION)
+async def submit_site_srd_assessment(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+    file_a: Annotated[UploadFile, File(..., alias='fileA', description='综述A的PDF')],
+    file_b: Annotated[UploadFile, File(..., alias='fileB', description='综述B的PDF')],
+) -> Response:
+    session_id = await SrdService.submit_assessment_services(query_db, current_guest.user_id, file_a, file_b)
+    logger.info(f'SRD 评估任务已提交：{session_id}')
+
+    return ResponseUtil.success(data=session_id, msg='已提交，正在评估')
+
+
+@action_site_controller.get(
+    '/srd/assessments/{session_id}/state',
+    summary='查询 SRD 评估任务状态',
+    description='轮询接口。任务跑完时顺手把引擎结果落库，出参里的 assessmentId 即可用于取详情',
+    response_model=DataResponseModel[SrdRunStateModel],
+)
+async def get_site_srd_run_state(
+    request: Request,
+    session_id: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await SrdService.run_state_services(query_db, session_id, current_guest.user_id)
+    logger.info(f'查询 SRD 评估任务 {session_id} 状态成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.post(
+    '/srd/assessments/{session_id}/stop',
+    summary='停止 SRD 评估任务',
+    description='用户点「中止」时调用',
+    response_model=ResponseBaseModel,
+)
+async def stop_site_srd_run(
+    request: Request,
+    session_id: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await SrdService.stop_run_services(query_db, session_id, current_guest.user_id)
+    logger.info(f'已请求停止 SRD 评估任务 {session_id}')
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_site_controller.get(
+    '/srd/assessments',
+    summary='获取我的 SRD 评估历史',
+    description='返回当前访客的评估记录列表（不含 34 条目明细）',
+    response_model=DataResponseModel[list[SrdHistoryModel]],
+)
+async def list_site_srd_history(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await SrdService.list_history_services(query_db, current_guest.user_id)
+    logger.info('获取 SRD 评估历史成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/srd/assessments/{assessment_id}',
+    summary='获取一次 SRD 评估的完整结果',
+    description='评估 → 领域 → 分组 → 条目；只能取本人的记录',
+    response_model=DataResponseModel[SrdAssessmentModel],
+)
+async def get_site_srd_assessment(
+    request: Request,
+    assessment_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await SrdService.get_assessment_services(query_db, assessment_id, current_guest.user_id)
+    logger.info(f'获取 SRD 评估 {assessment_id} 成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.delete(
+    '/srd/assessments/{assessment_id}',
+    summary='删除一条 SRD 评估历史',
+    description='逻辑删除，只能删本人的记录',
+    response_model=ResponseBaseModel,
+)
+async def delete_site_srd_assessment(
+    request: Request,
+    assessment_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await SrdService.delete_history_services(query_db, assessment_id, current_guest.user_id)
+    logger.info(f'删除 SRD 评估 {assessment_id} 成功')
+
+    return ResponseUtil.success(msg=result.message)
 
 
 # ---------------------------------------------------------------- 报告助手第三步：checklist 逐条校验

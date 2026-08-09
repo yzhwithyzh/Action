@@ -7,6 +7,7 @@
     python run_batch.py --out out-terra --cache .srd-cache-terra   # 换模型时另存一份
     python run_batch.py --from-db       # 模型改从 ai_models 表取（与 worker 同源，见下）
     python run_batch.py --granularity per_group --timeout 600    # 判定拆细 + 放宽单次调用超时
+    python run_batch.py --freeze 30 --rounds 4   # 单模型池：冻结短一点、重试深一点
 
 `--from-db` 会走 `tools/common/model_registry.py`，也就是 worker 用的那条路：
 从 `ai_models` 表取启用中的模型池（api_key 已解密），按 `model_sort` 排好交给引擎
@@ -47,8 +48,9 @@ LEVEL_ZH = {'none': '无重复', 'low': '低度重复', 'mod': '中度重复', '
 
 #: 本次用的模型池。空列表表示走 SRD_* 环境变量的单模型路径。
 MODEL_POOL: list[ModelConfig] = []
-#: 出错模型的冻结时长（秒）。单模型池上调小，见 assess_pair 的 docstring。
+#: 出错模型的冻结时长（秒）与单次逻辑调用的轮换轮数。单模型池要调，见 assess_pair 的 docstring。
 FREEZE_SECONDS = FailoverConfig.freeze_seconds
+MAX_ROUNDS = FailoverConfig.max_rounds
 
 
 def load_pool_from_db(timeout: float) -> list[ModelConfig]:
@@ -99,13 +101,18 @@ async def assess_pair(
     那 53 行重复实现（以及对 `_BATCH_SCHEMA` / `_batch_text` 两个私有符号的依赖）
     已无必要，改回调用 `pipeline.assess`。
 
-    唯一自己造 runner 的理由是 `FailoverConfig`：默认冻结 300s 是给「多模型池」设计的
-    （冻一个换一个，不耽误事），池里只有一个模型时它变成纯粹的空等 —— 一次网络抖动
-    罚站 5 分钟，10 对配对能白等一小时。`--freeze` 就是为这种单模型场景准备的。
+    唯一自己造 runner 的理由是 `FailoverConfig` —— 它的默认值全是按「多模型池」调的，
+    池里只有一个模型时每一项都会退化：
+
+    - `freeze_seconds=300`：本意是「冻一个换一个，不耽误事」，单模型下变成纯空等，
+      一次网络抖动罚站 5 分钟。`--freeze` 调小。
+    - `max_rounds=2`：一次逻辑调用的上限是 `池大小 × max_rounds`，单模型就是 2 轮
+      （每轮内含 `max_retries` 次原地重试）。连接抖动持续超过这个窗口就放弃，
+      对应的条目直接降级成 unclear。`--rounds` 调大，代价只是失败时多等一会儿。
     """
     runner = LlmRunner(
         model_cfg, max_concurrency=cfg.max_concurrency,
-        failover=FailoverConfig(freeze_seconds=FREEZE_SECONDS),
+        failover=FailoverConfig(freeze_seconds=FREEZE_SECONDS, max_rounds=MAX_ROUNDS),
     )
     return await assess(a, b, cfg=cfg, runner=runner, cache_dir=CACHE_DIR,
                         title_a=clean_title(a), title_b=clean_title(b), on_progress=progress)
@@ -183,16 +190,17 @@ def _val(argv: list[str], name: str, default: str) -> str:
 
 
 def main(argv: list[str]) -> int:
-    global OUT_DIR, CACHE_DIR, MODEL_POOL, FREEZE_SECONDS  # noqa: PLW0603 —— 供 assess_pair/run_one 直接读
+    global OUT_DIR, CACHE_DIR, MODEL_POOL, FREEZE_SECONDS, MAX_ROUNDS  # noqa: PLW0603 —— 供 assess_pair/run_one 直接读
 
     force = '--force' in argv
     OUT_DIR = _opt(argv, '--out', OUT_DIR)
     CACHE_DIR = _opt(argv, '--cache', CACHE_DIR)
     granularity = _val(argv, '--granularity', EngineConfig.judge_granularity)
     FREEZE_SECONDS = float(_val(argv, '--freeze', str(FailoverConfig.freeze_seconds)))
+    MAX_ROUNDS = int(_val(argv, '--rounds', str(FailoverConfig.max_rounds)))
     concurrency = int(_val(argv, '--concurrency', '8'))
     timeout = float(_val(argv, '--timeout', '180'))
-    opts = ('--out', '--cache', '--granularity', '--concurrency', '--timeout', '--freeze')
+    opts = ('--out', '--cache', '--granularity', '--concurrency', '--timeout', '--freeze', '--rounds')
     flag_values = {argv[argv.index(f) + 1] for f in opts if f in argv}
     wanted = {int(x) for x in argv if x.isdigit() and x not in flag_values}
     OUT_DIR.mkdir(exist_ok=True)
@@ -223,7 +231,7 @@ def main(argv: list[str]) -> int:
         'model_pool': [c.label for c in pool] if isinstance(pool, list) else [pool.label],
         'engine_config': {
             'extract_scope': cfg.extract_scope, 'granularity': cfg.judge_granularity,
-            'max_concurrency': cfg.max_concurrency, 'timeout': timeout, 'freeze_seconds': FREEZE_SECONDS,
+            'max_concurrency': cfg.max_concurrency, 'timeout': timeout, 'freeze_seconds': FREEZE_SECONDS, 'max_rounds': MAX_ROUNDS,
         },
         'pair_count': len(summaries),
         'pairs': summaries,

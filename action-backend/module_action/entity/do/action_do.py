@@ -1,6 +1,18 @@
 from datetime import datetime
 
-from sqlalchemy import CHAR, BigInteger, Column, Date, DateTime, Integer, String, Text, UniqueConstraint, text
+from sqlalchemy import (
+    CHAR,
+    BigInteger,
+    Column,
+    Date,
+    DateTime,
+    Integer,
+    Numeric,
+    String,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 
 from config.database import Base
@@ -103,6 +115,39 @@ class ActionTeamMember(Base):
     remark = Column(String(500), nullable=True, comment='备注')
 
 
+class ActionResourceLink(Base):
+    """
+    官网-资源中心链接
+
+    首页「国际报告规范组织与循证枢纽」一段的外链卡片，一行一张。
+    名称/说明中英成对，url 一律外部地址（前台新标签页打开）。
+    """
+
+    __tablename__ = 'action_resource_link'
+    __table_args__ = {'comment': '官网-资源中心链接'}
+
+    link_id = Column(Integer, primary_key=True, autoincrement=True, comment='资源id')
+    name_zh = Column(String(200), nullable=False, comment='名称（中文）')
+    name_en = Column(String(300), nullable=True, server_default=text("''"), comment='名称（英文）')
+    summary_zh = Column(String(500), nullable=True, server_default=text("''"), comment='一句话说明（中文）')
+    summary_en = Column(String(800), nullable=True, server_default=text("''"), comment='一句话说明（英文）')
+    url = Column(String(500), nullable=False, comment='外部地址（前台一律新标签页打开）')
+    logo_url = Column(
+        String(300),
+        nullable=True,
+        server_default=text("''"),
+        comment='标识图地址（随前端打包的 /assets/*.png 或后台上传的 OSS 直链），留空则不画图',
+    )
+    sort_num = Column(Integer, nullable=True, server_default='0', comment='卡片显示顺序')
+    status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_by = Column(String(64), nullable=True, server_default=text("''"), comment='创建者')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_by = Column(String(64), nullable=True, server_default=text("''"), comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+    remark = Column(String(500), nullable=True, comment='备注')
+
+
 class ActionGuideline(Base):
     """
     官网-报告规范目录
@@ -115,7 +160,11 @@ class ActionGuideline(Base):
     code = Column(String(64), nullable=False, comment='规范代号（CONSORT/STRICTA/SPIRIT…）')
     name_zh = Column(String(300), nullable=False, comment='名称（中文）')
     name_en = Column(String(500), nullable=True, server_default="''", comment='名称（英文）')
-    study_type = Column(String(64), nullable=True, server_default="''", comment='适用研究类型')
+    # 取值域是 action_guideline_category.cat_key —— 规范页的筛选条与卡片「研究设计」标签都靠它对上，
+    # 写入表外的值会让这份规范在前台既筛不出来、标签也是空白。写接口会校验，见 GuidelineService。
+    study_type = Column(
+        String(64), nullable=True, server_default="''", comment='适用研究类型（取 action_guideline_category.cat_key）'
+    )
     summary_zh = Column(Text, nullable=True, comment='简介（中文）')
     summary_en = Column(Text, nullable=True, comment='简介（英文）')
     version = Column(String(64), nullable=True, server_default="''", comment='版本')
@@ -142,6 +191,36 @@ class ActionGuideline(Base):
     create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
     create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
     update_by = Column(String(64), nullable=True, server_default="''", comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+    remark = Column(String(500), nullable=True, comment='备注')
+
+
+class ActionGuidelineCategory(Base):
+    """
+    官网-报告规范分类
+
+    规范页第①段筛选条的词表。`cat_key` 的取值域就是 `ActionGuideline.study_type`，
+    两者靠这个键对上；不另设外键列，避免同一件事有两列可写而各写各的。
+    """
+
+    __tablename__ = 'action_guideline_category'
+    __table_args__ = {'comment': '官网-报告规范分类'}
+
+    cat_id = Column(Integer, primary_key=True, autoincrement=True, comment='分类id')
+    cat_key = Column(
+        String(32),
+        nullable=False,
+        comment='分类标识，取值即 action_guideline.study_type（rct/nrct/protocol/sr/case/obs/guideline/animal）',
+    )
+    name_zh = Column(String(200), nullable=False, comment='名称（中文）')
+    name_en = Column(String(300), nullable=True, server_default=text("''"), comment='名称（英文）')
+    icon_paths = Column(Text, nullable=True, comment='卡片图标的 SVG path d 属性，一行一条')
+    sort_num = Column(Integer, nullable=True, server_default='0', comment='筛选条中的显示顺序')
+    status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_by = Column(String(64), nullable=True, server_default=text("''"), comment='创建者')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_by = Column(String(64), nullable=True, server_default=text("''"), comment='更新者')
     update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
     remark = Column(String(500), nullable=True, comment='备注')
 
@@ -354,20 +433,51 @@ class ActionReaimDimension(Base):
 class ActionSrdAssessment(Base):
     """
     官网-SRD系统综述重复性评估
+
+    既是**任务记录**（session_id / user_id / run_status 那一组），也是**结果留档**：
+    访客提交后先落一行 pending，worker 跑完由轮询接口把引擎结果写回同一行。
+    示例行（is_sample='1'）没有 session_id 与 user_id —— 它不属于任何访客。
     """
 
     __tablename__ = 'action_srd_assessment'
     __table_args__ = {'comment': '官网-SRD系统综述重复性评估'}
 
     assessment_id = Column(Integer, primary_key=True, autoincrement=True, comment='评估id')
+    session_id = Column(String(64), nullable=True, comment='worker任务id')
+    user_id = Column(BigInteger, nullable=True, comment='发起评估的访客用户id')
+    run_status = Column(
+        String(16), nullable=True, server_default="'completed'", comment='任务状态（pending/running/completed/failed/stopped）'
+    )
+    progress = Column(Integer, nullable=True, server_default='0', comment='进度百分比0-100')
+    error_msg = Column(String(500), nullable=True, server_default="''", comment='失败原因')
+    file_a_name = Column(String(255), nullable=True, server_default="''", comment='综述A上传文件名')
+    file_b_name = Column(String(255), nullable=True, server_default="''", comment='综述B上传文件名')
     review_a_title_zh = Column(String(600), nullable=False, comment='综述A标题（中文）')
     review_a_title_en = Column(String(900), nullable=True, server_default="''", comment='综述A标题（英文）')
     review_b_title_zh = Column(String(600), nullable=False, comment='综述B标题（中文）')
     review_b_title_en = Column(String(900), nullable=True, server_default="''", comment='综述B标题（英文）')
-    overall_level = Column(String(16), nullable=True, server_default="'mod'", comment='整体判定（none/low/mod/high）')
+    # 没有 server_default：判定为空就是「还没判 / 判不出来」，不能兜成「中度重复」。
+    # 兜了之后，ORM 会把显式传进来的 None 当成「没给值」而落成 'mod'（列有默认值时的既定行为），
+    # 于是一条刚排队的任务、或一个全领域证据不足的结果，都会在历史里显示成中度重复。
+    overall_level = Column(String(16), nullable=True, comment='整体判定（none/low/mod/high）')
     overall_pct = Column(Integer, nullable=True, server_default='0', comment='整体重复度百分比')
+    overall_score_sum = Column(Integer, nullable=True, server_default='0', comment='整体得分（分越低越重复）')
+    overall_score_max = Column(Integer, nullable=True, server_default='0', comment='可评分条目满分=3×可评分条目数')
+    overall_score_max_full = Column(Integer, nullable=True, server_default='0', comment='名义满分=3×34=102')
     overall_reason_zh = Column(Text, nullable=True, comment='整体判定理由（中文）')
     overall_reason_en = Column(Text, nullable=True, comment='整体判定理由（英文）')
+    provisional = Column(CHAR(1), nullable=True, server_default='0', comment='关键领域证据不足，结论仅供参考（0否 1是）')
+    unclear_count = Column(Integer, nullable=True, server_default='0', comment='证据不足条目数')
+    review_count = Column(Integer, nullable=True, server_default='0', comment='待人工复核条目数')
+    model_name = Column(String(200), nullable=True, server_default="''", comment='判定所用模型')
+    engine_version = Column(String(64), nullable=True, server_default="''", comment='引擎版本')
+    prompt_version = Column(String(64), nullable=True, server_default="''", comment='提示词版本')
+    criteria_version = Column(String(64), nullable=True, server_default="''", comment='判定口径版本')
+    llm_calls = Column(Integer, nullable=True, server_default='0', comment='模型调用次数')
+    token_in = Column(Integer, nullable=True, server_default='0', comment='输入token数')
+    token_out = Column(Integer, nullable=True, server_default='0', comment='输出token数')
+    seconds = Column(Numeric(10, 1), nullable=True, server_default='0', comment='耗时（秒）')
+    finish_time = Column(DateTime, nullable=True, comment='完成时间')
     is_sample = Column(CHAR(1), nullable=True, server_default='1', comment='是否示例数据（0否 1是）')
     status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
     del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
@@ -391,8 +501,17 @@ class ActionSrdDomain(Base):
     name_zh = Column(String(200), nullable=False, comment='名称（中文）')
     name_en = Column(String(300), nullable=True, server_default="''", comment='名称（英文）')
     is_key = Column(CHAR(1), nullable=True, server_default='0', comment='是否关键领域（0否 1是）')
-    level = Column(String(16), nullable=True, server_default="'mod'", comment='重复程度（none/low/mod/high）')
+    # 同 ActionSrdAssessment.overall_level：不设默认值，「没得判」必须是 null 而不是 'mod'
+    level = Column(String(16), nullable=True, comment='重复程度（none/low/mod/high）')
     pct = Column(Integer, nullable=True, server_default='0', comment='重复度百分比')
+    score_sum = Column(Integer, nullable=True, server_default='0', comment='领域得分（分越低越重复）')
+    score_max = Column(Integer, nullable=True, server_default='0', comment='可评分条目满分=3×可评分条目数')
+    score_max_full = Column(Integer, nullable=True, server_default='0', comment='名义满分=3×条目数')
+    dup_count = Column(Integer, nullable=True, server_default='0', comment='偏重复条目数（评分0/1）')
+    diff_count = Column(Integer, nullable=True, server_default='0', comment='偏不同条目数（评分2/3）')
+    unclear_count = Column(Integer, nullable=True, server_default='0', comment='证据不足条目数')
+    evidence_sufficient = Column(CHAR(1), nullable=True, server_default='1', comment='证据是否充分（0否 1是）')
+    near_boundary = Column(CHAR(1), nullable=True, server_default='0', comment='百分比临近分箱边界（0否 1是）')
 
 
 class ActionSrdGroup(Base):
@@ -424,8 +543,14 @@ class ActionSrdItem(Base):
     code = Column(String(32), nullable=True, server_default="''", comment='条目编号（如 1a）')
     question_zh = Column(Text, nullable=False, comment='评估问题（中文）')
     question_en = Column(Text, nullable=True, comment='评估问题（英文）')
-    level = Column(String(16), nullable=True, server_default="'mod'", comment='重复程度（none/low/mod/high）')
-    pct = Column(Integer, nullable=True, server_default='0', comment='重复度百分比')
+    # 条目层只有评分，没有「重复程度」与百分比：0=完全相同 … 3=完全不同，unclear=证据不足。
+    # 百分比是领域与整体才有的量（由这些分数算出来，见 srd-engine/aggregate.py）。
+    rating = Column(String(8), nullable=True, server_default="'unclear'", comment='条目评分（0/1/2/3/unclear）')
+    score = Column(Integer, nullable=True, comment='评分对应分数0-3；证据不足为空，不进分子分母')
+    confidence = Column(String(16), nullable=True, server_default="'medium'", comment='判定把握（high/medium/low）')
+    needs_review = Column(CHAR(1), nullable=True, server_default='0', comment='是否需人工复核（0否 1是）')
+    review_note = Column(String(500), nullable=True, server_default="''", comment='复核提示')
+    evidence_card = Column(Text, nullable=True, comment='代码算出的客观事实（3a/6a/8b）')
     basis_zh = Column(Text, nullable=True, comment='判定依据（中文）')
     basis_en = Column(Text, nullable=True, comment='判定依据（英文）')
     cite_a_zh = Column(Text, nullable=True, comment='综述A原文引用（中文）')

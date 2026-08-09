@@ -43,6 +43,12 @@ class AiModels(Base):
         server_default=SqlalchemyUtil.get_server_default_null(DataBaseConfig.db_type),
         comment='模型类型',
     )
+    structured_method = Column(
+        String(32),
+        nullable=True,
+        server_default=SqlalchemyUtil.get_server_default_null(DataBaseConfig.db_type),
+        comment='结构化输出方式',
+    )
     max_tokens = Column(Integer, nullable=True, comment='最大输出token')
     temperature = Column(Float, nullable=True, comment='默认温度')
     support_reasoning = Column(CHAR(1), server_default='N', comment='是否支持推理')

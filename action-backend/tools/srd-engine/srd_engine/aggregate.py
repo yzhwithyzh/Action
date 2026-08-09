@@ -150,7 +150,11 @@ def score_domain(domain: DomainResult, cfg: EngineConfig) -> DomainResult:
 
 
 def _effective_level(domain: DomainResult) -> Level:
-    """领域完全无可评估条目时，按「无重复」参与查表，同时整体标 provisional。"""
+    """领域完全无可评估条目时，按「无重复」参与查表，同时整体标 provisional。
+
+    注意这只对**部分**领域证据不足成立：四个领域一条都没评出来时，查表得到的
+    「无重复」是凭空来的，必须整体判成 `None`（见 `aggregate`），不能落进四档。
+    """
     return domain.level or 'none'
 
 
@@ -161,8 +165,17 @@ def build_overall_reason(result: AssessmentResult) -> tuple[str, str]:
     """模板化生成整体判定理由 —— 不用 LLM 写，保证文字与判定永远一致。"""
     by_seq = {d.seq: d for d in result.domains}
     d1, d2, d3, d4 = (by_seq.get(i) for i in (1, 2, 3, 4))
-    if not all((d1, d2, d3, d4)) or result.overall_level is None:
+    if not all((d1, d2, d3, d4)):
         return '', ''
+    if result.overall_level is None:
+        # 无法判定也要给出理由：报告里留一句空白，看的人只会以为是渲染坏了
+        total = len(result.items)
+        return (
+            f'{total} 个条目全部无法评分（证据不足或模型未返回判定），本次评估**无法判定**重复程度。'
+            f'请检查两篇综述的原文是否完整可读，或重新发起一次评估。',
+            f'All {total} items were unscorable (insufficient evidence or no verdict returned); '
+            f'the degree of duplication could not be determined.',
+        )
 
     def part_zh(d: DomainResult) -> str:
         if d.level is None:
@@ -216,12 +229,16 @@ def aggregate(result: AssessmentResult, cfg: EngineConfig | None = None) -> Asse
     if len(by_seq) != DOMAIN_COUNT:
         raise ValueError(f'需要 {DOMAIN_COUNT} 个领域，实际 {sorted(by_seq)}')
 
-    key = (_effective_level(by_seq[1]), _effective_level(by_seq[3]))
-    nonkey = (_effective_level(by_seq[2]), _effective_level(by_seq[4]))
-    result.overall_level = overall_of(key, nonkey)
-
     items = result.items
     scores = [it.score for it in items if it.score is not None]
+
+    key = (_effective_level(by_seq[1]), _effective_level(by_seq[3]))
+    nonkey = (_effective_level(by_seq[2]), _effective_level(by_seq[4]))
+    # 一条都没评出来时不许查表。查表会拿四个「证据不足按无重复算」凑出一个
+    # 「无重复」——那和「两篇综述毫无重复」在前台长得一模一样，用户会拿它当结论。
+    # 判定不出来就老实说判定不出来（level=None → 前台渲染「无法判定」的中性灰）。
+    result.overall_level = overall_of(key, nonkey) if scores else None
+
     result.overall_score_sum = sum(scores)
     result.overall_score_max = SCORE_PER_ITEM * len(scores)
     result.overall_score_max_full = SCORE_PER_ITEM * len(items)

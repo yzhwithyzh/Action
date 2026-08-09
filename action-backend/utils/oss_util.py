@@ -17,6 +17,10 @@ from utils.log_util import logger
 # 那份清单含 doc/zip/mp4，而这条通道只服务「会被 <img> 直接引用的公开图片」，
 # 放宽到文档/压缩包等于开了一个任意文件公网托管入口。
 ALLOWED_IMAGE_EXTENSIONS = frozenset({'jpg', 'jpeg', 'png', 'webp', 'gif'})
+# 官网文档下载允许的扩展名。同样刻意收窄到一种：这条通道产出的是匿名可读的公网直链，
+# 每放行一种能带宏或需下载后才能打开的格式（doc/xls/zip），就多一个任意文件托管入口；
+# 报告规范原文本来也以 PDF 发布，浏览器还能直接内嵌打开。
+ALLOWED_DOCUMENT_EXTENSIONS = frozenset({'pdf'})
 # 扩展名 → Content-Type。OSS 不会自己推断，传错了浏览器会当附件下载而不是显示。
 _CONTENT_TYPES = {
     'jpg': 'image/jpeg',
@@ -24,8 +28,11 @@ _CONTENT_TYPES = {
     'png': 'image/png',
     'webp': 'image/webp',
     'gif': 'image/gif',
+    'pdf': 'application/pdf',
 }
 MAX_IMAGE_SIZE = 5 * 1024 * 1024
+# 规范原文动辄几十页、含插图或扫描件，按图片的 5MB 卡会大面积传不上去
+MAX_DOCUMENT_SIZE = 30 * 1024 * 1024
 
 
 class OssUtil:
@@ -47,18 +54,40 @@ class OssUtil:
         return bool(OssConfig.oss_enabled and OssConfig.oss_access_key_id and OssConfig.oss_access_key_secret)
 
     @classmethod
+    def _normalize_extension(cls, filename: str, allowed: frozenset[str], kind: str) -> str:
+        """
+        取出并按白名单校验文件扩展名
+
+        :param filename: 原始文件名
+        :param allowed: 允许的扩展名集合
+        :param kind: 用于报错文案的资源类别，如「图片」「文档」
+        :return: 小写扩展名（不含点）
+        """
+        suffix = PurePosixPath(filename or '').suffix.lstrip('.').lower()
+        if suffix not in allowed:
+            raise ServiceException(message=f'不支持的{kind}格式，仅支持 {"/".join(sorted(allowed))}')
+
+        return suffix
+
+    @classmethod
     def normalize_extension(cls, filename: str) -> str:
         """
-        取出并校验文件扩展名
+        取出并校验图片扩展名
 
         :param filename: 原始文件名
         :return: 小写扩展名（不含点）
         """
-        suffix = PurePosixPath(filename or '').suffix.lstrip('.').lower()
-        if suffix not in ALLOWED_IMAGE_EXTENSIONS:
-            raise ServiceException(message=f'不支持的图片格式，仅支持 {"/".join(sorted(ALLOWED_IMAGE_EXTENSIONS))}')
+        return cls._normalize_extension(filename, ALLOWED_IMAGE_EXTENSIONS, '图片')
 
-        return suffix
+    @classmethod
+    def normalize_document_extension(cls, filename: str) -> str:
+        """
+        取出并校验文档扩展名
+
+        :param filename: 原始文件名
+        :return: 小写扩展名（不含点）
+        """
+        return cls._normalize_extension(filename, ALLOWED_DOCUMENT_EXTENSIONS, '文档')
 
     @classmethod
     def build_object_key(cls, category: str, extension: str) -> str:
@@ -149,7 +178,7 @@ class OssUtil:
                 raise ServiceException(
                     message='上传失败：桶开启了「阻止公共访问」，请改为桶级公共读，或把 OSS_OBJECT_ACL 置空'
                 )
-            raise ServiceException(message=f'图片上传失败（OSS {response.status_code}）')
+            raise ServiceException(message=f'文件上传失败（OSS {response.status_code}）')
 
         return cls.public_url(object_key)
 
@@ -169,6 +198,47 @@ class OssUtil:
             response = await client.get(url)
 
         return response.status_code == HTTP_200_OK
+
+    @classmethod
+    def is_own_public_url(cls, url: str) -> bool:
+        """
+        判断地址是否指向本项目自己的 OSS 桶
+
+        代理转发前必须过这一关：`action_guideline.file_url_*` 是后台文本框写进来的，
+        不限定来源地就等于给了一个「让服务器去 GET 任意 URL」的口子（SSRF）。
+
+        :param url: 待判定地址
+        :return: 是本桶的公网直链为 True
+        """
+        base = (OssConfig.public_base_url or '').rstrip('/')
+
+        return bool(base) and url.startswith(f'{base}/')
+
+    @classmethod
+    async def fetch_public_object(cls, url: str) -> bytes:
+        """
+        匿名 GET 取回公开对象的字节
+
+        用途是把 OSS 上的 PDF 转成「可内嵌预览」的响应：阿里云对默认域名
+        `*.oss-cn-*.aliyuncs.com` 下的所有对象强制加 `Content-Disposition: attachment`
+        （响应头里的 `x-oss-force-download: true`），`<img>` 不看这个头所以图片正常，
+        但 `<iframe>` 看，于是 PDF 变成「点开就下载、页面一片空白」。
+        彻底的解法是给桶绑一个已备案的自有域名，在那之前由后端转一道。
+
+        整包读进内存而不是流式转发：上传口把文档卡在 30MB 以内，规范原文实际都在几 MB，
+        换来的是不必在中间件链上维护流的生命周期。真要放开体积上限时再改成流式。
+
+        :param url: 对象公网地址
+        :return: 文件字节
+        """
+        async with httpx.AsyncClient(timeout=OssConfig.oss_timeout_seconds, follow_redirects=True) as client:
+            response = await client.get(url)
+
+        if response.status_code != HTTP_200_OK:
+            logger.error(f'OSS 读取失败 {response.status_code}: {url}')
+            raise ServiceException(message='原文文件读取失败，请稍后重试或改用下载')
+
+        return response.content
 
     @classmethod
     async def delete_object(cls, object_key: str) -> None:

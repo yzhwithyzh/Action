@@ -28,8 +28,10 @@ abatch 只能约束「同一条链的一批同构输入」，跨阶段的总并�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
@@ -62,6 +64,10 @@ RETRY = 'retry'  # 瞬时抖动：原地重试，重试用尽再当 SWITCH 处�
 SWITCH = 'switch'  # 该模型暂时不可用（限流 / 5xx）：冻结 + 换下一个，值得等它解冻
 DISABLE = 'disable'  # 该模型短期内治不好（鉴权 / 欠费 / 模型不存在）：冻结 + 换下一个，但不值得等
 FATAL = 'fatal'  # 请求本身有问题（参数非法 / 内容审核）：换谁都一样，直接把这次调用判错
+
+# 单次调用超过这么久就记一条进程日志（不进任务日志，别刷用户的屏）。
+# 实测国产兼容端点同一个请求 2s～80s 都可能，慢调用是排障时最想先看到的线索。
+SLOW_CALL_SECONDS = 60.0
 
 # 全池冻结时的轮询间隔
 _FROZEN_POLL_INTERVAL = 5.0
@@ -100,6 +106,19 @@ _UNSUPPORTED_METHOD_KEYWORDS = (
 )
 _UNSUPPORTED_HINTS = ('not supported', 'not valid', 'unsupported', 'invalid', '不支持')
 
+# 结构化输出方式，由强到弱。前三种由厂商保证结构，最后一种是自己解析字符串。
+METHOD_JSON_SCHEMA = 'json_schema'          # 服务端按 JSON Schema 约束解码，最稳
+METHOD_FUNCTION_CALLING = 'function_calling'  # 走工具调用，兼容面最广
+METHOD_JSON_MODE = 'json_mode'              # 只保证是合法 JSON，字段对不对得自己验
+METHOD_TEXT = 'text'                        # 纯文本 + 自己抠 JSON，什么都不保证
+#: 降级顺序。降级是**单向**的：越往后约束越弱、解析失败率越高，没有理由再升回去。
+METHOD_ORDER = (METHOD_JSON_SCHEMA, METHOD_FUNCTION_CALLING, METHOD_JSON_MODE, METHOD_TEXT)
+#: 库里没指定时的取值（`ai_models.structured_method` 允许存 'auto' 或留空）
+METHOD_AUTO = 'auto'
+
+# ```json ... ``` 围栏。text 模式下模型十有八九会加，得先剥掉
+_FENCE_RE = re.compile(r'^```[a-zA-Z0-9_-]*\s*|\s*```$')
+
 
 def is_unsupported_structured_method(err: str) -> bool:
     """错误信息是否在说「这种结构化输出方式我不支持」。"""
@@ -109,8 +128,99 @@ def is_unsupported_structured_method(err: str) -> bool:
     )
 
 
+def normalize_method(value: str | None) -> str:
+    """把库里/配置里的取值归一成一个合法的方式；认不出来的一律当「没指定」。"""
+    text = (value or '').strip().lower()
+    return text if text in METHOD_ORDER else ''
+
+
+def schema_instruction(schema: type[BaseModel]) -> str:
+    """把目标结构写进提示词。
+
+    json_mode 与 text 这两种方式下，厂商只保证（或干脆不保证）「是个 JSON」，
+    字段名和层级全靠模型自觉 —— 不把 Schema 摆给它看，出来的十有八九是另一套字段名。
+    """
+    return (
+        '请只输出一个 JSON 对象，严格符合下面的 JSON Schema：\n'
+        f'{json.dumps(schema.model_json_schema(), ensure_ascii=False)}\n'
+        '要求：不要输出任何解释文字，不要加 ``` 代码围栏；'
+        '字段名与层级严格按 Schema 来，枚举字段只能取允许的取值。'
+    )
+
+
+def parse_json_payload(raw: str) -> Any:
+    """从模型的纯文本回复里抠出 JSON。抠不出来抛 StructuredParseError（走重试梯子）。"""
+    text = _FENCE_RE.sub('', raw.strip()).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # 模型爱在 JSON 前后加一句话，退而求其次：取第一个 { / [ 到最后一个 } / ]
+    start = next((i for i, ch in enumerate(text) if ch in '{['), -1)
+    end = max(text.rfind('}'), text.rfind(']'))
+    if start < 0 or end <= start:
+        raise StructuredParseError('回复里找不到 JSON 对象')
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError as exc:
+        raise StructuredParseError(f'JSON 解析失败: {exc}') from exc
+
+
 class AllModelsFrozenError(RuntimeError):
     """池内所有模型都不可用（且不值得再等）。"""
+
+
+class StructuredParseError(RuntimeError):
+    """模型回了内容，但解析不成目标结构（截断、格式跑偏、字段类型不对）。
+
+    这类失败**没有异常**：HTTP 200，LangChain 把它塞进 `parsing_error` 字段。
+    如果只是事后读一下这个字段就返回错误，它就绕过了整条重试/切换梯子 ——
+    而截断和格式跑偏恰恰是最值得重试的那种抖动。所以这里主动抛出来，
+    让它和 429、5xx 走同一条路。
+    """
+
+
+#: 回喂给模型的上一次输出最多截多长。太短它认不出自己错在哪，太长白烧 token；
+#: 截断类错误的线索都在末尾（JSON 断在哪儿），所以留头也留尾。
+_REPAIR_HEAD, _REPAIR_TAIL = 600, 900
+
+
+def message_text(msg: object) -> str:
+    """从 AIMessage 里取纯文本。部分厂商把内容拆成分段列表，得拼回去。"""
+    content = getattr(msg, 'content', msg)
+    if isinstance(content, list):
+        return ''.join(part.get('text', '') if isinstance(part, dict) else str(part) for part in content)
+    return '' if content is None else str(content)
+
+
+def repair_message(raw_text: str, parse_error: str) -> str:
+    """把「上次输出 + 解析报错」拼成一条纠错指令。
+
+    重发同一份提示词是治不好解析失败的 —— 判定与抽取都跑在 temperature=0 上，
+    原样再问一遍多半原样再错一遍。必须让模型看见自己错在哪。
+    """
+    shown = (
+        raw_text if len(raw_text) <= _REPAIR_HEAD + _REPAIR_TAIL
+        else f'{raw_text[:_REPAIR_HEAD]}\n……（中间省略 {len(raw_text) - _REPAIR_HEAD - _REPAIR_TAIL} 字符）……\n'
+             f'{raw_text[-_REPAIR_TAIL:]}'
+    )
+    return f"""你上一次的回复无法解析成要求的结构，请重新输出一次。
+
+解析器报错：
+{parse_error}
+
+你上一次的输出：
+--- 开始 ---
+{shown}
+--- 结束 ---
+
+重新输出时务必做到：
+1. 只输出符合给定结构的 JSON 本体，不要加解释文字、不要加 ``` 代码围栏。
+2. 字段名、层级、类型严格按给定结构来，枚举字段只能取允许的取值。
+3. **如果上次是被截断的**（JSON 没闭合），请把每个字段的文字写得更精简
+   —— 理由控制在 50 字以内、引用只留最关键的一句 —— 保证整个 JSON 完整闭合。
+   宁可写短，也不能截断：截断意味着这批条目全部作废。
+4. 内容以原始任务为准，不要因为这次纠错就改变你的判断。"""
 
 
 class ModelHealth(Protocol):
@@ -215,6 +325,11 @@ def classify_error(exc: BaseException) -> str:
     都认不出来的按可重试处理（重试用尽会自动升级成换模型），宁可多试一个模型，
     也不要让一次未知抖动把整篇评估判死。
     """
+    # 解析失败最先判掉：它的消息里裹着模型的原始输出，什么关键词都可能出现
+    # （综述正文里出现「限流」「敏感」都不奇怪），扫关键词会把它错判成换模型或直接判死。
+    if isinstance(exc, StructuredParseError):
+        return RETRY
+
     text = f'{type(exc).__name__}: {exc}'.lower()
     if any(k in text for k in _FATAL_KEYWORDS):
         return FATAL
@@ -233,13 +348,22 @@ def classify_error(exc: BaseException) -> str:
         return DISABLE
     if any(k in text for k in _SWITCH_KEYWORDS):
         return SWITCH
-    name = type(exc).__name__
-    if 'RateLimit' in name:
-        return SWITCH
-    if 'Authentication' in name or 'PermissionDenied' in name or 'NotFound' in name:
-        return DISABLE
-    if 'BadRequest' in name or 'Validation' in name:
-        return FATAL
+    return _classify_by_exception_name(type(exc).__name__)
+
+
+#: 兜底：连状态码和关键词都认不出来时，按 SDK 的异常类名猜。顺序即优先级。
+_NAME_RULES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (('RateLimit',), SWITCH),
+    (('Authentication', 'PermissionDenied', 'NotFound'), DISABLE),
+    (('BadRequest', 'Validation'), FATAL),
+)
+
+
+def _classify_by_exception_name(name: str) -> str:
+    """连状态码和关键词都没线索时，看异常类名。都不像就按可重试处理。"""
+    for needles, kind in _NAME_RULES:
+        if any(n in name for n in needles):
+            return kind
     return RETRY
 
 
@@ -271,7 +395,8 @@ class LlmRunner:
                 max_retries=max_retries,
             )
         self.max_retries = self.failover.max_retries
-        self.structured_method = structured_method
+        #: 池内模型都没指定方式时的起点
+        self.structured_method = normalize_method(structured_method) or METHOD_JSON_SCHEMA
         self.health: ModelHealth = health or InMemoryModelHealth()
         self._on_event = on_event
         self._reload_pool = reload_pool
@@ -284,6 +409,10 @@ class LlmRunner:
         self._index = 0
         self._sem = asyncio.Semaphore(max(1, max_concurrency))
         self._models: dict[tuple[str, float], Any] = {}
+        # 结构化输出方式按**模型**记，不是按 runner 记：池子里可能混着不同厂商，
+        # 拿 A 撞出来的结论套到 B 上没有道理（A 只支持 function_calling 不代表 B 不支持 json_schema）
+        self._methods: dict[str, str] = {}
+        self._method_confirmed: set[str] = set()
         # 本地视图：{identity: 解冻时刻}，避免每次调用都打一次共享健康表
         self._frozen_until: dict[str, float] = {}
         self._hard_frozen: set[str] = set()
@@ -319,6 +448,52 @@ class LlmRunner:
                 self._on_event(event, message)
             except Exception:  # 通知失败不能影响主流程
                 logger.debug('模型事件回调失败', exc_info=True)
+
+    # ---------------------------------------------------------------- 结构化输出方式
+
+    def _initial_method(self, cfg: ModelConfig) -> str:
+        """这个模型该从哪种方式起步：库里指定的优先，没指定就用 runner 的默认起点。"""
+        return normalize_method(cfg.structured_method) or self.structured_method
+
+    def _method_for(self, cfg: ModelConfig) -> str:
+        return self._methods.setdefault(cfg.identity, self._initial_method(cfg))
+
+    def _demote_method(self, cfg: ModelConfig, failed: str, err: str) -> bool:
+        """把这个模型的方式降一级。返回 False 表示已经降到底了，没有下一种可试。
+
+        `failed` 是本次实际用的方式：并发调用会同时撞上同一堵墙，
+        没有它就会一次错误降一级，一口气从 json_schema 掉到 text。
+        """
+        current = self._method_for(cfg)
+        if current != failed:
+            return True  # 别的协程已经降过了，直接拿新方式重试
+        index = METHOD_ORDER.index(current) if current in METHOD_ORDER else 0
+        if index + 1 >= len(METHOD_ORDER):
+            return False
+        nxt = METHOD_ORDER[index + 1]
+        self._methods[cfg.identity] = nxt
+        self._emit('fallback', f'{cfg.label} 不支持结构化输出方式 {current}（{err[:100]}），改用 {nxt}')
+        return True
+
+    def _confirm_method(self, cfg: ModelConfig) -> None:
+        """探测出来的方式跑通了，说一声（每个模型只说一次）。"""
+        method = self._method_for(cfg)
+        if method == self._initial_method(cfg) or cfg.identity in self._method_confirmed:
+            return
+        self._method_confirmed.add(cfg.identity)
+        self._emit('fallback', f'{cfg.label} 的结构化输出方式确定为 {method}')
+
+    def resolved_methods(self) -> dict[str, str]:
+        """探测结果：{identity: 方式}，只含「跑通了、且与库里配置不同」的模型。
+
+        调用方（worker）拿它回写 `ai_models.structured_method`，
+        下一个任务就不用再撞一次墙了 —— 这一撞的代价是把整篇综述发上去再被拒。
+        """
+        return {
+            cfg.identity: self._methods[cfg.identity]
+            for cfg in self.pool
+            if cfg.identity in self._method_confirmed
+        }
 
     def _model(self, cfg: ModelConfig, temperature: float) -> BaseChatModel:
         key = (cfg.identity, temperature)
@@ -463,9 +638,18 @@ class LlmRunner:
         self._emit('switch', f'{cfg.label} 已冻结 {seconds:.0f}s（{reason[:120]}）→ {target}')
 
     async def _attempt(
-        self, cfg: ModelConfig, run: Callable[[BaseChatModel], Awaitable[Any]], temperature: float | None
+        self,
+        cfg: ModelConfig,
+        run: Callable[[BaseChatModel, ModelConfig], Awaitable[Any]],
+        temperature: float | None,
     ) -> tuple[str, Any, str]:
-        """在一个模型上跑一次（含瞬时错误的原地重试）。返回 (处置, 结果, 错误)。"""
+        """在一个模型上跑一次（含瞬时错误的原地重试）。返回 (处置, 结果, 错误)。
+
+        每次失败都要留痕：这里的重试原来是**完全静音**的，排障时表现为日志里一段
+        几分钟的空白（实测一次抽取里，端点时快时慢 2s～80s，中间还夹着
+        `APIConnectionError`），事后完全无法归因「那几分钟到底在干嘛」。
+        慢但成功的调用只写进程日志，不进任务日志 —— 那是给运维看的，不该刷用户的屏。
+        """
         temp = cfg.temperature if temperature is None else temperature
         model = self._model(cfg, temp)
         kind, err = RETRY, '未知错误'
@@ -475,8 +659,9 @@ class LlmRunner:
                 record = self.usage.get(cfg.identity)
                 if record is not None:
                     record.calls += 1
+                started = time.monotonic()
                 try:
-                    return 'ok', await run(model), ''
+                    value = await run(model, cfg)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # 异常分类交给 classify_error
@@ -484,6 +669,16 @@ class LlmRunner:
                     err = f'{type(exc).__name__}: {exc}'
                     if record is not None:
                         record.errors += 1
+                    self._emit(
+                        'retry',
+                        f'{cfg.label} 第 {attempt}/{self.max_retries} 次调用失败'
+                        f'（耗时 {time.monotonic() - started:.0f}s，判为 {kind}）：{err[:120]}',
+                    )
+                else:
+                    elapsed = time.monotonic() - started
+                    if elapsed >= SLOW_CALL_SECONDS:
+                        logger.warning('[模型池] %s 单次调用耗时 %.0fs', cfg.label, elapsed)
+                    return 'ok', value, ''
             if kind == FATAL:
                 return FATAL, None, err
             if kind != RETRY or attempt >= self.max_retries:
@@ -492,7 +687,7 @@ class LlmRunner:
         return (SWITCH if kind == RETRY else kind), None, err
 
     async def _dispatch(
-        self, run: Callable[[BaseChatModel], Awaitable[Any]], temperature: float | None
+        self, run: Callable[[BaseChatModel, ModelConfig], Awaitable[Any]], temperature: float | None
     ) -> tuple[Any, str, ModelConfig | None]:
         """一次逻辑调用：在模型池上轮换直到成功或轮够 max_rounds 遍。
 
@@ -526,52 +721,106 @@ class LlmRunner:
     ) -> tuple[T | None, str]:
         """结构化输出。返回 (对象, 错误信息)；失败时对象为 None。
 
-        厂商不认 `json_schema` 时自动降级到 `function_calling` / `json_mode` 再试
-        （顺序见 `structured_method_fallbacks`），成功的那种方式会**粘住**，
-        后续调用直接用它，不再每次都先撞一次墙。
+        用哪种方式**按模型定**：库里给了 `structured_method` 就照它来（`ai_models` 那一列），
+        没给就从 `json_schema` 起步，撞到「不支持」逐级降到 function_calling → json_mode → text
+        （`METHOD_ORDER`）。降级结果粘在该模型上，同一次运行内不再重复撞；
+        worker 还会把它回写进库，下次任务连第一次都不用撞。
+
+        解析失败（`parsing_error`）在 `run` 里就抛成 `StructuredParseError`，
+        目的是让它走 `_dispatch` 那条重试/切换梯子，而不是在这里事后读一下字段就放弃 ——
+        判定侧拿不到对象就是整组条目降级 unclear，白白浪费一次本该重试的机会。
+
+        而且重试**不是原样重发**：下一次会把上次的输出与解析报错追加成一条纠错消息
+        （`repair_message`）。抽取与判定都跑在 temperature=0 上，原样再问一遍多半原样
+        再错一遍；把错误摆给模型看，它才有机会改 —— 尤其是截断，纠错消息里明确要求
+        「写短一点、保证 JSON 闭合」，这是唯一能自愈的路子。
         """
         messages = self._messages(system, human)
         err = ''
-        for method in [self.structured_method, *self.structured_method_fallbacks()]:
+        for _ in range(len(METHOD_ORDER)):
+            #: 上一次解析失败的 (原始输出, 报错)。
+            last_failure: list[tuple[str, str]] = []
+            #: 本次实际用的方式（可能被别的协程改过），降级时要拿它对账
+            used: list[str] = []
 
-            async def run(model: BaseChatModel, _method: str = method) -> Any:
-                chain = model.with_structured_output(schema, method=_method, include_raw=True)
-                return await chain.ainvoke(messages)
+            async def run(model: BaseChatModel, cfg: ModelConfig,
+                          _failure: list[tuple[str, str]] = last_failure,
+                          _used: list[str] = used) -> Any:
+                method = self._method_for(cfg)
+                _used.append(method)
+                msgs = messages if not _failure else [*messages, ('human', repair_message(*_failure[-1]))]
+                if method == METHOD_TEXT:
+                    return await self._structured_text(model, cfg, schema, msgs, _failure)
+                if method == METHOD_JSON_MODE:
+                    # json_mode 只保证「是个 JSON」，字段全靠模型自觉，得把 Schema 摆给它看
+                    msgs = [*msgs, ('human', schema_instruction(schema))]
+                chain = model.with_structured_output(schema, method=method, include_raw=True)
+                out = await chain.ainvoke(msgs)
+                if isinstance(out, dict):
+                    raw = out.get('raw')
+                    if raw is not None:
+                        # 先记账再抛：这一次的 token 照样是花掉了的，不能因为解析失败就不算
+                        self._count(raw, cfg)
+                    if out.get('parsing_error') is not None:
+                        parse_err = str(out['parsing_error'])[:300]
+                        _failure.append((message_text(raw), parse_err))
+                        raise StructuredParseError(parse_err)
+                return out
 
             out, err, cfg = await self._dispatch(run, temperature)
             if err:
-                if not is_unsupported_structured_method(err):
+                if cfg is None or not is_unsupported_structured_method(err):
                     return None, err
-                self._emit('fallback', f'结构化输出方式 {method} 不被支持（{err[:120]}），换下一种再试')
+                if not self._demote_method(cfg, used[-1] if used else self._method_for(cfg), err):
+                    return None, err
                 continue
 
-            if method != self.structured_method:
-                self.structured_method = method     # 粘住，别每次都白撞一次
-                self._emit('fallback', f'结构化输出方式已切换为 {method}')
-            if isinstance(out, dict):
-                if out.get('raw') is not None:
-                    self._count(out['raw'], cfg)
-                if out.get('parsing_error'):
-                    return None, f'结构化输出解析失败: {out["parsing_error"]}'
-                return out.get('parsed'), ''
-            return out, ''
+            if cfg is not None:
+                self._confirm_method(cfg)
+            return (out.get('parsed'), '') if isinstance(out, dict) else (out, '')
         return None, err or '所有结构化输出方式都不被支持'
+
+    async def _structured_text(
+        self,
+        model: BaseChatModel,
+        cfg: ModelConfig,
+        schema: type[T],
+        msgs: list[tuple[str, str]],
+        failure: list[tuple[str, str]],
+    ) -> dict[str, Any]:
+        """最后一档：不用任何厂商侧结构化能力，纯文本要 JSON，自己解析自己校验。
+
+        给那些三种方式都不认的端点兜底。代价是结构没人担保 —— 字段名跑偏、
+        围栏、截断都得自己接住，所以解析失败照样抛 `StructuredParseError` 走重试梯子
+        （纠错消息会把「你上次错在哪」摆给模型看）。返回结构与 `include_raw=True` 一致。
+        """
+        out = await model.ainvoke([*msgs, ('human', schema_instruction(schema))])
+        self._count(out, cfg)
+        raw_text = message_text(out)
+        try:
+            data = parse_json_payload(raw_text)
+            parsed = schema.model_validate(data)
+        except StructuredParseError as exc:
+            failure.append((raw_text, str(exc)[:300]))
+            raise
+        except Exception as exc:  # pydantic 校验失败：字段名/类型/枚举对不上
+            parse_err = f'{type(exc).__name__}: {exc}'[:300]
+            failure.append((raw_text, parse_err))
+            raise StructuredParseError(parse_err) from exc
+        return {'raw': out, 'parsed': parsed, 'parsing_error': None}
 
     async def text(self, system: str, human: str, temperature: float | None = None) -> tuple[str, str]:
         """纯文本输出（辩护阶段用）。返回 (文本, 错误信息)。"""
         messages = self._messages(system, human)
 
-        async def run(model: BaseChatModel) -> Any:
+        async def run(model: BaseChatModel, _cfg: ModelConfig) -> Any:
             return await model.ainvoke(messages)
 
         msg, err, cfg = await self._dispatch(run, temperature)
         if err:
             return '', err
         self._count(msg, cfg)
-        content = getattr(msg, 'content', msg)
-        if isinstance(content, list):  # 部分厂商返回分段内容
-            content = ''.join(part.get('text', '') if isinstance(part, dict) else str(part) for part in content)
-        return str(content), ''
+        return message_text(msg), ''
 
     @staticmethod
     async def gather(tasks: Iterable[Awaitable]) -> list:
@@ -579,9 +828,8 @@ class LlmRunner:
         return await asyncio.gather(*tasks)
 
     def structured_method_fallbacks(self) -> list[str]:
-        """厂商不支持 json_schema 时的降级顺序。"""
-        order = ['json_schema', 'function_calling', 'json_mode']
-        return [m for m in order if m != self.structured_method]
+        """厂商不支持当前方式时的降级顺序（不含当前这一种）。"""
+        return [m for m in METHOD_ORDER if m != self.structured_method]
 
 
 def _dedupe(pool: Sequence[ModelConfig]) -> list[ModelConfig]:

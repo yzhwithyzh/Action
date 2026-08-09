@@ -39,6 +39,11 @@ class ModelConfig:
     #: 同一个 provider/model 可能对应多个账号 —— 每个账号有各自的并发与余额，
     #: 冻结、限流统计必须按账号分开算，所以不能拿 provider/model 当键。不填时退化成 provider:model。
     ref: str = ''
+    #: 结构化输出方式：json_schema / function_calling / json_mode / text。
+    #: 空串 = 交给运行时探测（从 json_schema 起，撞到「不支持」逐级降级）。
+    #: 后端从 `ai_models.structured_method` 填进来 —— 支持情况是**按模型**不同的
+    #: （同一个 deepseek 在官方端点与火山方舟上就不一样），所以它属于模型配置而不是引擎配置。
+    structured_method: str = ''
 
     @property
     def identity(self) -> str:

@@ -18,26 +18,32 @@ from exceptions.exception import ServiceException
 from module_action.entity.vo.action_vo import (
     CollabRequestModel,
     CollabRequestPageQueryModel,
+    GuidelineCategoryModel,
+    GuidelineCategoryPageQueryModel,
     GuidelineItemModel,
     GuidelineItemPageQueryModel,
     GuidelineModel,
     GuidelinePageQueryModel,
     NewsModel,
     NewsPageQueryModel,
+    ResourceLinkModel,
+    ResourceLinkPageQueryModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
 )
 from module_action.service.action_service import (
     CollabRequestService,
+    GuidelineCategoryService,
     GuidelineItemService,
     GuidelineService,
     NewsService,
+    ResourceLinkService,
     TeamMemberService,
 )
 from module_admin.entity.vo.common_vo import UploadResponseModel
 from module_admin.entity.vo.user_vo import CurrentUserModel
 from utils.log_util import logger
-from utils.oss_util import MAX_IMAGE_SIZE, OssUtil
+from utils.oss_util import MAX_DOCUMENT_SIZE, MAX_IMAGE_SIZE, OssUtil
 from utils.response_util import ResponseUtil
 
 # 官网内容管理：走后台鉴权，与 action_site_controller 的公开接口彻底分开。
@@ -401,6 +407,148 @@ async def delete_admin_guideline(
     return ResponseUtil.success(msg=result.message)
 
 
+@action_admin_controller.post(
+    '/guideline/file',
+    summary='上传报告规范文档',
+    description='后台维护用，PDF 直传阿里云 OSS，返回可直接写入 fileUrlZh/fileUrlEn 的公网地址',
+    response_model=DynamicResponseModel[UploadResponseModel],
+    dependencies=[UserInterfaceAuthDependency('action:guideline:edit')],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_GUIDELINE_FILE, preset=ApiRateLimitPreset.COMMON_UPLOAD)
+async def upload_admin_guideline_file(
+    request: Request,
+    file: Annotated[UploadFile, File(...)],
+) -> Response:
+    # 与团队头像同理：不走 /common/upload（落后端本地磁盘），官网是 SSG 静态站，
+    # 规范原文必须是与后端机器解耦的公网地址，否则换机部署下载链接就断。
+    extension = OssUtil.normalize_document_extension(file.filename or '')
+    content = await file.read()
+    if not content:
+        raise ServiceException(message='上传的文档为空')
+    if len(content) > MAX_DOCUMENT_SIZE:
+        raise ServiceException(message=f'文档大小不能超过 {MAX_DOCUMENT_SIZE // 1024 // 1024}MB')
+
+    object_key = OssUtil.build_object_key('guideline', extension)
+    url = await OssUtil.put_object(object_key, content, extension)
+    logger.info(f'报告规范文档上传成功：{object_key}')
+
+    # fileName 与 url 同为公网地址，理由同头像接口：action-admin 的 FileUpload 取 res.fileName 回填
+    return ResponseUtil.success(
+        model_content=UploadResponseModel(
+            fileName=url,
+            newFileName=object_key.rsplit('/', 1)[-1],
+            originalFilename=file.filename,
+            url=url,
+        )
+    )
+
+
+# ------------------------------------------------------------------ 报告规范分类
+
+
+@action_admin_controller.get(
+    '/guideline-category/list',
+    summary='获取报告规范分类分页列表',
+    description='后台维护用，含已停用的分类；也供规范目录管理页的「研究设计」下拉取值',
+    response_model=PageResponseModel[GuidelineCategoryModel],
+    dependencies=[UserInterfaceAuthDependency('action:guidelineCategory:list')],
+)
+async def get_admin_guideline_category_list(
+    request: Request,
+    category_page_query: Annotated[GuidelineCategoryPageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await GuidelineCategoryService.get_category_list_services(query_db, category_page_query, is_page=True)
+    logger.info('获取成功')
+
+    return ResponseUtil.success(model_content=result)
+
+
+@action_admin_controller.get(
+    '/guideline-category/{cat_id}',
+    summary='获取报告规范分类详情',
+    description='后台维护用',
+    response_model=DataResponseModel[GuidelineCategoryModel],
+    dependencies=[UserInterfaceAuthDependency('action:guidelineCategory:query')],
+)
+async def get_admin_guideline_category_detail(
+    request: Request,
+    cat_id: Annotated[int, Path(description='分类id')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await GuidelineCategoryService.category_detail_services(query_db, cat_id)
+    logger.info(f'获取cat_id为{cat_id}的信息成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.post(
+    '/guideline-category',
+    summary='新增报告规范分类',
+    description='后台维护用',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:guidelineCategory:add')],
+)
+@ValidateFields(validate_model='add_category')
+@Log(title='报告规范分类', business_type=BusinessType.INSERT)
+async def add_admin_guideline_category(
+    request: Request,
+    add_category: GuidelineCategoryModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    add_category.create_by = current_user.user.user_name
+    add_category.create_time = datetime.now()
+    add_category.update_by = current_user.user.user_name
+    add_category.update_time = datetime.now()
+    result = await GuidelineCategoryService.add_category_services(query_db, add_category)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.put(
+    '/guideline-category',
+    summary='编辑报告规范分类',
+    description='后台维护用；分类下已有规范时不允许改标识，只允许改名称',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:guidelineCategory:edit')],
+)
+@ValidateFields(validate_model='edit_category')
+@Log(title='报告规范分类', business_type=BusinessType.UPDATE)
+async def edit_admin_guideline_category(
+    request: Request,
+    edit_category: GuidelineCategoryModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    edit_category.update_by = current_user.user.user_name
+    edit_category.update_time = datetime.now()
+    result = await GuidelineCategoryService.edit_category_services(query_db, edit_category)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.delete(
+    '/guideline-category/{cat_ids}',
+    summary='删除报告规范分类',
+    description='后台维护用，逻辑删除；分类下还有规范时拒绝删除',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:guidelineCategory:remove')],
+)
+@Log(title='报告规范分类', business_type=BusinessType.DELETE)
+async def delete_admin_guideline_category(
+    request: Request,
+    cat_ids: Annotated[str, Path(description='需要删除的分类id，多个以逗号分隔')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await GuidelineCategoryService.delete_category_services(query_db, cat_ids)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
 # ------------------------------------------------------------------ 规范 checklist 条目
 
 
@@ -505,6 +653,149 @@ async def delete_admin_guideline_item(
     logger.info(result.message)
 
     return ResponseUtil.success(msg=result.message)
+
+
+# ------------------------------------------------------------------ 资源中心链接
+
+
+@action_admin_controller.get(
+    '/resource-link/list',
+    summary='获取资源中心链接分页列表',
+    description='后台维护用，含已停用的资源',
+    response_model=PageResponseModel[ResourceLinkModel],
+    dependencies=[UserInterfaceAuthDependency('action:resourceLink:list')],
+)
+async def get_admin_resource_link_list(
+    request: Request,
+    link_page_query: Annotated[ResourceLinkPageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await ResourceLinkService.get_link_list_services(query_db, link_page_query, is_page=True)
+    logger.info('获取成功')
+
+    return ResponseUtil.success(model_content=result)
+
+
+@action_admin_controller.get(
+    '/resource-link/{link_id}',
+    summary='获取资源中心链接详情',
+    description='后台维护用',
+    response_model=DataResponseModel[ResourceLinkModel],
+    dependencies=[UserInterfaceAuthDependency('action:resourceLink:query')],
+)
+async def get_admin_resource_link_detail(
+    request: Request,
+    link_id: Annotated[int, Path(description='资源id')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await ResourceLinkService.link_detail_services(query_db, link_id)
+    logger.info(f'获取link_id为{link_id}的信息成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.post(
+    '/resource-link',
+    summary='新增资源中心链接',
+    description='后台维护用',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:resourceLink:add')],
+)
+@ValidateFields(validate_model='add_link')
+@Log(title='资源中心链接', business_type=BusinessType.INSERT)
+async def add_admin_resource_link(
+    request: Request,
+    add_link: ResourceLinkModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    add_link.create_by = current_user.user.user_name
+    add_link.create_time = datetime.now()
+    add_link.update_by = current_user.user.user_name
+    add_link.update_time = datetime.now()
+    result = await ResourceLinkService.add_link_services(query_db, add_link)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.put(
+    '/resource-link',
+    summary='编辑资源中心链接',
+    description='后台维护用',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:resourceLink:edit')],
+)
+@ValidateFields(validate_model='edit_link')
+@Log(title='资源中心链接', business_type=BusinessType.UPDATE)
+async def edit_admin_resource_link(
+    request: Request,
+    edit_link: ResourceLinkModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    edit_link.update_by = current_user.user.user_name
+    edit_link.update_time = datetime.now()
+    result = await ResourceLinkService.edit_link_services(query_db, edit_link)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.delete(
+    '/resource-link/{link_ids}',
+    summary='删除资源中心链接',
+    description='后台维护用，逻辑删除',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:resourceLink:remove')],
+)
+@Log(title='资源中心链接', business_type=BusinessType.DELETE)
+async def delete_admin_resource_link(
+    request: Request,
+    link_ids: Annotated[str, Path(description='需要删除的资源id，多个以逗号分隔')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await ResourceLinkService.delete_link_services(query_db, link_ids)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.post(
+    '/resource-link/logo',
+    summary='上传资源中心标识图',
+    description='后台维护用，图片直传阿里云 OSS，返回可直接写入 logoUrl 的公网地址',
+    response_model=DynamicResponseModel[UploadResponseModel],
+    dependencies=[UserInterfaceAuthDependency('action:resourceLink:edit')],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_RESOURCE_LOGO, preset=ApiRateLimitPreset.COMMON_UPLOAD)
+async def upload_admin_resource_link_logo(
+    request: Request,
+    file: Annotated[UploadFile, File(...)],
+) -> Response:
+    # 与团队头像同理：不走 /common/upload（落后端本地磁盘），官网是 SSG 静态站，
+    # 图片必须是与后端机器解耦的公网地址。种子里那 6 张 /assets/logo-*.png 是随前端
+    # 打包的静态资源，不受此限，也不必迁走。
+    extension = OssUtil.normalize_extension(file.filename or '')
+    content = await file.read()
+    if not content:
+        raise ServiceException(message='上传的图片为空')
+    if len(content) > MAX_IMAGE_SIZE:
+        raise ServiceException(message=f'图片大小不能超过 {MAX_IMAGE_SIZE // 1024 // 1024}MB')
+
+    object_key = OssUtil.build_object_key('resource', extension)
+    url = await OssUtil.put_object(object_key, content, extension)
+    logger.info(f'资源中心标识图上传成功：{object_key}')
+
+    # fileName 与 url 同为公网地址，理由同头像接口：ImageUpload 取 res.fileName 回填
+    return ResponseUtil.success(
+        model_content=UploadResponseModel(
+            fileName=url,
+            newFileName=object_key.rsplit('/', 1)[-1],
+            originalFilename=file.filename,
+            url=url,
+        )
+    )
 
 
 # ------------------------------------------------------------------ 协作与咨询申请
