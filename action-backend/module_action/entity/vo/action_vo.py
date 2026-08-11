@@ -1,3 +1,4 @@
+import html
 import re
 from datetime import date, datetime
 from typing import Any, Literal
@@ -257,20 +258,29 @@ class DeleteResourceLinkModel(BaseModel):
 
 
 # 文案里允许出现的标签。原始 i18n 词条用到的是 span/b/i（排版强调）与 svg/circle/path（行内小图标），
+# 另加 <a>：页脚的 ICP 备案号按工信部要求必须是指向 beian.miit.gov.cn 的可点链接，
+# 这类「链接就长在一句话中间」的场景没法拆成 action_resource_link 那样的专表。
 # 白名单就按实照列，不多放一个。放开等于把「后台文本框」变成「往公开页面注入任意 HTML」的口子 ——
 # 这些文案是以 v-html 渲染的（nuxt.config.ts 的 escapeHtml: false），不是被转义的纯文本。
-ALLOWED_TEXT_TAGS = frozenset({'span', 'b', 'i', 'em', 'strong', 'br', 'sup', 'sub', 'small', 'svg', 'circle', 'path'})
+ALLOWED_TEXT_TAGS = frozenset(
+    {'a', 'span', 'b', 'i', 'em', 'strong', 'br', 'sup', 'sub', 'small', 'svg', 'circle', 'path'}
+)
 
 # 事件处理属性（onclick/onload/onerror…）。svg 在白名单里，没有这一道就等于放行 <svg onload=...>。
 _EVENT_ATTR_RE = re.compile(r'\son[a-z]+\s*=', re.IGNORECASE)
-# 伪协议。文案里出现 <a href> 的场景已由 action_resource_link 等专表承担，这里一并挡掉。
+# 伪协议兜底。真正拦 <a href> 的是下面的 _HREF_RE + _SAFE_HREF_RE，这条只多挡一层裸文本形态。
 _BAD_SCHEME_RE = re.compile(r'(javascript|vbscript|data)\s*:', re.IGNORECASE)
 _TAG_NAME_RE = re.compile(r'<\s*/?\s*([a-zA-Z][a-zA-Z0-9]*)')
+# 取出每个 href 的值（双引号/单引号/裸值三种写法）
+_HREF_RE = re.compile(r'href\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s>]+))', re.IGNORECASE)
+# href 只放行这几种：站外 http(s) 绝对地址、站内绝对路径、锚点、邮件。
+# 协议相对地址（//evil.com）不放 —— 它长得像路径，实际是跳站外。
+_SAFE_HREF_RE = re.compile(r'^(?:https?://[^/]|/(?!/)|#|mailto:)', re.IGNORECASE)
 
 
 def assert_safe_markup(value: str | None, field_label: str) -> None:
     """
-    校验文案里的 HTML 只用了白名单标签，且不含事件属性与伪协议
+    校验文案里的 HTML 只用了白名单标签，且不含事件属性与危险链接
 
     :param value: 待校验文案
     :param field_label: 报错时显示的字段名
@@ -286,6 +296,15 @@ def assert_safe_markup(value: str | None, field_label: str) -> None:
             )
     if _EVENT_ATTR_RE.search(value):
         raise ModelValidatorException(message=f'{field_label}不能包含 on... 事件属性')
+    for quoted, single, bare in _HREF_RE.findall(value):
+        # 先解 HTML 实体再判：&#106;avascript:… 在浏览器里会还原成 javascript:，只匹配原文等于没判
+        href = html.unescape(quoted or single or bare)
+        # 去掉浏览器解析 URL 时会忽略的空白与控制字符（java\tscript: 同样是可执行的）
+        href = re.sub(r'[\x00-\x20\x7f]', '', href)
+        if not _SAFE_HREF_RE.match(href):
+            raise ModelValidatorException(
+                message=f'{field_label}的链接地址不合法：只能是 http(s):// 开头的完整网址、/ 开头的站内路径、#锚点或 mailto:'
+            )
     if _BAD_SCHEME_RE.search(value):
         raise ModelValidatorException(message=f'{field_label}不能包含 javascript:/vbscript:/data: 伪协议')
 
