@@ -204,6 +204,29 @@ class OssSettings(BaseSettings):
         return f'https://{self.oss_bucket}.{self.oss_endpoint}'
 
 
+class SiteBuildSettings(BaseSettings):
+    """
+    官网静态站重新生成配置
+
+    官网是 `nitro.preset: 'static'` 的预渲染站，后台改完文案，搜索引擎与分享卡片看到的
+    仍是上一次构建的 HTML。后台「重新生成官网」按钮就是拿这份配置去跑一次构建命令。
+
+    **命令由运维在 .env 里写死，接口不接受任何来自请求的参数** —— 这是个执行 shell 的口子，
+    只要有一处能把用户输入拼进命令行，后台任意一个有该权限的账号就等于拿到了服务器。
+    同理不走 `shell=True`：命令用 shlex 拆成 argv 直接 exec，不经过 shell 解析。
+
+    site_rebuild_enabled 为 False（默认）时接口直接返回「未配置」，不做静默降级。
+    """
+
+    site_rebuild_enabled: bool = False
+    # 例：npm run generate —— 相对 site_rebuild_cwd 执行
+    site_rebuild_command: str = ''
+    # 前端源码目录，例：/opt/action/action-frontend
+    site_rebuild_cwd: str = ''
+    # 构建通常两三分钟；超时后子进程会被杀掉并记为失败
+    site_rebuild_timeout_seconds: int = 900
+
+
 class GenSettings:
     """
     代码生成配置
@@ -362,6 +385,12 @@ class GetConfig:
         """
         return OssSettings()
 
+    def get_site_build_config(self) -> SiteBuildSettings:
+        """
+        获取官网重新生成配置
+        """
+        return SiteBuildSettings()
+
     @staticmethod
     def parse_cli_args() -> None:
         """
@@ -419,3 +448,5 @@ GenConfig = get_config.get_gen_config()
 UploadConfig = get_config.get_upload_config()
 # 阿里云OSS配置
 OssConfig = get_config.get_oss_config()
+# 官网重新生成配置
+SiteBuildConfig = get_config.get_site_build_config()

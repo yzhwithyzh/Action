@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import shlex
 import shutil
 import uuid
 from collections import defaultdict
@@ -13,7 +14,7 @@ from fastapi import UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.vo import CrudResponseModel, PageModel
-from config.env import UploadConfig
+from config.env import SiteBuildConfig, UploadConfig
 from exceptions.exception import ServiceException
 from module_action.dao.action_dao import (
     CollabRequestDao,
@@ -23,6 +24,7 @@ from module_action.dao.action_dao import (
     ImplementationDao,
     NewsDao,
     ResourceLinkDao,
+    SiteTextDao,
     SrdDao,
     StudyTypeDao,
     TeamMemberDao,
@@ -49,6 +51,11 @@ from module_action.entity.vo.action_vo import (
     ReaimDimensionModel,
     ResourceLinkModel,
     ResourceLinkPageQueryModel,
+    SiteRebuildStateModel,
+    SiteTextGroupModel,
+    SiteTextModel,
+    SiteTextOverridesModel,
+    SiteTextPageQueryModel,
     SrdAssessmentModel,
     SrdDomainModel,
     SrdGroupModel,
@@ -372,6 +379,305 @@ class ResourceLinkService:
         except Exception as e:
             await query_db.rollback()
             raise e
+
+
+class SiteTextService:
+    """
+    官网站点文案服务层
+
+    只提供「查 / 改 / 还原默认」。词条的增删由 `python -m tools.extract_site_texts`
+    从前端 i18n JSON 同步 —— 键是模板里 `$t()` 的参数，后台建键只会建出没人读的孤儿行，
+    后台删键则会让官网上一段文字凭空消失且无从查起。
+    """
+
+    #: 编辑接口只认这几列。`text_key` / `default_*` / `sort_num` 由代码与同步脚本决定，
+    #: 前端把整个 form 原样 PUT 回来时，多余字段在这里被丢掉而不是写进库。
+    EDITABLE_FIELDS: ClassVar[set[str]] = {'text_zh', 'text_en', 'remark', 'update_by', 'update_time'}
+
+    @classmethod
+    async def get_text_list_services(
+        cls, query_db: AsyncSession, query_object: SiteTextPageQueryModel, is_page: bool = False
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        获取站点文案列表
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :return: 文案列表
+        """
+        return await SiteTextDao.get_text_list(query_db, query_object, is_page)
+
+    @classmethod
+    async def text_detail_services(cls, query_db: AsyncSession, text_id: int) -> SiteTextModel:
+        """
+        获取站点文案详情
+
+        :param query_db: orm对象
+        :param text_id: 文案id
+        :return: 文案详情
+        """
+        site_text = await SiteTextDao.get_text_detail_by_id(query_db, text_id)
+        if not site_text:
+            raise ServiceException(message='站点文案不存在')
+
+        return SiteTextModel(**CamelCaseUtil.transform_result(site_text))
+
+    @classmethod
+    async def get_page_groups_services(cls, query_db: AsyncSession) -> list[SiteTextGroupModel]:
+        """
+        获取分组词表（含每组词条数与已改动数），供后台筛选下拉
+
+        :param query_db: orm对象
+        :return: 分组列表
+        """
+        return [SiteTextGroupModel(**row) for row in await SiteTextDao.get_page_groups(query_db)]
+
+    @classmethod
+    async def edit_text_services(cls, query_db: AsyncSession, page_object: SiteTextModel) -> CrudResponseModel:
+        """
+        编辑站点文案
+
+        :param query_db: orm对象
+        :param page_object: 文案对象
+        :return: 编辑结果
+        """
+        text_info = await SiteTextDao.get_text_detail_by_id(query_db, page_object.text_id)
+        if not text_info:
+            raise ServiceException(message='站点文案不存在')
+        payload = {
+            key: value
+            for key, value in page_object.model_dump(exclude_unset=True).items()
+            if key in cls.EDITABLE_FIELDS
+        }
+        if not payload:
+            raise ServiceException(message='没有可修改的内容')
+        payload['text_id'] = page_object.text_id
+        try:
+            await SiteTextDao.edit_text_dao(query_db, payload)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='更新成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def restore_text_services(cls, query_db: AsyncSession, text_ids: str, operator: str) -> CrudResponseModel:
+        """
+        把指定文案还原成代码里的默认值
+
+        :param query_db: orm对象
+        :param text_ids: 文案id字符串，多个以逗号分隔；传 `all` 表示全部还原
+        :param operator: 操作人
+        :return: 还原结果
+        """
+        if text_ids.strip() == 'all':
+            id_list: list[int] = []
+        else:
+            id_list = [int(i) for i in text_ids.split(',') if i.strip()]
+            if not id_list:
+                raise ServiceException(message='传入文案id为空')
+        try:
+            await SiteTextDao.restore_text_dao(query_db, id_list, operator)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='已还原为默认文案')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def get_overrides_services(cls, query_db: AsyncSession) -> SiteTextOverridesModel:
+        """
+        取官网文案覆盖包（只含与默认值不同的词条）
+
+        中英分别只放**这一语言**被改过的键：中文改了英文没改时，只下发中文那一条，
+        英文界面继续用打进包里的 i18n 默认值，不多传一份一模一样的字符串。
+
+        :param query_db: orm对象
+        :return: 覆盖包
+        """
+        rows = await SiteTextDao.get_changed_texts(query_db)
+        zh = {row.text_key: row.text_zh or '' for row in rows if row.text_zh != row.default_zh}
+        en = {row.text_key: row.text_en or '' for row in rows if row.text_en != row.default_en}
+
+        return SiteTextOverridesModel(zh=zh, en=en)
+
+
+class SiteRebuildService:
+    """
+    官网静态站重新生成服务层
+
+    官网是预渲染站，后台改完文案，**访客的浏览器**会通过 `/action/site/texts` 立刻拿到新文案，
+    但**搜索引擎与分享卡片**只看首屏 HTML，那还是上一次构建的产物。这个服务负责按运维在
+    .env 里配好的命令跑一次构建，把改动烤进静态产物。
+
+    命令来自配置、不接受任何请求参数，且不经 shell（见 `SiteBuildSettings` 的说明）。
+    状态放 Redis 而不是内存：后端可能多副本，构建是全局互斥的一件事。
+    """
+
+    #: 状态存放的 Redis 键。构建可能跑几分钟，给一天的过期时间，够后台回看上一次结果。
+    STATE_KEY: ClassVar[str] = 'action:site:rebuild:state'
+    STATE_TTL_SECONDS: ClassVar[int] = 86400
+    #: 互斥锁键。TTL 取构建超时 + 一点余量，进程被 kill 时锁也能自己过期。
+    LOCK_KEY: ClassVar[str] = 'action:site:rebuild:lock'
+
+    @classmethod
+    async def get_state_services(cls, redis: Any) -> SiteRebuildStateModel:
+        """
+        取当前构建状态
+
+        :param redis: redis客户端
+        :return: 构建状态
+        """
+        if not SiteBuildConfig.site_rebuild_enabled:
+            return SiteRebuildStateModel(
+                status='disabled',
+                message='未启用「重新生成官网」。需在后端 .env 配置 SITE_REBUILD_ENABLED / '
+                'SITE_REBUILD_COMMAND / SITE_REBUILD_CWD 后重启后端。',
+            )
+        raw = await redis.get(cls.STATE_KEY)
+        if not raw:
+            return SiteRebuildStateModel(status='idle', message='尚未执行过')
+
+        return SiteRebuildStateModel(**json.loads(raw))
+
+    @classmethod
+    async def _write_state(cls, redis: Any, state: SiteRebuildStateModel) -> None:
+        """
+        写入构建状态
+
+        :param redis: redis客户端
+        :param state: 构建状态
+        :return: None
+        """
+        await redis.set(cls.STATE_KEY, state.model_dump_json(), ex=cls.STATE_TTL_SECONDS)
+
+    @classmethod
+    async def trigger_services(cls, redis: Any, operator: str) -> CrudResponseModel:
+        """
+        触发一次官网重新生成
+
+        立刻返回，构建在后台任务里跑；进度与结果走 `get_state_services`。
+
+        :param redis: redis客户端
+        :param operator: 触发人
+        :return: 触发结果
+        """
+        if not SiteBuildConfig.site_rebuild_enabled:
+            raise ServiceException(
+                message='未启用「重新生成官网」。需在后端 .env 配置 SITE_REBUILD_ENABLED / '
+                'SITE_REBUILD_COMMAND / SITE_REBUILD_CWD 后重启后端。'
+            )
+        if not SiteBuildConfig.site_rebuild_command.strip():
+            raise ServiceException(message='SITE_REBUILD_COMMAND 未配置')
+        cwd = Path(SiteBuildConfig.site_rebuild_cwd)
+        # to_thread 只是为了不在事件循环里做磁盘 stat；这是个配置自检，命中的是「运维填错路径」
+        if not SiteBuildConfig.site_rebuild_cwd or not await asyncio.to_thread(cwd.is_dir):
+            raise ServiceException(message=f'SITE_REBUILD_CWD 不是一个存在的目录：{SiteBuildConfig.site_rebuild_cwd}')
+
+        # setnx 拿锁：同一时刻只允许一次构建。两个构建同时往 .output 里写等于产物损坏。
+        acquired = await redis.set(
+            cls.LOCK_KEY, operator, ex=SiteBuildConfig.site_rebuild_timeout_seconds + 60, nx=True
+        )
+        if not acquired:
+            raise ServiceException(message='官网正在重新生成中，请等这一次跑完')
+
+        state = SiteRebuildStateModel(
+            status='running',
+            message='正在重新生成官网……',
+            started_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            started_by=operator,
+        )
+        await cls._write_state(redis, state)
+        # 不 await：接口要立刻返回。任务对象存一份引用，否则可能被 GC 提前回收。
+        task = asyncio.create_task(cls._run(redis, state))
+        cls._running_tasks.add(task)
+        task.add_done_callback(cls._running_tasks.discard)
+
+        return CrudResponseModel(is_success=True, message='已开始重新生成官网，预计需要几分钟')
+
+    #: 后台构建任务的强引用集合（asyncio 只持弱引用，不存就可能被中途回收）
+    _running_tasks: ClassVar[set[asyncio.Task]] = set()
+
+    @classmethod
+    async def _run(cls, redis: Any, state: SiteRebuildStateModel) -> None:
+        """
+        实际执行构建命令
+
+        :param redis: redis客户端
+        :param state: 触发时写入的状态，用于保留 startedAt / startedBy
+        :return: None
+        """
+        argv = shlex.split(SiteBuildConfig.site_rebuild_command)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=SiteBuildConfig.site_rebuild_cwd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    process.communicate(), timeout=SiteBuildConfig.site_rebuild_timeout_seconds
+                )
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                raise ServiceException(
+                    message=f'构建超时（{SiteBuildConfig.site_rebuild_timeout_seconds}s），已终止'
+                ) from None
+
+            output = (stdout or b'').decode('utf-8', errors='replace')
+            if process.returncode == 0:
+                # 只回显末尾若干行：构建日志动辄几千行，整包塞进 Redis 状态没有意义
+                result = SiteRebuildStateModel(
+                    status='success',
+                    message='官网已重新生成。' + cls._tail(output),
+                    started_at=state.started_at,
+                    started_by=state.started_by,
+                    finished_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                )
+                logger.info('官网重新生成成功')
+            else:
+                result = SiteRebuildStateModel(
+                    status='failed',
+                    message=f'构建失败（退出码 {process.returncode}）。' + cls._tail(output),
+                    started_at=state.started_at,
+                    started_by=state.started_by,
+                    finished_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                )
+                logger.error(f'官网重新生成失败，退出码 {process.returncode}')
+            await cls._write_state(redis, result)
+        except Exception as e:
+            logger.error(f'官网重新生成异常：{e}')
+            await cls._write_state(
+                redis,
+                SiteRebuildStateModel(
+                    status='failed',
+                    message=f'构建异常：{e}',
+                    started_at=state.started_at,
+                    started_by=state.started_by,
+                    finished_at=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                ),
+            )
+        finally:
+            # 无论成败都要放锁，否则下一次触发要等到 TTL 过期
+            await redis.delete(cls.LOCK_KEY)
+
+    @staticmethod
+    def _tail(output: str, lines: int = 12) -> str:
+        """
+        取构建输出的末尾若干行
+
+        :param output: 完整输出
+        :param lines: 保留行数
+        :return: 末尾片段
+        """
+        kept = [line for line in output.strip().splitlines() if line.strip()][-lines:]
+
+        return '\n'.join(kept)
 
 
 class GuidelineService:

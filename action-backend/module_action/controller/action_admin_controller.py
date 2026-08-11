@@ -28,6 +28,10 @@ from module_action.entity.vo.action_vo import (
     NewsPageQueryModel,
     ResourceLinkModel,
     ResourceLinkPageQueryModel,
+    SiteRebuildStateModel,
+    SiteTextGroupModel,
+    SiteTextModel,
+    SiteTextPageQueryModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
 )
@@ -38,6 +42,8 @@ from module_action.service.action_service import (
     GuidelineService,
     NewsService,
     ResourceLinkService,
+    SiteRebuildService,
+    SiteTextService,
     TeamMemberService,
 )
 from module_admin.entity.vo.common_vo import UploadResponseModel
@@ -796,6 +802,145 @@ async def upload_admin_resource_link_logo(
             url=url,
         )
     )
+
+
+# ------------------------------------------------------------------ 站点文案
+#
+# 只有「查 / 改 / 还原默认」，**没有新增和删除**：一条文案对应前端模板里的一个 $t() 键，
+# 键由代码定义。词条的增删走 `python -m tools.extract_site_texts` 生成的同步 SQL。
+
+
+@action_admin_controller.get(
+    '/site-text/list',
+    summary='获取站点文案分页列表',
+    description='后台维护用，官网各页的标题/导语/正文/按钮文字',
+    response_model=PageResponseModel[SiteTextModel],
+    dependencies=[UserInterfaceAuthDependency('action:siteText:list')],
+)
+async def get_admin_site_text_list(
+    request: Request,
+    text_page_query: Annotated[SiteTextPageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await SiteTextService.get_text_list_services(query_db, text_page_query, is_page=True)
+    logger.info('获取成功')
+
+    return ResponseUtil.success(model_content=result)
+
+
+@action_admin_controller.get(
+    '/site-text/groups',
+    summary='获取站点文案分组词表',
+    description='后台维护用，返回各分组的词条总数与已改动数，供筛选下拉使用',
+    response_model=DataResponseModel[list[SiteTextGroupModel]],
+    dependencies=[UserInterfaceAuthDependency('action:siteText:list')],
+)
+async def get_admin_site_text_groups(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await SiteTextService.get_page_groups_services(query_db)
+    logger.info('获取站点文案分组成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.get(
+    '/site-text/rebuild',
+    summary='查询官网重新生成状态',
+    description='后台维护用，返回上一次/当前构建的状态。未配置构建命令时返回 disabled',
+    response_model=DataResponseModel[SiteRebuildStateModel],
+    dependencies=[UserInterfaceAuthDependency('action:siteText:list')],
+)
+async def get_admin_site_rebuild_state(request: Request) -> Response:
+    result = await SiteRebuildService.get_state_services(request.app.state.redis)
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.post(
+    '/site-text/rebuild',
+    summary='重新生成官网',
+    description=(
+        '后台维护用。改完文案后，访客浏览器已能立刻看到新文案（走 /action/site/texts），'
+        '但搜索引擎与分享卡片只看首屏 HTML —— 那需要重新构建静态站。本接口触发一次构建，'
+        '立刻返回，进度走 GET 同路径。命令由后端 .env 配置，接口不接受任何参数。'
+    ),
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:siteText:rebuild')],
+)
+# 一次构建几分钟，且全局互斥。限流按登录用户算，挡的是手抖连点，真正的并发闸是服务层的 Redis 锁。
+@ApiRateLimit(namespace=ApiNamespace.ACTION_SITE_REBUILD, limit=3, window_seconds=600, scope='user')
+@Log(title='官网重新生成', business_type=BusinessType.OTHER)
+async def trigger_admin_site_rebuild(
+    request: Request,
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    result = await SiteRebuildService.trigger_services(request.app.state.redis, current_user.user.user_name)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.get(
+    '/site-text/{text_id}',
+    summary='获取站点文案详情',
+    description='后台维护用',
+    response_model=DataResponseModel[SiteTextModel],
+    dependencies=[UserInterfaceAuthDependency('action:siteText:query')],
+)
+async def get_admin_site_text_detail(
+    request: Request,
+    text_id: Annotated[int, Path(description='文案id')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await SiteTextService.text_detail_services(query_db, text_id)
+    logger.info(f'获取text_id为{text_id}的信息成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.put(
+    '/site-text',
+    summary='编辑站点文案',
+    description='后台维护用。只有 textZh / textEn / remark 会被写入，其余字段由代码与同步脚本决定',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:siteText:edit')],
+)
+@ValidateFields(validate_model='edit_text')
+@Log(title='官网站点文案', business_type=BusinessType.UPDATE)
+async def edit_admin_site_text(
+    request: Request,
+    edit_text: SiteTextModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    edit_text.update_by = current_user.user.user_name
+    edit_text.update_time = datetime.now()
+    result = await SiteTextService.edit_text_services(query_db, edit_text)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.put(
+    '/site-text/restore/{text_ids}',
+    summary='还原站点文案为默认值',
+    description='后台维护用。text_ids 传 `all` 表示把全部文案还原成代码里的默认文案',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:siteText:edit')],
+)
+@Log(title='官网站点文案', business_type=BusinessType.UPDATE)
+async def restore_admin_site_text(
+    request: Request,
+    text_ids: Annotated[str, Path(description='需要还原的文案id，多个以逗号分隔；传 all 表示全部')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    result = await SiteTextService.restore_text_services(query_db, text_ids, current_user.user.user_name)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
 
 
 # ------------------------------------------------------------------ 协作与咨询申请

@@ -34,6 +34,7 @@ from module_action.entity.vo.action_vo import (
     ReaimDimensionModel,
     ResourceLinkModel,
     ResourceLinkPageQueryModel,
+    SiteTextOverridesModel,
     SrdAssessmentModel,
     SrdHistoryModel,
     SrdRunStateModel,
@@ -50,6 +51,7 @@ from module_action.service.action_service import (
     ImplementationService,
     NewsService,
     ResourceLinkService,
+    SiteTextService,
     SrdService,
     StudyTypeService,
     TeamMemberService,
@@ -164,6 +166,26 @@ async def get_site_resource_links(
         query_db, ResourceLinkPageQueryModel(), only_published=True
     )
     logger.info('获取资源中心链接成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/texts',
+    summary='获取官网文案覆盖包',
+    description=(
+        '官网公开接口，返回**被后台改过**的 i18n 词条（键为 index.s052 这样的完整 i18n 键）。'
+        '前台在打包进来的 i18n 默认文案之上 merge 这一层，没人改过时两个字典都是空的。'
+        '刻意不返回全部 934 条：那会给每个页面的 hydration payload 白压上约 120KB。'
+    ),
+    response_model=DataResponseModel[SiteTextOverridesModel],
+)
+async def get_site_texts(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await SiteTextService.get_overrides_services(query_db)
+    logger.info('获取官网文案覆盖包成功')
 
     return ResponseUtil.success(data=result)
 

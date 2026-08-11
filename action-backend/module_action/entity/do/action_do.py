@@ -148,6 +148,41 @@ class ActionResourceLink(Base):
     remark = Column(String(500), nullable=True, comment='备注')
 
 
+class ActionSiteText(Base):
+    """
+    官网-站点文案（i18n 词条的可编辑副本）
+
+    官网各页的标题/导语/正文/按钮字原本写死在 action-frontend/i18n/locales/{zh,en}.json，
+    改一个字要改代码 + 重新 generate。本表把那 934 条搬进库供后台编辑。
+
+    **default_* 与 text_* 不是中英那种对称关系**：
+      default_zh / default_en  代码里的原始文案，由 `tools/extract_site_texts.py` 同步，后台只读
+      text_zh    / text_en     当前生效文案，后台改的是这两列
+    公开接口只吐 `text_* <> default_*` 的行 —— 一条没改时返回空对象，
+    不给每个页面的 hydration payload 白压 120KB。「还原默认」= 把 text_* 写回 default_*。
+    """
+
+    __tablename__ = 'action_site_text'
+    __table_args__ = {'comment': '官网-站点文案'}
+
+    text_id = Column(Integer, primary_key=True, autoincrement=True, comment='文案id')
+    text_key = Column(String(128), nullable=False, comment='i18n 键，如 index.s052，与前端 $t() 的参数一字不差')
+    page_key = Column(String(64), nullable=False, server_default=text("''"), comment='所属分组（= text_key 首段）')
+    page_label = Column(String(64), nullable=False, server_default=text("''"), comment='分组中文名')
+    text_zh = Column(Text, nullable=True, comment='当前生效的中文文案')
+    text_en = Column(Text, nullable=True, comment='当前生效的英文文案')
+    default_zh = Column(Text, nullable=True, comment='代码里的中文默认值（后台只读）')
+    default_en = Column(Text, nullable=True, comment='代码里的英文默认值（后台只读）')
+    has_markup = Column(CHAR(1), nullable=True, server_default='0', comment='默认值里含HTML标签（0否 1是）')
+    sort_num = Column(Integer, nullable=True, server_default='0', comment='显示顺序，大体等同页面从上到下')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_by = Column(String(64), nullable=True, server_default=text("''"), comment='创建者')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_by = Column(String(64), nullable=True, server_default=text("''"), comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+    remark = Column(String(500), nullable=True, comment='备注')
+
+
 class ActionGuideline(Base):
     """
     官网-报告规范目录

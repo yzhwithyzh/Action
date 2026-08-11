@@ -20,6 +20,7 @@ from module_action.entity.do.action_do import (
     ActionNews,
     ActionReaimDimension,
     ActionResourceLink,
+    ActionSiteText,
     ActionSrdAssessment,
     ActionSrdDomain,
     ActionSrdGroup,
@@ -41,6 +42,7 @@ from module_action.entity.vo.action_vo import (
     NewsPageQueryModel,
     ResourceLinkModel,
     ResourceLinkPageQueryModel,
+    SiteTextPageQueryModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
 )
@@ -409,6 +411,161 @@ class ResourceLinkDao:
             update(ActionResourceLink)
             .where(ActionResourceLink.link_id.in_(link_ids))
             .values(del_flag='2', update_time=datetime.now())
+        )
+
+
+class SiteTextDao:
+    """
+    官网站点文案数据库操作层
+
+    没有 add / delete：词条由前端代码定义，增删走 `python -m tools.extract_site_texts`
+    生成的同步 SQL。后台只改 text_zh / text_en（还原默认也是改这两列）。
+    """
+
+    #: 「后台改过」的判定条件。用 is distinct from 而不是 <>，
+    #: 否则任一侧为 null 时整个比较是 null，那一行会被静默漏掉。
+    CHANGED_CONDITION = (ActionSiteText.text_zh.is_distinct_from(ActionSiteText.default_zh)) | (
+        ActionSiteText.text_en.is_distinct_from(ActionSiteText.default_en)
+    )
+
+    @classmethod
+    async def get_text_detail_by_id(cls, db: AsyncSession, text_id: int) -> ActionSiteText | None:
+        """
+        根据文案id获取详情
+
+        :param db: orm对象
+        :param text_id: 文案id
+        :return: 文案对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionSiteText).where(ActionSiteText.text_id == text_id, ActionSiteText.del_flag == '0')
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_text_list(
+        cls,
+        db: AsyncSession,
+        query_object: SiteTextPageQueryModel,
+        is_page: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        根据查询参数获取文案列表
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :return: 文案列表
+        """
+        conditions = [
+            ActionSiteText.del_flag == '0',
+            ActionSiteText.page_key == query_object.page_key if query_object.page_key else True,
+            cls.CHANGED_CONDITION if query_object.only_changed else True,
+        ]
+        if query_object.keyword:
+            kw = f'%{query_object.keyword}%'
+            conditions.append(
+                ActionSiteText.text_key.like(kw) | ActionSiteText.text_zh.like(kw) | ActionSiteText.text_en.like(kw)
+            )
+
+        query = (
+            select(ActionSiteText)
+            .where(*conditions)
+            .order_by(ActionSiteText.sort_num, ActionSiteText.text_id)
+            .distinct()
+        )
+
+        return await PageUtil.paginate(db, query, query_object.page_num, query_object.page_size, is_page)
+
+    @classmethod
+    async def get_changed_texts(cls, db: AsyncSession) -> list[ActionSiteText]:
+        """
+        取所有与默认值不同的文案，供官网公开接口下发覆盖包
+
+        :param db: orm对象
+        :return: 被改过的文案列表
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionSiteText)
+                    .where(ActionSiteText.del_flag == '0', cls.CHANGED_CONDITION)
+                    .order_by(ActionSiteText.sort_num)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def get_page_groups(cls, db: AsyncSession) -> list[dict[str, Any]]:
+        """
+        取分组词表（含每组的词条数与被改过的条数），供后台筛选下拉
+
+        :param db: orm对象
+        :return: 分组列表
+        """
+        rows = (
+            await db.execute(
+                select(
+                    ActionSiteText.page_key,
+                    func.max(ActionSiteText.page_label).label('page_label'),
+                    func.count().label('total'),
+                    func.count().filter(cls.CHANGED_CONDITION).label('changed'),
+                )
+                .where(ActionSiteText.del_flag == '0')
+                .group_by(ActionSiteText.page_key)
+                .order_by(func.min(ActionSiteText.sort_num))
+            )
+        ).all()
+
+        # 键用驼峰：`SiteTextGroupModel` 与本模块其余 VO 一样只认别名（alias_generator=to_camel，
+        # 没开 populate_by_name），传下划线键会以「字段缺失」报错
+        return [
+            {'pageKey': row.page_key, 'pageLabel': row.page_label, 'total': row.total, 'changed': row.changed}
+            for row in rows
+        ]
+
+    @classmethod
+    async def edit_text_dao(cls, db: AsyncSession, site_text: dict) -> None:
+        """
+        编辑文案
+
+        :param db: orm对象
+        :param site_text: 需要更新的文案字典
+        :return: None
+        """
+        await db.execute(update(ActionSiteText), [site_text])
+
+    @classmethod
+    async def restore_text_dao(cls, db: AsyncSession, text_ids: list[int], operator: str) -> None:
+        """
+        把指定文案还原成代码里的默认值
+
+        在库里一条 update 做完，不逐条读出来再写回去 —— 「还原全部」可能是几百行。
+
+        :param db: orm对象
+        :param text_ids: 文案id列表，空列表表示全部
+        :param operator: 操作人
+        :return: None
+        """
+        conditions = [ActionSiteText.del_flag == '0']
+        if text_ids:
+            conditions.append(ActionSiteText.text_id.in_(text_ids))
+        await db.execute(
+            update(ActionSiteText)
+            .where(*conditions)
+            .values(
+                text_zh=ActionSiteText.default_zh,
+                text_en=ActionSiteText.default_en,
+                update_by=operator,
+                update_time=datetime.now(),
+            )
         )
 
 

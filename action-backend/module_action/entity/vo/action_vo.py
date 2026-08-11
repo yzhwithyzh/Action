@@ -1,6 +1,6 @@
 import re
 from datetime import date, datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator, model_validator
 from pydantic.alias_generators import to_camel
@@ -251,6 +251,152 @@ class DeleteResourceLinkModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel)
 
     link_ids: str = Field(description='需要删除的资源id，多个以逗号分隔')
+
+
+# ---------------------------------------------------------------- 站点文案
+
+
+# 文案里允许出现的标签。原始 i18n 词条用到的是 span/b/i（排版强调）与 svg/circle/path（行内小图标），
+# 白名单就按实照列，不多放一个。放开等于把「后台文本框」变成「往公开页面注入任意 HTML」的口子 ——
+# 这些文案是以 v-html 渲染的（nuxt.config.ts 的 escapeHtml: false），不是被转义的纯文本。
+ALLOWED_TEXT_TAGS = frozenset({'span', 'b', 'i', 'em', 'strong', 'br', 'sup', 'sub', 'small', 'svg', 'circle', 'path'})
+
+# 事件处理属性（onclick/onload/onerror…）。svg 在白名单里，没有这一道就等于放行 <svg onload=...>。
+_EVENT_ATTR_RE = re.compile(r'\son[a-z]+\s*=', re.IGNORECASE)
+# 伪协议。文案里出现 <a href> 的场景已由 action_resource_link 等专表承担，这里一并挡掉。
+_BAD_SCHEME_RE = re.compile(r'(javascript|vbscript|data)\s*:', re.IGNORECASE)
+_TAG_NAME_RE = re.compile(r'<\s*/?\s*([a-zA-Z][a-zA-Z0-9]*)')
+
+
+def assert_safe_markup(value: str | None, field_label: str) -> None:
+    """
+    校验文案里的 HTML 只用了白名单标签，且不含事件属性与伪协议
+
+    :param value: 待校验文案
+    :param field_label: 报错时显示的字段名
+    :return: None
+    :raise ModelValidatorException: 命中任一禁止项
+    """
+    if not value or '<' not in value:
+        return
+    for tag in _TAG_NAME_RE.findall(value):
+        if tag.lower() not in ALLOWED_TEXT_TAGS:
+            raise ModelValidatorException(
+                message=f'{field_label}含不允许的标签 <{tag}>，可用标签：' + '、'.join(sorted(ALLOWED_TEXT_TAGS))
+            )
+    if _EVENT_ATTR_RE.search(value):
+        raise ModelValidatorException(message=f'{field_label}不能包含 on... 事件属性')
+    if _BAD_SCHEME_RE.search(value):
+        raise ModelValidatorException(message=f'{field_label}不能包含 javascript:/vbscript:/data: 伪协议')
+
+
+class SiteTextModel(ActionBaseModel):
+    """
+    官网站点文案
+
+    `textKey` 是前端模板里 `$t()` 的参数，由代码定义，后台不可增删也不可改键；
+    可改的只有 `textZh` / `textEn`。`defaultZh` / `defaultEn` 是代码里的原始文案，只读，
+    供后台对照与「还原默认」用。
+    """
+
+    text_id: int | None = Field(default=None, description='文案id')
+    text_key: str | None = Field(default=None, description='i18n 键，如 index.s052')
+    page_key: str | None = Field(default=None, description='所属分组（= text_key 首段）')
+    page_label: str | None = Field(default=None, description='分组中文名')
+    text_zh: str | None = Field(default=None, description='当前生效的中文文案')
+    text_en: str | None = Field(default=None, description='当前生效的英文文案')
+    default_zh: str | None = Field(default=None, description='代码里的中文默认值（只读）')
+    default_en: str | None = Field(default=None, description='代码里的英文默认值（只读）')
+    has_markup: Literal['0', '1'] | None = Field(default=None, description='默认值里含HTML标签（0否 1是）')
+    sort_num: int | None = Field(default=None, description='显示顺序')
+    create_by: str | None = Field(default=None, description='创建者')
+    create_time: datetime | None = Field(default=None, description='创建时间')
+    update_by: str | None = Field(default=None, description='更新者')
+    update_time: datetime | None = Field(default=None, description='更新时间')
+    remark: str | None = Field(default=None, description='备注')
+
+    @field_validator('text_zh', 'text_en')
+    @classmethod
+    def check_markup(cls, v: str | None, info: Any) -> str | None:
+        """
+        文案落地后走 v-html，必须过标签白名单
+
+        :param v: 待校验文案
+        :param info: 字段上下文
+        :return: 原值
+        """
+        assert_safe_markup(v, '中文文案' if info.field_name == 'text_zh' else '英文文案')
+
+        return v
+
+    @Size(field_name='text_zh', min_length=0, max_length=5000, message='中文文案不能超过5000个字符')
+    def get_text_zh(self) -> str | None:
+        return self.text_zh
+
+    @Size(field_name='text_en', min_length=0, max_length=5000, message='英文文案不能超过5000个字符')
+    def get_text_en(self) -> str | None:
+        return self.text_en
+
+    def validate_fields(self) -> None:
+        self.get_text_zh()
+        self.get_text_en()
+
+
+class SiteTextQueryModel(SiteTextModel):
+    """
+    站点文案查询模型
+    """
+
+    keyword: str | None = Field(default=None, description='按键名/中英文案模糊搜索')
+    only_changed: bool | None = Field(default=None, description='只看与默认值不同的（即后台改过的）')
+
+
+class SiteTextPageQueryModel(SiteTextQueryModel):
+    """
+    站点文案分页查询模型
+    """
+
+    page_num: int = Field(default=1, description='当前页码')
+    page_size: int = Field(default=20, description='每页记录数')
+
+
+class SiteTextOverridesModel(BaseModel):
+    """
+    官网公开接口的文案覆盖包
+
+    只含**与默认值不同**的词条，键为完整 i18n 键（如 `index.s052`），前台在 i18n 之上 merge。
+    一条都没改时两个字典都是空的 —— 这正是常态，也是它敢挂在每个页面上的原因。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    zh: dict[str, str] = Field(default_factory=dict, description='中文覆盖项')
+    en: dict[str, str] = Field(default_factory=dict, description='英文覆盖项')
+
+
+class SiteTextGroupModel(ActionBaseModel):
+    """
+    站点文案分组（后台筛选下拉用）
+    """
+
+    page_key: str = Field(description='分组键（= text_key 首段）')
+    page_label: str = Field(description='分组中文名')
+    total: int = Field(description='该组词条总数')
+    changed: int = Field(description='该组被改过的条数')
+
+
+class SiteRebuildStateModel(BaseModel):
+    """
+    官网重新生成的执行状态
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    status: Literal['idle', 'running', 'success', 'failed', 'disabled'] = Field(description='当前状态')
+    message: str = Field(default='', description='人类可读的说明或错误摘要')
+    started_at: str = Field(default='', description='本次开始时间')
+    finished_at: str = Field(default='', description='本次结束时间')
+    started_by: str = Field(default='', description='触发人')
 
 
 # ---------------------------------------------------------------- 报告规范目录
