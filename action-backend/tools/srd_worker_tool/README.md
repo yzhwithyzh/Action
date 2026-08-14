@@ -54,6 +54,14 @@ async with TaskClient(CONFIG) as client:
     })
 ```
 
+> **官网这条链路走的是 `path` 不是 `url`**（`module_action/service/action_service.py`
+> 的 `SrdService`）：访客上传的 PDF 由后端写进 `vf_admin/private_upload_path/srd/{session_id}/`，
+> 结果 `result.json` 也由后端按摘要里的 `files.json` 路径读回来。
+> 也就是说**后端进程与 worker 进程必须共享文件系统** —— §8 的 systemd 示例本来就是同机，
+> 拆到两台机器上部署时这条会断（后端会把任务判成
+> 「评估已完成但读不到结果文件」，而不是默默落一份没有判定依据的报告）。
+> 不用 OSS 是刻意的：那个桶整桶公共读，用户上传的综述原文不该变成公网可下载的对象。
+
 ### payload 字段
 
 | 字段 | 必填 | 说明 |
@@ -80,6 +88,21 @@ async with TaskClient(CONFIG) as client:
 1. `payload.model` 里带 `api_key` → 一次性临时模型，不查库也不轮换；
 2. `ai_models` 表（可用 `payload.model_ids` 缩小范围）；
 3. `SRD_PROVIDER / SRD_MODEL / SRD_API_KEY / SRD_BASE_URL` 环境变量 —— 库里一个都没有时的兜底。
+
+### 结构化输出方式（`ai_models.structured_method`）
+
+「让模型按给定 JSON 结构回话」有四种实现，厂商支持情况**按模型**不同 —— 同一个 deepseek
+在官方端点支持 `json_schema`，在火山方舟上就回 400 `... is not supported by this model`。
+这一列决定用哪种，取值 `json_schema` / `function_calling` / `json_mode` / `text`
+（含义与降级顺序见 [srd-engine/README.md](../srd-engine/README.md)）。
+
+**建议留空**：worker 会从 `json_schema` 起自动探测，撞到「不支持」逐级降级，
+跑通之后**把结论回写进这一列**（`save_structured_method`），下个任务直接命中。
+只有在探测判错、或想强制降级时才手动指定 —— 列非空时回写不会覆盖它，人工优先。
+
+值得为它专门加一列的原因：探测是拿一个**真实请求**去撞的，而抽取请求带着整篇综述正文，
+实测撞一次要几分钟（日志里表现为「模型 X…抽取缓存…」之后长时间没有下一行）。
+不记住的话，每个任务、每次重启都要重付一次这个钱。
 
 ### 出错怎么切换
 
@@ -193,7 +216,52 @@ tools/srd_worker_tool/
 模型池还需要 worker 能连上后端那套数据库（`config/.env` 里的 `DB_*`）与解密密钥（`JwtConfig.jwt_secret_key`）——
 和后端进程用同一份配置即可，systemd 的 `EnvironmentFile` 指向同一个 `.env` 最省事。
 
-## 8. 部署（systemd 示例）
+## 8. 部署
+
+### 8.1 运维脚本（宝塔 / 手工部署）
+
+没有 systemd 的机器（宝塔面板那类）用 `action-backend/` 下的这套脚本，与
+`*_data_extraction_worker.*` 同一套用法：
+
+```bash
+cd /path/to/action-backend
+./start_srd_worker.sh      # 后台拉起，PID 写 tools/srd_worker_tool/logs/srd_worker.pid
+./status_srd_worker.sh     # 进程 + 队列长度 + 最近日志
+./stop_srd_worker.sh       # SIGTERM，等在跑的评估收尾（默认最多 330s）后再退
+./restart_srd_worker.sh    # 停 + 起
+```
+
+四个 `.sh` 拉的是 `start_srd_worker.py`，路径/解释器/PID 判定这些公共部分在
+`_srd_worker_common.sh` 里（被 start/stop/status source，不单独执行）——
+**六个文件要一起放到同一个目录**（`action-backend/`）。
+
+`start_srd_worker.py` 与 `python -m tools.srd_worker_tool` 跑的是同一个 `SrdWorkerService`，
+只多两件事：把 `action-backend/` 塞进 `sys.path`（换个工作目录也能起），
+以及用 `signal.signal` 给停止信号兜一层 —— 服务自己装的是 `loop.add_signal_handler`，
+Windows 上装不上，SIGTERM 会变成强杀。Linux 上服务那份会覆盖它，行为不变。
+两个入口都能用，systemd 里继续用模块形式即可。
+
+几个约定：
+
+- **解释器**默认取 `action-backend/.venv/bin/python`，可用 `SRD_WORKER_PYTHON` 覆盖
+- **`--env` 必须显式传**：`config/env.py` 的 `parse_cli_args()` 在没有 `--env` 时会把
+  `APP_ENV` 强行写成 `dev`，光 `export APP_ENV=prod` 会被它覆盖掉、worker 照样连开发库，
+  所以脚本是把 `APP_ENV` 转成 `--env` 参数传进去的。
+  **默认 `dev`**（与后端服务当前跑法一致），上生产库：`APP_ENV=prod ./start_srd_worker.sh`
+- **worker 自己的 `SRD_WORKER_* / SRD_*` 不从 `.env.dev` 读**：那是 `KEY = 'value'` 的
+  dotenv 语法（bash source 不了），而且 `WorkerConfig` 在 `config.env` 被 import 之前就定型了。
+  放 `action-backend/.env.srd-worker`（纯 `KEY=VALUE`，start 脚本会 `set -a` 载入），
+  或用 `SRD_WORKER_ENV_FILE` 指别处。**后端进程要拿到同一份**，否则一个投一条队列、
+  一个守另一条，任务会一直排队没人取
+- **停止别照抄 30 秒**：SIGTERM 后 worker 停止取新任务、等在跑的评估自然结束
+  （上限 `SRD_WORKER_SHUTDOWN_TIMEOUT`，默认 300s），所以脚本默认等 330s
+  （`SRD_WORKER_STOP_WAIT` 可调）。到点强杀会打断用户正在跑的评估
+- start/stop 都会核对 PID 对应的进程命令行里有没有 `srd_worker`（`start_srd_worker.py`
+  与 `-m tools.srd_worker_tool` 都认）：worker 崩过之后 PID 可能被系统复用，
+  只判「进程还在」会误杀无关进程
+- `status` 的退出码可直接喂监控：0 = 运行中，1 = 未运行
+
+### 8.2 systemd 示例
 
 ```ini
 [Unit]

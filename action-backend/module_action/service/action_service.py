@@ -67,6 +67,7 @@ from module_action.entity.vo.action_vo import (
     TeamMemberModel,
     TeamMemberPageQueryModel,
 )
+from module_action.service.srd_export_service import build_assessment_xlsx
 from utils.common_util import CamelCaseUtil
 from utils.log_util import logger
 
@@ -1846,8 +1847,9 @@ class SrdService:
 
         引擎的引用字段是「原文逐字 `cite_a` + 中文翻译 `cite_a_zh`」，而库里是
         `cite_a_zh` / `cite_a_en` 一对双语列。原文既然保持原语言，就放进 `*_en`
-        那一格：前台 `pick()` 在英文缺失时回落中文，原文本就是中文的那些条目
-        两边同值，显示不会重影。
+        那一格 —— **`cite_*_en` 装的是原语言，不一定是英文**（中文文献就是中文，
+        与 `cite_*_zh` 同值）。列名是历史包袱，前台 `pages/srd.vue` 因此不用
+        `pick()` 取这两列（那会在中文界面拿到译文），只认 `citeAEn` 这一格。
 
         :param it: result.json 里的一个条目
         :return: 列名到值的映射
@@ -2093,6 +2095,32 @@ class SrdService:
                 for d in domains
             ],
         )
+
+    @classmethod
+    async def export_assessment_services(
+        cls,
+        query_db: AsyncSession,
+        assessment_id: int | None = None,
+        user_id: int | None = None,
+        lang: str = 'zh',
+    ) -> bytes:
+        """
+        把一次 SRD 评估导成 xlsx
+
+        取数复用 `get_assessment_services`，可见性那两道闸（示例公开、真实评估只有本人能看）
+        因此不必在这里再判一遍 —— 导出与查看是同一份数据，权限判定分成两处写迟早会分叉。
+
+        排版在 `srd_export_service`：那是纯函数（模型 → 字节），不碰数据库，可离线单测。
+
+        :param query_db: orm对象
+        :param assessment_id: 评估id；不传则导出示例评估
+        :param user_id: 访客用户id，导出真实评估时必传
+        :param lang: 导出语言（zh / en）
+        :return: xlsx 文件字节
+        """
+        assessment = await cls.get_assessment_services(query_db, assessment_id, user_id)
+
+        return build_assessment_xlsx(assessment, 'en' if lang == 'en' else 'zh')
 
 
 class CollabRequestService:

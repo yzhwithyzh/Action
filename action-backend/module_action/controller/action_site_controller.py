@@ -57,9 +57,15 @@ from module_action.service.action_service import (
     TeamMemberService,
 )
 from module_action.service.guest_auth_service import GuestAuthService
+from utils.common_util import bytes2file_response
 from utils.log_util import logger
 from utils.oss_util import OssUtil
 from utils.response_util import ResponseUtil
+
+#: xlsx 的媒体类型。**必须显式给** —— `ResponseUtil.streaming` 默认不带 Content-Type，
+#: 而前台要靠它把「一份 xlsx」和「同一条通道上回来的 JSON 错误信封」区分开
+#: （本站错误走 HTTP 200 + code≠200，光看状态码分不出来）。
+XLSX_MEDIA_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 # 官网公开接口：**不挂 PreAuthDependency**。
 # 这些数据本就对外公开，官网是匿名访问的静态站，加鉴权会直接打不开。
@@ -506,6 +512,52 @@ async def get_site_srd_assessment(
     logger.info(f'获取 SRD 评估 {assessment_id} 成功')
 
     return ResponseUtil.success(data=result)
+
+
+# 导出走两条路而不是一条，与上面「示例公开 / 真实评估要登录」的分法一致：
+# 示例是给没有账号的访客看形态的，导出按钮在那份结果上也得能按。两条路的排版共用
+# 同一个 `build_assessment_xlsx`，出参完全一致。
+#
+# 文件名由前端给（照抄后台 `download()` 的做法）：这里回的是裸字节流，
+# 中文文件名进 `Content-Disposition` 还要 RFC 5987 编码，交给浏览器侧省一层。
+
+
+@action_site_controller.get(
+    '/srd/sample/export',
+    summary='导出 SRD 示例评估为 Excel',
+    description='官网公开接口，返回示例评估的 xlsx 文件流',
+    response_class=Response,
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_SRD_EXPORT, preset=ApiRateLimitPreset.USER_RESOURCE_EXPORT, scope='ip')
+async def export_site_srd_sample(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    lang: Annotated[str, Query(description='导出语言（zh / en）')] = 'zh',
+) -> Response:
+    content = await SrdService.export_assessment_services(query_db, lang=lang)
+    logger.info('导出 SRD 示例评估成功')
+
+    return ResponseUtil.streaming(data=bytes2file_response(content), media_type=XLSX_MEDIA_TYPE)
+
+
+@action_site_controller.get(
+    '/srd/assessments/{assessment_id}/export',
+    summary='导出一次 SRD 评估为 Excel',
+    description='三张工作表：概览 / 领域 / 条目明细；只能导出本人的记录',
+    response_class=Response,
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_SRD_EXPORT, preset=ApiRateLimitPreset.USER_RESOURCE_EXPORT, scope='ip')
+async def export_site_srd_assessment(
+    request: Request,
+    assessment_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+    lang: Annotated[str, Query(description='导出语言（zh / en）')] = 'zh',
+) -> Response:
+    content = await SrdService.export_assessment_services(query_db, assessment_id, current_guest.user_id, lang)
+    logger.info(f'导出 SRD 评估 {assessment_id} 成功')
+
+    return ResponseUtil.streaming(data=bytes2file_response(content), media_type=XLSX_MEDIA_TYPE)
 
 
 @action_site_controller.delete(

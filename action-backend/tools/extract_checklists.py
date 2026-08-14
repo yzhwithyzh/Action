@@ -241,14 +241,15 @@ create index idx_action_guideline_item_gid on action_guideline_item (guideline_i
 -- 导致规范页查不到、报告助手匹配到观察性研究时挂载不出规范。补上；本仓库暂无 STROBE 中英素材，
 -- 故 release_state 置 soon、不带 checklist 条目，拿到素材后再跑一次抽取脚本。
 delete from action_guideline where guideline_id = 7;
-insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version,
+insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en,
+                              version_zh, version_en,
                               file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status,
                               del_flag, create_by, create_time, update_by, update_time, remark)
 values (7, 'STROBE', 'STROBE（观察性研究报告规范）',
         'STROBE (Strengthening the Reporting of Observational Studies in Epidemiology)', 'obs',
         'STROBE 规范队列研究、病例对照研究与横断面研究的报告条目。针刺领域的真实世界研究与注册登记研究适用；本平台的针刺扩展条目待补。',
         'STROBE covers reporting for cohort, case-control and cross-sectional studies. It applies to real-world and registry studies of acupuncture; an acupuncture-specific extension is not yet available on this platform.',
-        '现行版', '', '', 'https://www.strobe-statement.org/', '', 'soon', 6, '0', '0', 'migration',
+        '现行版', 'Current version', '', '', 'https://www.strobe-statement.org/', '', 'soon', 6, '0', '0', 'migration',
         current_timestamp, '', null, '素材待补');
 
 """

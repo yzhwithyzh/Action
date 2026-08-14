@@ -259,6 +259,7 @@ class ApiNamespace:
     ACTION_GUEST_LOGOUT: 官网访客登出接口命名空间
     ACTION_CHECKLIST_REVIEW: 官网报告助手 checklist 逐条校验接口命名空间
     ACTION_SRD_ASSESS: 官网 SRD 系统综述重复性评估提交接口命名空间
+    ACTION_SRD_EXPORT: 官网 SRD 评估结果导出 Excel 接口命名空间
     ACTION_TEAM_AVATAR: 官网团队成员头像上传接口命名空间
     ACTION_GUIDELINE_FILE: 官网报告规范文档上传接口命名空间
     ACTION_RESOURCE_LOGO: 官网资源中心标识图上传接口命名空间
@@ -378,6 +379,7 @@ class ApiNamespace:
     ACTION_GUEST_LOGOUT = 'action:guest:logout'
     ACTION_CHECKLIST_REVIEW = 'action:checklist:review'
     ACTION_SRD_ASSESS = 'action:srd:assess'
+    ACTION_SRD_EXPORT = 'action:srd:export'
     ACTION_TEAM_AVATAR = 'action:team:avatar'
     ACTION_GUIDELINE_FILE = 'action:guideline:file'
     ACTION_RESOURCE_LOGO = 'action:resource:logo'

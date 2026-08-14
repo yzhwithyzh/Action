@@ -65,13 +65,24 @@ MATRIX: dict[str, tuple[Level, Level, Level]] = {
 KEY_STATE_LABEL_ZH = {
     'both_none': '均为「无重复」',
     'both_low': '均为「低重复」及以下',
-    'one_mod': '其中一个为「中度重复」',
+    'one_mod': '中有一个为「中度重复」',
     'both_mod_or_high': '均为「中度重复」或包含「高度重复」',
 }
 NONKEY_COL_LABEL_ZH = {
     0: '均为「低重复」及以下',
-    1: '一个达到「中度重复」',
+    1: '中有一个达到「中度重复」',
     2: '均达到「中度重复」或其中一个为「高度重复」',
+}
+KEY_STATE_LABEL_EN = {
+    'both_none': 'both showed no duplication',
+    'both_low': 'both were low duplication or below',
+    'one_mod': 'one reached moderate duplication',
+    'both_mod_or_high': 'both were moderate, or one was high duplication',
+}
+NONKEY_COL_LABEL_EN = {
+    0: 'both were low duplication or below',
+    1: 'one reached moderate duplication',
+    2: 'both reached moderate, or one was high duplication',
 }
 
 
@@ -162,7 +173,16 @@ def _effective_level(domain: DomainResult) -> Level:
 
 
 def build_overall_reason(result: AssessmentResult) -> tuple[str, str]:
-    """模板化生成整体判定理由 —— 不用 LLM 写，保证文字与判定永远一致。"""
+    """模板化生成整体判定理由 —— 不用 LLM 写，保证文字与判定永远一致。
+
+    这里**只说查表这一步**：四个领域各自的得分、百分比、档位在同一份报告（页面上是
+    领域卡片，文本报告里是领域小节）里逐个列着了，理由再抄一遍只会把「怎么得出结论的」
+    这条唯一的新信息埋进一段数字里。同理，`provisional` / `review_count` 是结果对象上
+    的独立字段，展示端各自有位置，不再往这段话尾巴上挂。
+
+    唯一保留的细节是「哪个领域证据不足」—— 它解释了一件光看卡片看不出来的事：
+    该领域按「无重复」参与了查表（见 `_effective_level`）。
+    """
     by_seq = {d.seq: d for d in result.domains}
     d1, d2, d3, d4 = (by_seq.get(i) for i in (1, 2, 3, 4))
     if not all((d1, d2, d3, d4)):
@@ -171,48 +191,31 @@ def build_overall_reason(result: AssessmentResult) -> tuple[str, str]:
         # 无法判定也要给出理由：报告里留一句空白，看的人只会以为是渲染坏了
         total = len(result.items)
         return (
-            f'{total} 个条目全部无法评分（证据不足或模型未返回判定），本次评估**无法判定**重复程度。'
+            f'{total} 个条目全部无法评分（证据不足或模型未返回判定），本次评估无法判定重复程度。'
             f'请检查两篇综述的原文是否完整可读，或重新发起一次评估。',
             f'All {total} items were unscorable (insufficient evidence or no verdict returned); '
             f'the degree of duplication could not be determined.',
-        )
-
-    def part_zh(d: DomainResult) -> str:
-        if d.level is None:
-            return f'「{d.name_zh.split("：")[-1]}」证据不足（{d.unclear_count} 条无法评分）'
-        return (
-            f'「{d.name_zh.split("：")[-1]}」得分 {d.score_sum}/{d.score_max}'
-            f'（重复度 {d.pct}%）{LEVEL_LABEL_ZH[d.level]}'
-        )
-
-    def part_en(d: DomainResult) -> str:
-        if d.level is None:
-            return f'"{d.name_en.split(": ")[-1]}" insufficient evidence'
-        return (
-            f'"{d.name_en.split(": ")[-1]}" scored {d.score_sum}/{d.score_max} '
-            f'({d.pct}% duplication) {LEVEL_LABEL_EN[d.level]}'
         )
 
     ks = key_state(_effective_level(d1), _effective_level(d3))
     col = nonkey_col(_effective_level(d2), _effective_level(d4))
 
     zh = (
-        f'关键领域：{part_zh(d1)}、{part_zh(d3)}，{KEY_STATE_LABEL_ZH[ks]}；'
-        f'非关键领域：{part_zh(d2)}、{part_zh(d4)}，{NONKEY_COL_LABEL_ZH[col]}。'
-        f'按表 3 判定为**{LEVEL_LABEL_ZH[result.overall_level]}**。'
+        f'关键领域{KEY_STATE_LABEL_ZH[ks]}，非关键领域{NONKEY_COL_LABEL_ZH[col]}，'
+        f'按表 3 判定为{LEVEL_LABEL_ZH[result.overall_level]}。'
     )
-    if result.provisional:
-        zh += '注：关键领域存在证据不足，本结论为初步判定，须经人工复核后方可引用。'
-    if result.review_count:
-        zh += f'另有 {result.review_count} 条目标记为待人工复核。'
-
     en = (
-        f'Key domains: {part_en(d1)}, {part_en(d3)}; '
-        f'non-key domains: {part_en(d2)}, {part_en(d4)}. '
-        f'Table 3 verdict: **{LEVEL_LABEL_EN[result.overall_level]}**.'
+        f'Key domains: {KEY_STATE_LABEL_EN[ks]}; '
+        f'non-key domains: {NONKEY_COL_LABEL_EN[col]}. '
+        f'Table 3 verdict: {LEVEL_LABEL_EN[result.overall_level]}.'
     )
-    if result.provisional:
-        en += ' Note: evidence is insufficient in a key domain; this verdict is provisional.'
+
+    blank = [d for d in (d1, d2, d3, d4) if d.level is None]
+    if blank:
+        names_zh = '、'.join(f'「{d.name_zh.split("：")[-1]}」' for d in blank)
+        names_en = ', '.join(f'"{d.name_en.split(": ")[-1]}"' for d in blank)
+        zh += f'其中{names_zh}无一条可评分，按「无重复」参与查表。'
+        en += f' {names_en} had no scorable item and entered the table as "no duplication".'
     return zh, en
 
 

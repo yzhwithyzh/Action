@@ -1,8 +1,13 @@
-"""checklist 校验任务 —— 把「一份稿件 × 一份报告规范」的逐条核对包成 worker 任务。
+"""checklist 校验任务 —— 把「一份稿件 × 一份报告规范」的核对包成 worker 任务。
 
 职责边界：
-- **算法**在 `engine/audit.py`：编行号 → 切窗口 → 分批判定 → 聚合，不认识 Redis / HTTP。
+- **算法**在 `engine/`：`audit.py` 逐条完整性（编行号 → 切窗口 → 分批判定 → 聚合），
+  `consistency.py` 全稿逻辑一致性与术语标准化；两者都不认识 Redis / HTTP。
 - **本文件**只管把它跑起来：取条目、解析模型池、给进度、写结果、处理停止。
+
+两类判定的主次分明：**逐条完整性是主产物，全稿校验是增补**。所以全稿校验整体失败时
+只把它标成「没跑成」、写进日志，不拖垮整个任务 —— 用户已经付过的那几十次条目判定，
+不该因为最后四次请求出错就一起丢掉。
 
 任务 payload（后端 rpush 进队列的 JSON）::
 
@@ -31,6 +36,7 @@ from typing import Any
 
 from tools.checklist_worker_tool.config.worker_config import RESULT_DIR, ensure_engine_importable
 from tools.checklist_worker_tool.engine.audit import AuditConfig, ChecklistItem, audit
+from tools.checklist_worker_tool.engine.consistency import ConsistencyConfig, check_consistency
 from tools.common.base_session_task import BaseSessionTask, TaskPayloadError
 from tools.common.model_registry import load_llm_models, model_id_from_ref, save_structured_method
 
@@ -39,8 +45,8 @@ ensure_engine_importable()
 from srd_engine.adapters.langchain_client import LlmRunner  # noqa: E402
 from srd_engine.config import FailoverConfig, ModelConfig  # noqa: E402
 
-#: 各阶段占总进度的区间。判定是唯一花钱的阶段，理应占大头。
-STAGE_RANGE = {'load': (0, 8), 'judge': (8, 95), 'done': (95, 100)}
+#: 各阶段占总进度的区间。逐条判定是花钱的大头（几十次调用），全稿校验只有四次。
+STAGE_RANGE = {'load': (0, 6), 'judge': (6, 86), 'cross': (86, 96), 'done': (96, 100)}
 
 #: 稿件长度下限 —— 比这还短基本是误触，早失败比烧一次模型调用好
 MIN_MANUSCRIPT_CHARS = 200
@@ -107,9 +113,45 @@ class ChecklistSessionTask(BaseSessionTask):
 
         result = await audit(self._runner, self._manuscript, items, cfg, on_progress)
         await self.raise_if_stopped()
+
+        consistency = await self._run_consistency()
+        await self.raise_if_stopped()
         await self._persist_structured_methods(self._runner)
 
-        return await self._finalize(result, items)
+        return await self._finalize(result, consistency, items)
+
+    async def _run_consistency(self) -> dict[str, Any]:
+        """全稿逻辑一致性与术语标准化校验。
+
+        整体失败不抛：逐条完整性已经跑完了，为最后这几次请求把整份结果作废没有道理。
+        失败时回一个「全部 unchecked」的空壳，前台照实显示成「未完成校验」——
+        它和「未发现问题」在展示上必须分得开，否则等于把没跑过的检查算成了合格。
+        """
+        lo, hi = STAGE_RANGE['cross']
+        await self.report_progress(lo, 100, 'cross', '全稿逻辑与术语校验')
+
+        def on_progress(done: int, total: int, message: str) -> None:
+            self.report_progress_nowait(lo + int((hi - lo) * done / max(1, total)), 100, 'cross', message)
+
+        try:
+            result = await check_consistency(
+                self._runner, self._manuscript, self._consistency_config(), self._locale, on_progress=on_progress
+            )
+        except Exception as exc:
+            await self.log.write_warning(f'全稿校验未完成（{type(exc).__name__}: {exc}），逐条完整性结果不受影响')
+            return {'summary': {}, 'checks': [], 'truncated': False, 'errors': [f'{type(exc).__name__}: {exc}']}
+
+        summary = result['summary']
+        await self.log.write_info(
+            f'全稿校验：不一致 {summary["issue"]} 项 / 待核 {summary["warn"]} 项 / '
+            f'未发现问题 {summary["ok"]} 项 / 不适用 {summary["na"]} 项 / 未完成 {summary["unchecked"]} 项'
+        )
+        if result.get('errors'):
+            await self.log.write_warning(f'{len(result["errors"])} 项全稿校验请求失败，相关项标为未完成')
+        if result.get('truncated'):
+            await self.log.write_warning('稿件超出全稿校验的字符预算，仅通读了前一部分')
+
+        return result
 
     async def _persist_structured_methods(self, runner: LlmRunner) -> None:
         """把探测出来的结构化输出方式回写进 ai_models（列为空时才写，人工钉死的不覆盖）。"""
@@ -241,9 +283,19 @@ class ChecklistSessionTask(BaseSessionTask):
 
         return replace(base, **overrides) if overrides else base
 
+    def _consistency_config(self) -> ConsistencyConfig:
+        raw = (self.payload.get('engine') or {}).get('consistency') or {}
+        base = ConsistencyConfig(max_concurrency=min(2, self.cfg.max_concurrent_llm))
+        allowed = ('max_chars', 'max_concurrency', 'max_findings')
+        overrides = {k: int(raw[k]) for k in allowed if str(raw.get(k) or '').strip().isdigit()}
+
+        return replace(base, **overrides) if overrides else base
+
     # ================================================================== 收尾
 
-    async def _finalize(self, result: dict[str, Any], items: list[ChecklistItem]) -> dict[str, Any]:
+    async def _finalize(
+        self, result: dict[str, Any], consistency: dict[str, Any], items: list[ChecklistItem]
+    ) -> dict[str, Any]:
         """完整判定写文件留档，任务状态里只回前台要用的那份。"""
         RESULT_DIR.mkdir(parents=True, exist_ok=True)
         path = RESULT_DIR / f'{self.session_id}.json'
@@ -252,6 +304,7 @@ class ChecklistSessionTask(BaseSessionTask):
             'guidelineCode': self._guideline_code,
             'locale': self._locale,
             **result,
+            'consistency': consistency,
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
 
@@ -270,6 +323,11 @@ class ChecklistSessionTask(BaseSessionTask):
             'locale': self._locale,
             'summary': summary,
             'verdicts': result['verdicts'],
+            'consistency': {
+                'summary': consistency.get('summary') or {},
+                'checks': consistency.get('checks') or [],
+                'truncated': bool(consistency.get('truncated')),
+            },
             'lineCount': result['lineCount'],
             'truncated': result['truncated'],
             'itemCount': len(items),

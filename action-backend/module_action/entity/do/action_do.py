@@ -202,7 +202,10 @@ class ActionGuideline(Base):
     )
     summary_zh = Column(Text, nullable=True, comment='简介（中文）')
     summary_en = Column(Text, nullable=True, comment='简介（英文）')
-    version = Column(String(64), nullable=True, server_default="''", comment='版本')
+    # 版本号是显示给访客的一句话（「2010 修订 · 6 领域 / 17 条目」），不是内部版本标识，
+    # 所以和 name/summary 一样分中英两列 —— 只留一列的话英文界面会原样显示中文。
+    version_zh = Column(String(64), nullable=True, server_default="''", comment='版本（中文）')
+    version_en = Column(String(64), nullable=True, server_default="''", comment='版本（英文）')
     file_url_zh = Column(
         String(500),
         nullable=True,

@@ -14,7 +14,10 @@ from dataclasses import dataclass, field, replace
 
 # 0.7.0：条目判定由 dup/diff 二选一改为 0–3 四档评分（新版 Excel 表 1 的「评分」列），
 #        领域与整体百分比改由分数算；条目编号 9 随 Excel 改为 9a。
-ENGINE_VERSION = 'srd-engine/0.7.0'
+# 0.7.1：整体判定理由改成只讲查表这一步，不再逐领域复述得分与百分比（那些同一份报告里
+#        本来就逐个列着）。判定逻辑一字未动 —— 升版本只是为了让「同版本 → 同措辞」成立，
+#        代价是抽取缓存全失效（缓存键含 ENGINE_VERSION），下一次评估要重抽一遍。
+ENGINE_VERSION = 'srd-engine/0.7.1'
 PROMPT_VERSION = 'prompt/2026-08-05'
 CRITERIA_VERSION = 'criteria/2026-08-05'
 

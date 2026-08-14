@@ -435,7 +435,8 @@ class GuidelineModel(ActionBaseModel):
     )
     summary_zh: str | None = Field(default=None, description='简介（中文）')
     summary_en: str | None = Field(default=None, description='简介（英文）')
-    version: str | None = Field(default=None, description='版本')
+    version_zh: str | None = Field(default=None, description='版本（中文）')
+    version_en: str | None = Field(default=None, description='版本（英文）')
     file_url_zh: str | None = Field(
         default=None, description='中文版下载地址（文件存阿里云 OSS，由后台上传；初始为空串）'
     )
