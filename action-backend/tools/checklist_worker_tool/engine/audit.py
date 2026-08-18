@@ -134,6 +134,30 @@ def _has_text(s: str) -> bool:
     return bool(s) and not DASH.match(s.strip())
 
 
+def line_map(text: str) -> dict[int, str]:
+    """行号 → 该行原文。
+
+    **这是全仓「第 N 行」的唯一定义**，`number_lines` 与后端的回填都走它。
+    单独抽出来是因为「空行不占行号」这条规则已经被踩过一次：照物理行号去取原文，
+    稿件里出现第一个空行之后就整体错位，而错位**不报任何错** —— 行号仍在合法范围、
+    页面照常滚过去，只是指着一段不相干的话。实测一份 2193 字的稿件：物理 77 行、
+    有效 39 行。前端那份对照实现在 `action-frontend/composables/manuscriptLines.ts`。
+
+    :param text: 原始稿件
+    :return: {行号: 该行原文}，行号从 1 开始，空行不占号
+    """
+    out: dict[int, str] = {}
+    no = 0
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        no += 1
+        out[no] = line
+
+    return out
+
+
 def number_lines(text: str) -> tuple[str, int]:
     """给稿件编行号。
 

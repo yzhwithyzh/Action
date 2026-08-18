@@ -286,6 +286,9 @@ class ActionGuidelineItem(Base):
     ext_label_en = Column(String(300), nullable=True, server_default="''", comment='扩展列列名（英文）')
     extension_zh = Column(Text, nullable=True, comment='扩展/对照条目内容（中文）')
     extension_en = Column(Text, nullable=True, comment='扩展/对照条目内容（英文）')
+    # 报告规范的通例是条目默认都要应答，所以默认 '0'（必填）；只有带「如适用 / if applicable」
+    # 这类限定语的才是 '1'。种子由 sql/007 的关键词启发式回填，后台可逐条修正。
+    require_level = Column(CHAR(1), nullable=True, server_default='0', comment='填写要求（0必填 1条件填写/选填）')
     sort_num = Column(Integer, nullable=True, server_default='0', comment='规范内显示顺序')
     status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
     del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
@@ -499,7 +502,7 @@ class ActionSrdAssessment(Base):
     # 于是一条刚排队的任务、或一个全领域证据不足的结果，都会在历史里显示成中度重复。
     overall_level = Column(String(16), nullable=True, comment='整体判定（none/low/mod/high）')
     overall_pct = Column(Integer, nullable=True, server_default='0', comment='整体重复度百分比')
-    overall_score_sum = Column(Integer, nullable=True, server_default='0', comment='整体得分（分越低越重复）')
+    overall_score_sum = Column(Integer, nullable=True, server_default='0', comment='整体得分（分越高越重复）')
     overall_score_max = Column(Integer, nullable=True, server_default='0', comment='可评分条目满分=3×可评分条目数')
     overall_score_max_full = Column(Integer, nullable=True, server_default='0', comment='名义满分=3×34=102')
     overall_reason_zh = Column(Text, nullable=True, comment='整体判定理由（中文）')
@@ -542,7 +545,7 @@ class ActionSrdDomain(Base):
     # 同 ActionSrdAssessment.overall_level：不设默认值，「没得判」必须是 null 而不是 'mod'
     level = Column(String(16), nullable=True, comment='重复程度（none/low/mod/high）')
     pct = Column(Integer, nullable=True, server_default='0', comment='重复度百分比')
-    score_sum = Column(Integer, nullable=True, server_default='0', comment='领域得分（分越低越重复）')
+    score_sum = Column(Integer, nullable=True, server_default='0', comment='领域得分（分越高越重复）')
     score_max = Column(Integer, nullable=True, server_default='0', comment='可评分条目满分=3×可评分条目数')
     score_max_full = Column(Integer, nullable=True, server_default='0', comment='名义满分=3×条目数')
     dup_count = Column(Integer, nullable=True, server_default='0', comment='偏重复条目数（评分0/1）')
@@ -581,7 +584,7 @@ class ActionSrdItem(Base):
     code = Column(String(32), nullable=True, server_default="''", comment='条目编号（如 1a）')
     question_zh = Column(Text, nullable=False, comment='评估问题（中文）')
     question_en = Column(Text, nullable=True, comment='评估问题（英文）')
-    # 条目层只有评分，没有「重复程度」与百分比：0=完全相同 … 3=完全不同，unclear=证据不足。
+    # 条目层只有评分，没有「重复程度」与百分比：3=完全相同 … 0=完全不同，unclear=证据不足。
     # 百分比是领域与整体才有的量（由这些分数算出来，见 srd-engine/aggregate.py）。
     rating = Column(String(8), nullable=True, server_default="'unclear'", comment='条目评分（0/1/2/3/unclear）')
     score = Column(Integer, nullable=True, comment='评分对应分数0-3；证据不足为空，不进分子分母')
@@ -654,3 +657,189 @@ class ActionGuestProfile(Base):
     del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
     create_time = Column(_timestamp_second(), nullable=True, comment='创建时间', default=datetime.now)
     update_time = Column(_timestamp_second(), nullable=True, comment='更新时间', default=datetime.now)
+
+
+class ActionReportDraft(Base):
+    """
+    官网-报告助手报告草稿
+
+    一行 = 一份报告初稿，逐条目正文在 `ActionReportDraftItem`。字段与
+    sql/008-action-report-draft-pg.sql 严格一一对应。
+
+    **acu_* 五列已停用，代码里不再读写**（针灸专属字段整体撤除的理由见
+    `module_action/service/report_compose_service.py` 的模块 docstring）。
+    列留着不删：撤除前存过草稿的用户，那几行数据还在里面，drop 一次就没了；
+    留着不读不写没有代价。ORM 里也照留，好让这个类继续与实表一一对应 ——
+    少写一列，`create_all` 在全新库上建出来的表就和 008 建出来的不是同一张。
+
+    空串默认值一律写 `text("''")`，**不能写 `server_default="''"`**：后者会被当成需要转义的
+    字面量，DDL 渲染成 `DEFAULT ''''''`，默认值变成「两个引号字符」这个非空字符串
+    （实跑时踩到过：本该判空的列一律变成非空）。同 `ActionGuestProfile` 的处理。
+    """
+
+    __tablename__ = 'action_report_draft'
+    __table_args__ = {'comment': '官网-报告助手报告草稿'}
+
+    draft_id = Column(Integer, primary_key=True, autoincrement=True, comment='草稿id')
+    user_id = Column(BigInteger, nullable=False, comment='归属访客用户id（sys_user.user_id）')
+    guideline_id = Column(Integer, nullable=False, comment='所依据的报告规范id')
+    study_type_key = Column(String(32), nullable=True, server_default=text("''"), comment='第一步判定的研究类型，仅作留档')
+    title = Column(String(300), nullable=True, server_default=text("''"), comment='草稿名称，由用户自取')
+    #: 导入的原稿。**与条目框两份并存**：导出正文以它为准，条目框只是对照与改写的工作面。
+    #: 拆碎了当唯一真相的话，导出拼回来的就不是用户写的那篇稿子了（见 sql/019 的文件头）
+    source_text = Column(Text, nullable=True, comment='导入的原稿全文；逐条填的草稿为空')
+    source_name = Column(String(255), nullable=True, server_default=text("''"), comment='导入时的原始文件名')
+    source_lines = Column(Integer, nullable=True, server_default='0', comment='原稿有效行数（空行不占号）')
+    acu_basis = Column(String(32), nullable=True, server_default=text("''"), comment='穴位选取依据（bianzheng/duizheng/jingyan）')
+    acu_basis_note = Column(String(1000), nullable=True, server_default=text("''"), comment='选穴依据补充说明')
+    acu_needle = Column(String(1000), nullable=True, server_default=text("''"), comment='进针手法（角度、深度、行针手法）')
+    acu_deqi = Column(String(1000), nullable=True, server_default=text("''"), comment='得气感应')
+    acu_control = Column(String(1000), nullable=True, server_default=text("''"), comment='对照/对照措施设置')
+    status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_by = Column(String(64), nullable=True, server_default=text("''"), comment='创建者')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_by = Column(String(64), nullable=True, server_default=text("''"), comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+
+
+class ActionReportDraftItem(Base):
+    """
+    官网-报告草稿逐条目正文
+
+    用户没填过的条目**不建行**：「没有行」与「填了空串」在完成度统计里是同一回事，
+    没必要为一份 282 条的规范预先铺 282 行空记录。
+    """
+
+    __tablename__ = 'action_report_draft_item'
+    # uk_action_report_draft_item 在 DDL 里是唯一索引，DO 必须同步声明 ——
+    # 少了它 create_all 建出来的表会允许同一条目写出多行，于是「保存两次」变成
+    # 「同一条目两份正文」，而线上库反而拦得住。保存本身走的是先删后插
+    # （`ReportDraftDao.replace_draft_items`），这个索引挡的是并发保存时落后的那一次。
+    __table_args__ = (
+        UniqueConstraint('draft_id', 'item_id', name='uk_action_report_draft_item'),
+        {'comment': '官网-报告草稿逐条目正文'},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='主键')
+    draft_id = Column(Integer, nullable=False, comment='所属草稿id')
+    item_id = Column(Integer, nullable=False, comment='所应答的 checklist 条目id')
+    content = Column(Text, nullable=True, comment='用户为该条目写的正文')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+
+
+class ActionReportReview(Base):
+    """
+    官网-报告助手第三步校验记录
+
+    一行 = 一次逐条校验任务。字段与 sql/010-action-report-review-pg.sql +
+    sql/014-action-report-review-history-pg.sql 一一对应。
+
+    ## 它同时是两样东西
+
+    ① **任务台账**：提交那一刻就落一行 `pending`，由轮询与历史列表对账到终态。
+    所以跑失败的、被停掉的、用户中途关掉页面的任务在这里都留得下痕迹 ——
+    014 之前落库发生在前端轮到 completed 的那一刻，恰恰把这批最该排查的任务全漏了。
+    ② **结果快照**：跑完的判定连同稿件正文一起存，用户可按历史回看。
+
+    ## draft_id 可空
+
+    外部粘贴稿件的用户（第三步真正的主用户）没有草稿可挂。第四步的工作清单仍旧从这里取
+    「这份草稿最近一次校验」，那只是 `draft_id is not null` 的一个子集。
+
+    ## 稿件正文在这里，删除时是真删
+
+    014 起存 `manuscript` 与逐条 `evidence`（`assistant.rvHint` 那句承诺已同步改写）。
+    作为对价，`ReportReviewDao.soft_delete_review_dao` 在置 `del_flag='2'` 的同时把这两处
+    **物理清空**，只留台账那几列。排障要的是 session_id / 状态 / 计数 / 时间，
+    隐私风险在正文 —— 用户点了删除就该是真的没了，而不是列表里看不见了。
+    """
+
+    __tablename__ = 'action_report_review'
+    __table_args__ = {'comment': '官网-报告助手第三步校验记录'}
+
+    review_id = Column(Integer, primary_key=True, autoincrement=True, comment='校验记录id')
+    draft_id = Column(Integer, nullable=True, comment='被校验的草稿id；外部粘贴的稿件为空')
+    user_id = Column(BigInteger, nullable=False, comment='归属访客用户id（sys_user.user_id）')
+    guideline_id = Column(Integer, nullable=True, comment='所依据的报告规范id')
+    guideline_code = Column(String(64), nullable=True, server_default=text("''"), comment='报告规范代号（冗余存）')
+    session_id = Column(String(64), nullable=True, server_default=text("''"), comment='worker会话id，仅供排障对账')
+    #: 用途。`import` 那一次跑完会**回填草稿条目**，`check` 不会 —— 不分的话，
+    #: 用户之后每复查一次就把自己在第二步的编辑悄悄盖掉一遍
+    purpose = Column(String(16), nullable=True, server_default='check', comment='用途（check / import）')
+    run_status = Column(String(16), nullable=True, server_default='completed', comment='任务状态')
+    error_msg = Column(String(500), nullable=True, server_default=text("''"), comment='失败原因')
+    progress = Column(Integer, nullable=True, server_default='0', comment='进度百分比0-100')
+    models = Column(String(200), nullable=True, server_default=text("''"), comment='实际出结果的模型，排障用')
+    locale = Column(String(2), nullable=True, server_default='zh', comment='判定语言（zh/en）')
+    char_count = Column(Integer, nullable=True, server_default='0', comment='稿件字符数')
+    item_total = Column(Integer, nullable=True, server_default='0', comment='该规范的条目总数')
+    completeness = Column(Integer, nullable=True, server_default='0', comment='完整度百分比0-100')
+    reported = Column(Integer, nullable=True, server_default='0', comment='已报告条目数')
+    vague = Column(Integer, nullable=True, server_default='0', comment='描述模糊条目数')
+    missing = Column(Integer, nullable=True, server_default='0', comment='未报告条目数')
+    line_count = Column(Integer, nullable=True, server_default='0', comment='稿件行数')
+    truncated = Column(CHAR(1), nullable=True, server_default='0', comment='稿件是否被截断（0否 1是）')
+    manuscript = Column(Text, nullable=True, comment='稿件正文；删除记录时物理清空')
+    consistency = Column(Text, nullable=True, comment='全稿一致性判定结果（JSON）')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    finish_time = Column(DateTime, nullable=True, comment='任务到终态的时间')
+
+
+class ActionReportReviewItem(Base):
+    """
+    官网-报告助手第三步逐条判定
+
+    `reason` 是模型对该条目的判断说明，`evidence` 才是稿件的逐字片段。
+    **evidence 与主表的 manuscript 是一对**：单存 evidence 是一句回不到上下文的孤立引文，
+    所以两者要么都在，要么在删除时一起清空（见 `ActionReportReview` 的 docstring）。
+    """
+
+    __tablename__ = 'action_report_review_item'
+    # 同一次校验里一条目只该有一条判定。DO 必须同步声明这个唯一索引 ——
+    # 少了它 create_all 建出来的表允许重复写入，而线上库反而拦得住
+    __table_args__ = (
+        UniqueConstraint('review_id', 'item_id', name='uk_action_report_review_item'),
+        {'comment': '官网-报告助手第三步逐条判定'},
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True, comment='主键')
+    review_id = Column(Integer, nullable=False, comment='所属校验记录id')
+    item_id = Column(Integer, nullable=False, comment='checklist条目id')
+    status = Column(String(16), nullable=False, comment='判定（reported / vague / missing）')
+    reason = Column(Text, nullable=True, comment='判定说明')
+    evidence = Column(Text, nullable=True, comment='判定引用的稿件原文片段；删除记录时物理清空')
+    lines = Column(String(200), nullable=True, server_default=text("''"), comment='报告于第几行，逗号分隔')
+class ActionReportTrail(Base):
+    """
+    官网-报告助手操作留痕
+
+    字段与 sql/011-action-report-trail-pg.sql 一一对应。
+
+    **只存结构化的数字与枚举，不存渲染好的句子**：句子里迟早会混进稿件正文片段
+    （「已提交稿件：本研究纳入 120 例……」），第三步「稿件不入库」的承诺就绕过去了。
+    人读的那句话由前端按 i18n 渲染，库里没有它。唯一的自由文本是 `note`，仅供系统诊断。
+
+    `event=applied` 记的是第四步把模型生成的文字写回草稿条目 —— 那是这套工具里
+    真正的「关键数据修改」，也是投稿时被问起「AI 参与了多少」时唯一能拿出来的答案。
+    """
+
+    __tablename__ = 'action_report_trail'
+    __table_args__ = {'comment': '官网-报告助手操作留痕'}
+
+    trail_id = Column(Integer, primary_key=True, autoincrement=True, comment='留痕id')
+    user_id = Column(BigInteger, nullable=False, comment='操作人（sys_user.user_id）')
+    draft_id = Column(Integer, nullable=True, comment='关联草稿id；外部稿件为空')
+    guideline_code = Column(String(64), nullable=True, server_default=text("''"), comment='报告规范代号')
+    event = Column(String(32), nullable=False, comment='事件（submitted/judged/cross/failed/applied）')
+    actor = Column(String(200), nullable=True, server_default=text("''"), comment='执行者：用户名或模型标识')
+    item_id = Column(Integer, nullable=True, comment='event=applied 时被写回的条目id')
+    total = Column(Integer, nullable=True, comment='判定条目总数')
+    reported = Column(Integer, nullable=True, comment='已报告条目数')
+    vague = Column(Integer, nullable=True, comment='描述模糊条目数')
+    missing = Column(Integer, nullable=True, comment='未报告条目数')
+    completeness = Column(Integer, nullable=True, comment='完整性百分比')
+    char_count = Column(Integer, nullable=True, comment='稿件字符数（只记长度，不记内容）')
+    note = Column(String(300), nullable=True, server_default=text("''"), comment='系统诊断信息，不得写入稿件内容')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)

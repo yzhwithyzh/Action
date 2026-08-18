@@ -3,19 +3,23 @@
 纯代码、零 LLM、无 IO —— 这是整个引擎里唯一决定最终结论的地方，必须能对着
 Excel 的表 1 / 表 2 / 表 3 逐格复核。表 3 的 16 格在 tests/test_aggregate.py 里逐格断言。
 
-表 1（条目评分，0.7.0 起）：每条目 0–3 分
-    0 完全相同 / 1 部分相同 / 2 部分不同 / 3 完全不同
+表 1（条目评分，0.7.0 起；0.8.0 起方向翻转）：每条目 0–3 分，**分越高越重复**
+    3 完全相同 / 2 部分相同 / 1 部分不同 / 0 完全不同
     领域满分 = 3 × 条目数 → 领域1 /24、领域2 /18、领域3 /42、领域4 /18，合计 /102
 
 表 2（单领域重复程度，按百分比）：
     无重复 0–25% / 低重复 26–50% / 中度重复 51–75% / 高度重复 76–100%
-    其中 重复百分比 = (满分 − 得分) ÷ 满分 × 100
-         —— 分数量的是「差异」，百分比量的是「重复」，所以要反过来
+    其中 重复百分比 = 得分 ÷ 满分 × 100
+         —— 0.8.0 起分数量的就是「重复」，与百分比同向，不再取补
          unclear 条目连同它那 3 分一起剔出分母（两篇都没写清楚 ≠ 两篇做法相同）
 
-    与 0.6.0 的兼容性：老口径是 `dup 条数 ÷ (dup + diff)`。若全部条目都只打 0 或 3 分，
-    新公式退化成完全相同的数值 —— 0 分等价于旧的 dup，3 分等价于旧的 diff。
-    1 分与 2 分是新增的中间档，它们让「大同小异」不再被迫二选一。
+    与 0.7.x 的兼容性：老口径是 `(满分 − 得分) ÷ 满分`，配合老方向的分数。
+    两处一起翻转后**数值恒等** —— 同一次评估在 0.7.x 与 0.8.0 下算出的
+    pct / level / overall_level 一格不差，翻转只重新标注了分数这一层。
+
+    与 0.6.0 的兼容性：老口径是 `dup 条数 ÷ (dup + diff)`。若全部条目都只打 3 或 0 分，
+    新公式退化成完全相同的数值 —— 3 分等价于旧的 dup，0 分等价于旧的 diff。
+    2 分与 1 分是新增的中间档，它们让「大同小异」不再被迫二选一。
 
 表 3（整体判定）：关键领域（主题 + 结果）状态 × 非关键领域（方法 + 质量）状态查表
 """
@@ -129,8 +133,8 @@ def overall_of(key: tuple[Level, Level], nonkey: tuple[Level, Level]) -> Level:
 
 
 def dup_pct(score_sum: int, score_max: int) -> int:
-    """得分 → 重复百分比。分数量差异，百分比量重复，故取补。"""
-    return round(100 * (score_max - score_sum) / score_max) if score_max else 0
+    """得分 → 重复百分比。0.8.0 起分数量的就是重复，与百分比同向，直接相除。"""
+    return round(100 * score_sum / score_max) if score_max else 0
 
 
 def score_domain(domain: DomainResult, cfg: EngineConfig) -> DomainResult:
@@ -284,9 +288,9 @@ def build_skeleton(verdicts: dict[str, ItemResult] | None = None) -> AssessmentR
     return result
 
 
-#: 老式三态判定 → 评分。dup 折成 0 分、diff 折成 3 分，即两端满打满算，
+#: 老式三态判定 → 评分。dup 折成 3 分、diff 折成 0 分，即两端满打满算，
 #: 这样 0.6.0 的历史 verdict 文件算出来的百分比与当年完全一致。
-_VERDICT_RATING: dict[str, Rating] = {'dup': '0', 'diff': '3', 'unclear': 'unclear'}
+_VERDICT_RATING: dict[str, Rating] = {'dup': '3', 'diff': '0', 'unclear': 'unclear'}
 
 
 def from_rating_map(mapping: dict[str, str], cfg: EngineConfig | None = None) -> AssessmentResult:

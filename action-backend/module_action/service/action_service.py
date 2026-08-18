@@ -1,10 +1,11 @@
 import asyncio
 import contextlib
 import json
+import re
 import shlex
 import shutil
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -23,21 +24,37 @@ from module_action.dao.action_dao import (
     GuidelineItemDao,
     ImplementationDao,
     NewsDao,
+    ReportDraftDao,
+    ReportReviewDao,
+    ReportTrailDao,
     ResourceLinkDao,
     SiteTextDao,
     SrdDao,
     StudyTypeDao,
     TeamMemberDao,
 )
-from module_action.entity.do.action_do import ActionSrdAssessment
+from module_action.entity.do.action_do import (
+    ActionReportReview,
+    ActionReportTrail,
+    ActionSrdAssessment,
+    ActionStudyType,
+)
 from module_action.entity.vo.action_vo import (
+    MAX_ASSIST_INPUT_CHARS,
+    MAX_TRAIL_ROWS,
+    MIN_MANUSCRIPT_CHARS,
+    AssistApplyModel,
+    AssistRequestModel,
+    AssistResultModel,
     CfirConstructModel,
     CfirDomainModel,
     CfirStrategyModel,
     ChecklistReviewStateModel,
     ChecklistReviewSubmitModel,
+    ChecklistReviewSubmitResultModel,
     CollabRequestPageQueryModel,
     CollabRequestSubmitModel,
+    DraftImportResultModel,
     EricCategoryModel,
     EricStrategyModel,
     GuidelineCategoryModel,
@@ -49,8 +66,17 @@ from module_action.entity.vo.action_vo import (
     NewsModel,
     NewsPageQueryModel,
     ReaimDimensionModel,
+    ReportDraftComposeModel,
+    ReportDraftCreateModel,
+    ReportDraftItemModel,
+    ReportDraftModel,
+    ReportDraftSaveModel,
+    ReportReviewHistoryModel,
+    ReportReviewModel,
     ResourceLinkModel,
     ResourceLinkPageQueryModel,
+    ReviewPurpose,
+    ReviewVerdictModel,
     SiteRebuildStateModel,
     SiteTextGroupModel,
     SiteTextModel,
@@ -63,10 +89,17 @@ from module_action.entity.vo.action_vo import (
     SrdItemModel,
     SrdRunStateModel,
     StudyTypeModel,
+    StudyTypeSaveModel,
     StudyTypeStatModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
+    TrailAddModel,
+    TrailModel,
 )
+from module_action.service.ai_assist_service import AiAssistService
+from module_action.service.report_assist_prompt import AssistContext, needs_current_text
+from module_action.service.report_compose_service import ComposeItem, compose_draft_text
+from module_action.service.report_export_service import BUILDERS, ExportDraft, ExportItem
 from module_action.service.srd_export_service import build_assessment_xlsx
 from utils.common_util import CamelCaseUtil
 from utils.log_util import logger
@@ -1062,14 +1095,84 @@ class GuidelineItemService:
             raise e
 
 
+def _manuscript_line_map(text: str) -> dict[int, str]:
+    """
+    行号 → 该行原文，**直接用引擎那份实现**，不在后端另造一份。
+
+    「空行不占行号」这条规则已经踩过一次：照物理行号去取原文，稿件里出现第一个空行之后
+    就整体错位，而且**不报任何错** —— 行号仍在合法范围、页面照常滚过去，只是指着一段
+    不相干的话。实测一份 2193 字的稿件：物理 77 行、有效 39 行。
+
+    全仓的唯一定义在 `tools/checklist_worker_tool/engine/audit.py::line_map`；
+    前端那份对照实现在 `action-frontend/composables/manuscriptLines.ts`，各有测试钉住。
+    延迟导入：tools 包依赖 redis 等库，不该拖累未用到该功能的进程启动。
+
+    :param text: 稿件全文
+    :return: {行号: 该行原文}
+    """
+    from tools.checklist_worker_tool.engine.audit import line_map  # noqa: PLC0415
+
+    return line_map(text)
+
+
+@dataclass(frozen=True)
+class _ReviewRun:
+    """
+    一次 checklist 校验的运行态快照（普通值，不是 ORM 对象）
+
+    同 `_SrdRun`：投递 → 轮询 → 落库要连着提交好几次事务，而会话是 `expire_on_commit=True`，
+    commit 之后读任何 ORM 属性都会触发懒加载，在 async 会话里直接抛 `MissingGreenlet`。
+    """
+
+    review_id: int
+    session_id: str
+    user_id: int
+    guideline_id: int | None
+    #: 这次是「导入并回填草稿」还是「只判定」。回填只在 import 那次做 ——
+    #: 不分的话，用户之后每复查一次就把自己在第二步的编辑悄悄盖掉一遍
+    purpose: str
+    draft_id: int | None
+    run_status: str
+    progress: int
+    error_msg: str
+
+
 class ChecklistReviewService:
     """
     checklist 逐条校验服务层（报告助手第三步）
 
-    这里只做投递与查询，真正干活的是 `tools/checklist_worker_tool` 常驻 worker：
-    后端把稿件与规范代号 rpush 进 Redis 队列，worker 取条目、调模型、写状态，
-    两个进程互不依赖 —— worker 挂了不影响官网，后端重启也不影响在跑的任务。
+    算法由 `tools/checklist_worker_tool` 常驻 worker 干：后端把稿件与规范代号 rpush 进
+    Redis 队列，worker 取条目、调模型、写状态。两个进程互不依赖 —— worker 挂了不影响官网，
+    后端重启也不影响在跑的任务。
+
+    ## 三件事：投递、对账、回看
+
+    **投递**时就落一行 `pending` 台账（`action_report_review`），**轮询**时把 worker 的状态
+    同步进库、终态那一刻把判定写进来，**回看**由历史列表与详情两个口提供。
+
+    014 之前这里只有投递与透传状态，落库由前端在轮到 completed 时另调一个口完成。那样有两个
+    后果，而它们在「刷新一下页面，刚跑完的校验就没了」上撞成同一个：跑失败/被停/用户关掉
+    页面的任务一条都没留下（恰恰是要排查的那批），以及 session_id 只活在前端内存里，
+    刷新之后 Redis 里明明还有结果却再也找不回来。
+
+    ## 落库为什么在轮询里，不在 worker 里
+
+    同 `SrdService`：worker 已经为了模型池连过一次库，再让它写业务表就等于把两个系统焊死。
+    代价是「用户关掉页面就没人来落库」，由 `list_history_services` 顺带对账兜底。
     """
+
+    #: 一个访客最多留几条历史。每行挂着一整篇稿件正文，比 014 之前更该管上限
+    KEEP_HISTORY = 20
+    #: 历史列表一次返回几条
+    HISTORY_LIMIT = 20
+    #: 同一访客同时在跑的校验数上限 —— 一次校验是几十次模型调用，不设闸等于把账单交给公网
+    MAX_RUNNING_PER_USER = 2
+
+    #: 完整度权重（模糊算半条）。与 `tools/checklist_worker_tool/engine/audit.py` 的
+    #: `STATUS_WEIGHT` 是同一张表 —— 这里不 import 引擎（后端进程不该为了 3 个键去加载
+    #: worker 那一整包依赖），但两处必须一致，**改引擎的权重时记得同步这里**。
+    #: 同 `SrdService.RATING_SCORE` 的处理
+    STATUS_WEIGHT: ClassVar[dict[str, float]] = {'reported': 1.0, 'vague': 0.5, 'missing': 0.0}
 
     @classmethod
     def _client(cls) -> Any:
@@ -1080,80 +1183,613 @@ class ChecklistReviewService:
         return TaskClient(CONFIG)
 
     @classmethod
-    async def submit_review_services(
-        cls, query_db: AsyncSession, submit: ChecklistReviewSubmitModel, user_id: int | None = None
-    ) -> str:
+    def _snapshot(cls, record: ActionReportReview) -> _ReviewRun:
         """
-        提交一次校验，返回任务id
+        把 ORM 记录里这条链路要用的几个字段抄成普通值（理由见 `_ReviewRun`）
+
+        :param record: 校验记录
+        :return: 运行态快照
+        """
+        return _ReviewRun(
+            review_id=record.review_id,
+            session_id=record.session_id or '',
+            user_id=record.user_id,
+            guideline_id=record.guideline_id,
+            purpose=record.purpose or 'check',
+            draft_id=record.draft_id,
+            run_status=record.run_status or 'pending',
+            progress=record.progress or 0,
+            error_msg=record.error_msg or '',
+        )
+
+    # ------------------------------------------------------------------ 对账
+
+    @classmethod
+    async def _count_running(cls, query_db: AsyncSession, user_id: int) -> int:
+        """
+        库里还挂着 pending/running 的记录数
+
+        :param query_db: orm对象
+        :param user_id: 访客用户id
+        :return: 条数
+        """
+        return len(
+            [
+                r
+                for r in await ReportReviewDao.get_user_reviews_dao(query_db, user_id, cls.HISTORY_LIMIT)
+                if (r.run_status or '') in ('pending', 'running')
+            ]
+        )
+
+    @classmethod
+    async def _reconcile_pending(cls, query_db: AsyncSession, user_id: int) -> int:
+        """
+        对未终结的记录补查一次 worker 状态，跑完的补落库、查不到的判过期
+
+        **这是整条链路的兜底**：落库发生在轮询里，而用户随时可能关掉页面 ——
+        没有这一步，跑完的任务会永远挂在 running，孤儿还会占满并发名额。
+        历史列表每次打开都做一遍，提交口只在撞上限时做。
+
+        :param query_db: orm对象
+        :param user_id: 访客用户id
+        :return: 对账之后仍在跑的条数
+        """
+        pending = [
+            cls._snapshot(r)
+            for r in await ReportReviewDao.get_user_reviews_dao(query_db, user_id, cls.HISTORY_LIMIT)
+            if (r.run_status or '') in ('pending', 'running') and r.session_id
+        ]
+        for run in pending:
+            try:
+                state = await cls._fetch_worker_state(run.session_id)
+                if state is None:
+                    await cls._mark_failed(query_db, run, '任务状态已过期，请重新提交')
+                    continue
+                await cls._sync_run(query_db, run, state)
+            except Exception as e:
+                # 对账是顺带做的，Redis 抖一下不该让整个历史列表打不开
+                logger.warning(f'checklist 校验历史对账失败 {run.session_id}: {type(e).__name__}: {e}')
+
+        return await cls._count_running(query_db, user_id)
+
+    # ------------------------------------------------------------------ 投递
+
+    @classmethod
+    async def submit_review_services(
+        cls,
+        query_db: AsyncSession,
+        submit: ChecklistReviewSubmitModel,
+        user_id: int,
+        purpose: ReviewPurpose = 'check',
+    ) -> ChecklistReviewSubmitResultModel:
+        """
+        提交一次校验：先落台账，再入队
+
+        **顺序与 SRD 相反，是刻意的**。SRD 先入队后落库，因为它要先把 PDF 落盘；这里没有
+        文件，而台账本身就是目的之一 —— 先落库意味着连「入队都没成功」的任务都留得下痕迹，
+        那正是排查队列/Redis 故障时唯一的线索。入队失败就地标 failed，不回滚掉这一行。
 
         :param query_db: orm对象
         :param submit: 提交模型
-        :param user_id: 访客用户id，用于记账
-        :return: 任务id（session_id）
+        :param user_id: 访客用户id
+        :return: 任务id + 校验记录id
+        :raises ServiceException: 规范不存在 / 无条目 / 草稿不属于本人 / 在跑的任务过多
         """
         guideline = await GuidelineDao.get_guideline_by_code(query_db, submit.guideline_code)
         if not guideline:
             raise ServiceException(message=f'报告规范 {submit.guideline_code} 不存在')
+        # **就地抄成普通值，别把这个 ORM 对象带过下面那次 commit**：会话是
+        # `expire_on_commit=True`，commit 之后读它的任何属性都要发一次懒加载，
+        # 而懒加载在 async 会话里直接抛 `MissingGreenlet`（"greenlet_spawn has not been
+        # called"）。踩过一次：入队用的 payload 在 commit 之后才去取 guideline.code，
+        # 于是每一次提交都在落库成功后炸掉 —— 表现是「历史里多了一条 pending，
+        # 页面却报错」。同 `_ReviewRun` / `_SrdRun` 那两个快照的理由
+        guideline_id = guideline.guideline_id
+        guideline_code = guideline.code
 
         # 条目为空时 worker 也会失败，但那要等排队+启动，不如在这里直接回绝
-        items = await GuidelineItemDao.get_item_list(
-            query_db,
-            GuidelineItemPageQueryModel(guidelineId=guideline.guideline_id),
-            is_page=False,
-            only_published=True,
-        )
+        items = await ReportDraftService._items_of(query_db, guideline_id)
         if not items:
             raise ServiceException(message=f'报告规范 {submit.guideline_code} 尚未录入 checklist 条目')
 
+        # **撞上限时先对账再判**。这道闸数的是库里挂着 pending/running 的行，而那种行
+        # 未必真的还在跑：入队失败、worker 崩了、Redis 里的状态过了 TTL，都会留下一个
+        # 永远等不到终态的孤儿。只数不对账的话，两个孤儿就把这个账号永久锁在门外
+        # ——而用户能看到的现象只有一句「你已有 2 个校验在进行中」，且怎么等都不会消失。
+        # 对账本身有 Redis 往返，所以只在**真的撞上限**时才做：正常提交一次都不发
+        running = await cls._count_running(query_db, user_id)
+        if running >= cls.MAX_RUNNING_PER_USER:
+            running = await cls._reconcile_pending(query_db, user_id)
+        if running >= cls.MAX_RUNNING_PER_USER:
+            raise ServiceException(message=f'你已有 {running} 个校验在进行中，请等它跑完再提交')
+
+        # draft_id 由前端传，但**归属必须在这里验**：不验的话随手改一个 id
+        # 就能把自己的判定挂到别人的草稿上，第四步的工作清单会跟着串台
+        draft_id = None
+        if submit.draft_id:
+            draft = await ReportDraftDao.get_draft_by_id(query_db, submit.draft_id, user_id)
+            if not draft:
+                raise ServiceException(message='草稿不存在')
+            draft_id = submit.draft_id
+
+        # session_id 自己先生成：台账要先落库，而落库时就得带上它
+        session_id = uuid.uuid4().hex
+        manuscript = submit.manuscript
+        review = ActionReportReview(
+            draft_id=draft_id,
+            user_id=user_id,
+            guideline_id=guideline_id,
+            guideline_code=guideline_code,
+            session_id=session_id,
+            purpose=purpose,
+            run_status='pending',
+            progress=0,
+            locale=submit.locale,
+            char_count=len(manuscript),
+            item_total=len(items),
+            manuscript=manuscript,
+            del_flag='0',
+            create_time=datetime.now(),
+        )
+        try:
+            await ReportReviewDao.add_review_dao(query_db, review)
+            # flush 之后主键才有值，而 commit 之后就读不到了（expire_on_commit）
+            review_id = review.review_id
+            await ReportReviewDao.trim_user_reviews_dao(query_db, user_id, cls.KEEP_HISTORY)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
         payload = {
-            'guideline_code': guideline.code,
-            'guideline_id': guideline.guideline_id,
-            'manuscript': submit.manuscript,
+            'guideline_code': guideline_code,
+            'guideline_id': guideline_id,
+            'manuscript': manuscript,
             'locale': submit.locale,
             'user_id': user_id,
         }
         try:
             async with cls._client() as client:
-                return await client.submit(payload)
-        except ServiceException:
-            raise
+                await client.submit(payload, session_id=session_id)
         except Exception as e:
+            # 台账留着并标记失败：用户在历史里看得见「这次没提交上去」，
+            # 运维也查得到是哪一刻的哪一条。静默回滚等于把这次故障抹掉
+            with contextlib.suppress(Exception):
+                await ReportReviewDao.edit_review_dao(
+                    query_db,
+                    review_id,
+                    {
+                        'run_status': 'failed',
+                        'error_msg': f'任务入队失败：{type(e).__name__}'[:500],
+                        'finish_time': datetime.now(),
+                    },
+                )
+                await query_db.commit()
             raise ServiceException(message=f'校验任务提交失败，请稍后重试：{type(e).__name__}') from e
 
-    @classmethod
-    async def review_state_services(cls, session_id: str) -> ChecklistReviewStateModel:
-        """
-        查询校验任务状态
+        return ChecklistReviewSubmitResultModel(sessionId=session_id, reviewId=review_id)
 
-        :param session_id: 任务id
-        :return: 任务状态
+    # ------------------------------------------------------------------ 轮询与对账
+
+    @classmethod
+    async def review_state_services(
+        cls, query_db: AsyncSession, session_id: str, user_id: int
+    ) -> ChecklistReviewStateModel:
         """
-        try:
-            async with cls._client() as client:
-                state = await client.status(session_id)
-        except Exception as e:
-            raise ServiceException(message=f'校验任务状态查询失败：{type(e).__name__}') from e
-        if not state:
-            raise ServiceException(message='校验任务不存在或已过期')
+        查询校验任务状态；跑完顺手把判定落库
+
+        :param query_db: orm对象
+        :param session_id: 任务id
+        :param user_id: 访客用户id（越权保护）
+        :return: 任务快照
+        :raises ServiceException: 任务不存在或不属于该用户
+        """
+        record = await ReportReviewDao.get_review_by_session_dao(query_db, session_id, user_id)
+        if not record:
+            raise ServiceException(message='校验任务不存在')
+        run = cls._snapshot(record)
+
+        state = await cls._fetch_worker_state(session_id)
+        if state is None:
+            # Redis 里的任务状态有 TTL（默认 7 天）。已经落过库的记录不受影响 ——
+            # 判定就在业务表里，用户照样能从历史点开看
+            if run.run_status in ('pending', 'running'):
+                run = await cls._mark_failed(query_db, run, '任务状态已过期，请重新提交')
+        else:
+            run = await cls._sync_run(query_db, run, state)
 
         return ChecklistReviewStateModel(
-            sessionId=session_id,
-            status=str(state.get('status') or ''),
-            progressCurrent=int(state.get('progress_current') or 0),
-            progressTotal=int(state.get('progress_total') or 100),
-            message=str(state.get('message') or ''),
-            error=str(state.get('error') or ''),
-            result=state.get('result') if isinstance(state.get('result'), dict) else None,
+            sessionId=run.session_id,
+            reviewId=run.review_id,
+            status=run.run_status,
+            progressCurrent=int((state or {}).get('progress_current') or 0),
+            progressTotal=int((state or {}).get('progress_total') or 100) or 100,
+            message=str((state or {}).get('message') or ''),
+            error=run.error_msg,
+            result=(state or {}).get('result') if isinstance((state or {}).get('result'), dict) else None,
         )
 
     @classmethod
-    async def stop_review_services(cls, session_id: str) -> CrudResponseModel:
+    async def _fetch_worker_state(cls, session_id: str) -> dict[str, Any] | None:
+        """
+        读 worker 的任务状态快照
+
+        :param session_id: 任务id
+        :return: 状态字典；任务不存在或已过期时为 None
+        """
+        try:
+            async with cls._client() as client:
+                return await client.status(session_id)
+        except Exception as e:
+            raise ServiceException(message=f'校验任务状态查询失败：{type(e).__name__}') from e
+
+    @classmethod
+    async def _commit_values(cls, query_db: AsyncSession, run: _ReviewRun, values: dict[str, Any]) -> _ReviewRun:
+        """
+        更新校验记录并返回改过的快照
+
+        :param query_db: orm对象
+        :param run: 运行态快照
+        :param values: 列名到值的映射
+        :return: 更新后的快照
+        """
+        try:
+            await ReportReviewDao.edit_review_dao(query_db, run.review_id, values)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return replace(
+            run,
+            run_status=str(values.get('run_status', run.run_status)),
+            progress=int(values.get('progress', run.progress)),
+            error_msg=str(values.get('error_msg', run.error_msg)),
+        )
+
+    @classmethod
+    async def _mark_failed(cls, query_db: AsyncSession, run: _ReviewRun, error: str) -> _ReviewRun:
+        """
+        把记录标记为失败
+
+        :param query_db: orm对象
+        :param run: 运行态快照
+        :param error: 失败原因
+        :return: 更新后的快照
+        """
+        return await cls._commit_values(
+            query_db, run, {'run_status': 'failed', 'error_msg': error[:500], 'finish_time': datetime.now()}
+        )
+
+    @classmethod
+    async def _sync_run(cls, query_db: AsyncSession, run: _ReviewRun, state: dict[str, Any]) -> _ReviewRun:
+        """
+        把 worker 的状态同步进库；首次看到 completed 时把判定写进来
+
+        已经是 completed 的记录直接跳过 —— 前端会一直轮询到拿着结果离开页面，
+        没有这道闸就会每 2 秒重写一次 282 条判定。
+
+        :param query_db: orm对象
+        :param run: 运行态快照
+        :param state: worker 状态快照
+        :return: 更新后的快照
+        """
+        if run.run_status == 'completed':
+            return run
+
+        status = str(state.get('status') or 'pending')
+        current = int(state.get('progress_current') or 0)
+        total = int(state.get('progress_total') or 100) or 100
+        progress = min(100, round(current / total * 100))
+
+        if status == 'completed':
+            result = state.get('result') if isinstance(state.get('result'), dict) else {}
+
+            return await cls._persist_result(query_db, run, result or {})
+
+        values: dict[str, Any] = {'run_status': status, 'progress': progress}
+        if status in ('failed', 'stopped'):
+            values['error_msg'] = (str(state.get('error') or '') or ('已停止' if status == 'stopped' else '校验失败'))[
+                :500
+            ]
+            values['finish_time'] = datetime.now()
+
+        return await cls._commit_values(query_db, run, values)
+
+    @classmethod
+    async def _persist_result(
+        cls, query_db: AsyncSession, run: _ReviewRun, result: dict[str, Any]
+    ) -> _ReviewRun:
+        """
+        把 worker 的判定结果写进业务表
+
+        **判定必须落在这份规范当前启用的条目上**：条目 id 来自 worker，而 worker 是照着
+        提交那一刻的条目表跑的；后台若在这期间停用了某几条，落进来就是一批孤儿 ——
+        第四步按 item_id 取要求原文会取不到，渲染成一排空白。
+
+        :param query_db: orm对象
+        :param run: 运行态快照
+        :param result: worker 的结果摘要
+        :return: 更新后的快照
+        """
+        raw_verdicts = result.get('verdicts') if isinstance(result.get('verdicts'), list) else []
+
+        # 条目取出来是**驼峰键的字典**（PageUtil.paginate 的出参），不是 ORM 对象
+        valid_ids: set[int] = set()
+        if run.guideline_id:
+            items = await ReportDraftService._items_of(query_db, run.guideline_id)
+            valid_ids = {int(it['itemId']) for it in items}
+
+        seen: set[int] = set()
+        rows: list[dict[str, Any]] = []
+        for v in raw_verdicts or []:
+            if not isinstance(v, dict):
+                continue
+            try:
+                item_id = int(v.get('itemId') or v.get('item_id') or 0)
+            except (TypeError, ValueError):
+                continue
+            status = str(v.get('status') or '')
+            if item_id not in valid_ids or item_id in seen or status not in ('reported', 'vague', 'missing'):
+                continue
+            seen.add(item_id)
+            lines = v.get('lines') or []
+            rows.append(
+                {
+                    'item_id': item_id,
+                    'status': status,
+                    'reason': str(v.get('reason') or '')[:2000],
+                    'evidence': str(v.get('evidence') or '')[:500],
+                    # 库里存逗号分隔的字符串，引擎给的是数字数组
+                    'lines': ','.join(str(int(n)) for n in lines if isinstance(n, (int, float)))[:200],
+                }
+            )
+
+        counts = Counter(r['status'] for r in rows)
+        consistency = result.get('consistency') if isinstance(result.get('consistency'), dict) else None
+        models = result.get('models') if isinstance(result.get('models'), list) else []
+
+        # 条目总数与完整度**按实际落库的行重算**，不照抄 worker 摘要里的 total/completeness。
+        # 上面那道过滤可能丢掉几条（后台在任务跑着的时候停用了条目），照抄的话历史行会显示
+        # 「共 3 条、完整度 50%」而点开只有 1 条 —— 数字与明细对不上，且对不上的方向永远是
+        # 「看起来判得比实际多」。没有可计分条目时完整度按 0
+        graded = len(rows)
+        score = sum(cls.STATUS_WEIGHT.get(r['status'], 0.0) for r in rows)
+
+        values: dict[str, Any] = {
+            'run_status': 'completed',
+            'progress': 100,
+            'error_msg': '',
+            'reported': counts.get('reported', 0),
+            'vague': counts.get('vague', 0),
+            'missing': counts.get('missing', 0),
+            'item_total': graded,
+            'completeness': round(score / graded * 100) if graded else 0,
+            'line_count': int(result.get('lineCount') or 0),
+            'truncated': '1' if result.get('truncated') else '0',
+            'models': ' / '.join(str(m) for m in models)[:200],
+            'consistency': json.dumps(consistency, ensure_ascii=False) if consistency else None,
+            'finish_time': datetime.now(),
+        }
+        try:
+            await ReportReviewDao.replace_review_items_dao(query_db, run.review_id, rows)
+            await ReportReviewDao.edit_review_dao(query_db, run.review_id, values)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        # 导入那一次跑完，把匹配到的原文段落回填进草稿条目。**只在 import 时做**：
+        # 之后每次复查都回填的话，用户在第二步的编辑会被悄无声息地盖掉一遍
+        if run.purpose == 'import' and run.draft_id:
+            try:
+                await cls._backfill_draft(query_db, run, rows)
+            except Exception as e:
+                # 回填失败不该让整次判定作废 —— 判定已经落库了，用户至少还能在第三步看结果，
+                # 也能自己去第二步逐条填。静默吞掉才是最糟的，所以记日志
+                logger.warning(f'导入回填失败 review={run.review_id} draft={run.draft_id}: {type(e).__name__}: {e}')
+
+        return replace(run, run_status='completed', progress=100, error_msg='')
+
+    @classmethod
+    async def _backfill_draft(cls, query_db: AsyncSession, run: _ReviewRun, rows: list[dict[str, Any]]) -> None:
+        """
+        按判定里的行号，从原稿还原段落、填进草稿条目
+
+        ## 为什么用行号而不是 evidence
+
+        `evidence` 是引擎截到 200 字符的**片段**，拿它当条目正文，用户在第二步看到的
+        就是一句被砍断的话。行号指向的才是完整的原文行。行号口径由引擎的 `line_map`
+        定义（**空行不占号**），后端直接 import 它，不另造实现。
+
+        ## 只填空框
+
+        已经有内容的条目一律跳过。导入那一刻草稿是全新的、框都是空的，这道判断是为
+        「同一份草稿被重复导入」之类的意外兜底 —— 覆盖用户已有的字是不能接受的。
+
+        :param query_db: orm对象
+        :param run: 运行态快照
+        :param rows: 已落库的逐条判定
+        """
+        draft = await ReportDraftDao.get_draft_by_id(query_db, run.draft_id, run.user_id)
+        if not draft or not draft.source_text:
+            return
+        source = draft.source_text
+        lines = _manuscript_line_map(source)
+
+        existing = await ReportDraftDao.get_draft_items(query_db, run.draft_id, run.user_id)
+        contents = {r.item_id: (r.content or '') for r in existing}
+
+        filled = 0
+        for r in rows:
+            item_id = int(r['item_id'])
+            if contents.get(item_id, '').strip():
+                continue
+            nums = [int(n) for n in str(r.get('lines') or '').split(',') if n.strip().isdigit()]
+            text = '\n'.join(lines[n] for n in sorted(set(nums)) if n in lines)
+            if not text.strip():
+                continue
+            contents[item_id] = text
+            filled += 1
+
+        if not filled:
+            return
+
+        items = await ReportDraftService._items_of(query_db, run.guideline_id) if run.guideline_id else []
+        valid_ids = {int(it['itemId']) for it in items}
+        try:
+            await ReportDraftDao.replace_draft_items(query_db, run.draft_id, run.user_id, contents, valid_ids)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+        logger.info(f'导入回填：草稿 {run.draft_id} 填入 {filled} 条')
+
+
+    # ------------------------------------------------------------------ 回看
+
+    @classmethod
+    async def list_history_services(cls, query_db: AsyncSession, user_id: int) -> list[ReportReviewHistoryModel]:
+        """
+        我的校验历史
+
+        顺手对账：用户关掉页面后没人再轮询，跑完的任务会一直挂在 running。这里对未终结的
+        记录补查一次 worker 状态，把结果补落库 —— **这一步就是「刷新之后还找得回来」的兜底**。
+
+        对账与取列表分成两趟：对账要提交事务，而提交会让第一趟查出来的 ORM 对象全部失效
+        （见 `_ReviewRun`），所以对账只在快照上做，改完再重新查一次列表。
+
+        :param query_db: orm对象
+        :param user_id: 访客用户id
+        :return: 历史列表
+        """
+        await cls._reconcile_pending(query_db, user_id)
+
+        records = await ReportReviewDao.get_user_reviews_dao(query_db, user_id, cls.HISTORY_LIMIT)
+
+        return [
+            ReportReviewHistoryModel(
+                reviewId=r.review_id,
+                sessionId=r.session_id or '',
+                draftId=r.draft_id,
+                guidelineCode=r.guideline_code or '',
+                runStatus=r.run_status or 'pending',
+                errorMsg=r.error_msg or '',
+                progress=r.progress or 0,
+                charCount=r.char_count or 0,
+                itemTotal=r.item_total or 0,
+                completeness=r.completeness or 0,
+                reported=r.reported or 0,
+                vague=r.vague or 0,
+                missing=r.missing or 0,
+                createTime=r.create_time,
+                finishTime=r.finish_time,
+            )
+            for r in records
+        ]
+
+    @classmethod
+    async def get_review_services(cls, query_db: AsyncSession, review_id: int, user_id: int) -> ReportReviewModel:
+        """
+        取一次校验的完整结果（历史回看）
+
+        :param query_db: orm对象
+        :param review_id: 校验记录id
+        :param user_id: 访客用户id
+        :return: 校验详情
+        :raises ServiceException: 记录不存在或不属于该用户
+        """
+        record = await ReportReviewDao.get_review_by_id_dao(query_db, review_id, user_id)
+        if not record:
+            # 「不存在」而不是「无权访问」：后者等于告诉调用方这个 id 是真的
+            raise ServiceException(message='校验记录不存在')
+
+        rows = await ReportReviewDao.get_review_items_dao(query_db, record.review_id)
+        consistency = None
+        if record.consistency:
+            try:
+                parsed = json.loads(record.consistency)
+                consistency = parsed if isinstance(parsed, dict) else None
+            except ValueError:
+                # 存进去的是引擎给的 JSON，解不动说明这一行坏了。整份详情不该因此打不开，
+                # 一致性那一段空着就是了（前台本来就按「worker 没跑这段」处理）
+                logger.warning(f'校验记录 {record.review_id} 的一致性结果解析失败')
+
+        return ReportReviewModel(
+            reviewId=record.review_id,
+            draftId=record.draft_id,
+            guidelineId=record.guideline_id,
+            guidelineCode=record.guideline_code or '',
+            sessionId=record.session_id or '',
+            runStatus=record.run_status or 'completed',
+            errorMsg=record.error_msg or '',
+            progress=record.progress or 0,
+            models=record.models or '',
+            locale=record.locale or 'zh',
+            charCount=record.char_count or 0,
+            itemTotal=record.item_total or 0,
+            completeness=record.completeness or 0,
+            reported=record.reported or 0,
+            vague=record.vague or 0,
+            missing=record.missing or 0,
+            lineCount=record.line_count or 0,
+            truncated=(record.truncated or '0') == '1',
+            manuscript=record.manuscript or '',
+            consistency=consistency,
+            verdicts=[
+                ReviewVerdictModel(
+                    itemId=r.item_id,
+                    status=r.status,
+                    reason=r.reason or '',
+                    evidence=r.evidence or '',
+                    lines=r.lines or '',
+                )
+                for r in rows
+            ],
+            createTime=record.create_time,
+            finishTime=record.finish_time,
+        )
+
+    @classmethod
+    async def delete_history_services(cls, query_db: AsyncSession, review_id: int, user_id: int) -> CrudResponseModel:
+        """
+        删除一条校验历史（记录逻辑删，稿件正文与 evidence 物理删）
+
+        「真删正文」是 014 存稿件的对价，理由见 `ReportReviewDao.soft_delete_review_dao`。
+
+        :param query_db: orm对象
+        :param review_id: 校验记录id
+        :param user_id: 访客用户id
+        :return: 操作结果
+        """
+        record = await ReportReviewDao.get_review_by_id_dao(query_db, review_id, user_id)
+        if not record:
+            raise ServiceException(message='校验记录不存在')
+        try:
+            await ReportReviewDao.soft_delete_review_dao(query_db, review_id)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return CrudResponseModel(is_success=True, message='删除成功')
+
+    @classmethod
+    async def stop_review_services(cls, query_db: AsyncSession, session_id: str, user_id: int) -> CrudResponseModel:
         """
         请求停止校验任务
 
+        :param query_db: orm对象
         :param session_id: 任务id
+        :param user_id: 访客用户id（越权保护）
         :return: 操作结果
+        :raises ServiceException: 任务不存在或不属于该用户
         """
+        # 停别人的任务本来就该拦住；014 之前这个口只认 session_id，
+        # 拿到一个 id 就能停任意用户在跑的校验
+        record = await ReportReviewDao.get_review_by_session_dao(query_db, session_id, user_id)
+        if not record:
+            raise ServiceException(message='校验任务不存在')
         try:
             async with cls._client() as client:
                 await client.stop(session_id)
@@ -1205,6 +1841,188 @@ class StudyTypeService:
             for t in types
         ]
 
+
+    # ------------------------------------------------------------------ 后台管理
+    #
+    # 「研究类型管理」页面。这张表是**报告助手第一步的问卷词表**，与
+    # `action_guideline_category`（规范目录的陈列分类）用途不同、不要合并 ——
+    # 同一类研究在两边取同样的 key，但不构成外键关系。
+
+    @classmethod
+    async def _assert_hot_guideline(cls, query_db: AsyncSession, code: str) -> None:
+        """
+        校验重点推荐规范：必须存在，且**真有 checklist 条目**
+
+        `hot_guideline` 决定第二步展开哪份 checklist。指向一份不存在或 0 条目的规范，
+        表现是「第一步选得出来、第二步一片空白」，而且要等用户走到第二步才发现。
+        眼下 `obs → STROBE` 就是 0 条（仓库里没有 STROBE 的中英素材），所以 0 条**只警告不拦**
+        —— 拦死就没法先把类型建起来、素材后补。不存在的代号则直接拦。
+
+        :param query_db: orm对象
+        :param code: 规范代号
+        :raises ServiceException: 代号在 action_guideline 里不存在
+        """
+        if not code:
+            return
+        guideline = await GuidelineDao.get_guideline_by_code(query_db, code)
+        if not guideline:
+            raise ServiceException(
+                message=f'重点推荐规范 {code} 不存在；它决定第二步展开哪份 checklist，'
+                f'请先在「规范目录管理」中建好这份规范'
+            )
+
+    @classmethod
+    async def get_study_type_page_services(
+        cls, query_db: AsyncSession, keyword: str | None = None
+    ) -> list[StudyTypeModel]:
+        """
+        后台列表。**不分页** —— 这是张词表，眼下 8 行，可预见也就十几行
+
+        :param query_db: orm对象
+        :param keyword: 按标识或名称模糊搜索
+        :return: 研究类型列表（含两张子表）
+        """
+        rows = await cls.get_study_type_tree_services(query_db)
+        kw = (keyword or '').strip().lower()
+        if not kw:
+            return rows
+
+        return [
+            r
+            for r in rows
+            if kw in (r.type_key or '').lower()
+            or kw in (r.name_zh or '').lower()
+            or kw in (r.name_en or '').lower()
+        ]
+
+    @classmethod
+    async def add_study_type_services(
+        cls, query_db: AsyncSession, save: StudyTypeSaveModel, operator: str
+    ) -> CrudResponseModel:
+        """
+        新增研究类型
+
+        :param query_db: orm对象
+        :param save: 入参
+        :param operator: 操作人
+        :return: 新增结果
+        """
+        if await StudyTypeDao.get_study_type_by_key(query_db, save.type_key):
+            raise ServiceException(message=f'新增失败，类型标识 {save.type_key} 已存在')
+        await cls._assert_hot_guideline(query_db, save.hot_guideline)
+
+        sort_num = save.sort_num
+        if sort_num is None:
+            sort_num = await StudyTypeDao.get_max_type_sort_num(query_db) + 1
+        try:
+            obj = ActionStudyType(
+                type_key=save.type_key,
+                name_zh=save.name_zh,
+                name_en=save.name_en,
+                hot_guideline=save.hot_guideline,
+                sort_num=sort_num,
+                status=save.status,
+                create_by=operator,
+                create_time=datetime.now(),
+                update_by=operator,
+                update_time=datetime.now(),
+            )
+            await StudyTypeDao.add_study_type_dao(query_db, obj)
+            await StudyTypeDao.replace_type_children_dao(
+                query_db, obj.type_id, save.guidelines, [(s.text_zh or '', s.text_en or '') for s in save.stats]
+            )
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        # 前台选项是写死的数组 + i18n 键，光入库还看不见 —— 这句话必须让操作者当场读到
+        return CrudResponseModel(
+            is_success=True,
+            message=f'新增成功。注意：前台第一步的选项还需开发同步 '
+            f'`composables/wizardQuery.ts` 的 TYPE_OPTS 与文案键 assistant.typeOpt.{save.type_key}，'
+            f'否则这个类型在官网上选不出来',
+        )
+
+    @classmethod
+    async def edit_study_type_services(
+        cls, query_db: AsyncSession, save: StudyTypeSaveModel, operator: str
+    ) -> CrudResponseModel:
+        """
+        编辑研究类型
+
+        :param query_db: orm对象
+        :param save: 入参
+        :param operator: 操作人
+        :return: 编辑结果
+        """
+        current = await StudyTypeDao.get_study_type_by_id(query_db, save.type_id or 0)
+        if not current:
+            raise ServiceException(message='研究类型不存在')
+        old_key = current.type_key
+        await cls._assert_hot_guideline(query_db, save.hot_guideline)
+
+        if save.type_key != old_key:
+            exist = await StudyTypeDao.get_study_type_by_key(query_db, save.type_key)
+            if exist and exist.type_id != save.type_id:
+                raise ServiceException(message=f'修改失败，类型标识 {save.type_key} 已存在')
+
+        try:
+            await StudyTypeDao.edit_study_type_dao(
+                query_db,
+                save.type_id,
+                {
+                    'type_key': save.type_key,
+                    'name_zh': save.name_zh,
+                    'name_en': save.name_en,
+                    'hot_guideline': save.hot_guideline,
+                    'sort_num': save.sort_num if save.sort_num is not None else current.sort_num,
+                    'status': save.status,
+                    'update_by': operator,
+                    'update_time': datetime.now(),
+                },
+            )
+            await StudyTypeDao.replace_type_children_dao(
+                query_db, save.type_id, save.guidelines, [(s.text_zh or '', s.text_en or '') for s in save.stats]
+            )
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        if save.type_key != old_key:
+            # 改键 = 前台那个选项的文案退化成键名本身，且老键的 i18n 词条成了孤儿
+            return CrudResponseModel(
+                is_success=True,
+                message=f'更新成功。注意：类型标识由 {old_key} 改为 {save.type_key}，'
+                f'前台的 TYPE_OPTS 与文案键 assistant.typeOpt.* 需同步改，否则该选项会显示成键名',
+            )
+
+        return CrudResponseModel(is_success=True, message='更新成功')
+
+    @classmethod
+    async def delete_study_type_services(cls, query_db: AsyncSession, type_ids: str) -> CrudResponseModel:
+        """
+        删除研究类型（连同两张子表）
+
+        :param query_db: orm对象
+        :param type_ids: 类型id字符串，多个以逗号分隔
+        :return: 删除结果
+        """
+        id_list = [int(i) for i in type_ids.split(',') if i.strip()]
+        if not id_list:
+            raise ServiceException(message='传入类型id为空')
+        try:
+            await StudyTypeDao.delete_study_types_dao(query_db, id_list)
+            await query_db.commit()
+
+            return CrudResponseModel(
+                is_success=True,
+                message='删除成功。若前台 TYPE_OPTS 里还留着这个标识，那个选项会匹配不到规范，请一并清理',
+            )
+        except Exception as e:
+            await query_db.rollback()
+            raise e
 
 class ImplementationService:
     """
@@ -1368,6 +2186,9 @@ class SrdService:
     #: 评分 → 分数。与 `srd_engine.schemas.RATING_SCORE` 同一张表；
     #: 这里不 import 引擎（后端进程不该为了 5 个键去加载 pydantic 模型与 yaml 口径），
     #: 但两处必须一致，改引擎的评分档位时记得同步这里。
+    #:
+    #: **rating 键就是分数本身**，引擎 0.8.0 翻转的是标签不是这层映射，所以这张表一字未动：
+    #: 3 = 完全相同（最重复）… 0 = 完全不同。分越高越重复，别照着 Excel 表 1 的表头读反。
     RATING_SCORE: ClassVar[dict[str, int | None]] = {'0': 0, '1': 1, '2': 2, '3': 3, 'unclear': None}
 
     # ------------------------------------------------------------------ 投递
@@ -2231,3 +3052,948 @@ class CollabRequestService:
         except Exception as e:
             await query_db.rollback()
             raise e
+
+
+class ReportDraftService:
+    """
+    报告草稿服务层（报告助手第二步）
+
+    文档 2 要的是「含必填/选填的编辑页 + 一键生成标准化报告初稿 + 关键参数一次定义、
+    全文联动」。这里负责草稿的增删改查与合成调度，**合成算法本身在
+    `report_compose_service`**（纯函数、离线可单测），本类只做取数与拼装。
+
+    越权保护在 `ReportDraftDao` 的 where 里，本层不重复判 user_id；
+    取不到就统一报「草稿不存在」——**不区分「不存在」与「不是你的」**，
+    否则拿 id 逐个试就能探出别人有几份草稿。
+    """
+
+    #: 单个访客的草稿数上限。一份草稿最多几十条正文，30 份足够一个课题组用，
+    #: 同时挡住「脚本无限建草稿」把库撑大
+    MAX_DRAFTS_PER_USER = 30
+    #: 列表一次最多回多少条
+    LIST_LIMIT = 50
+
+    # ------------------------------------------------------------------ 取数
+
+    @classmethod
+    async def _items_of(cls, query_db: AsyncSession, guideline_id: int) -> list[dict[str, Any]]:
+        """
+        取某规范的全部启用条目（已按展示顺序排好）
+
+        :param query_db: orm对象
+        :param guideline_id: 规范id
+        :return: 条目字典列表（驼峰键）
+        """
+        result = await GuidelineItemDao.get_item_list(
+            query_db, GuidelineItemPageQueryModel(guidelineId=guideline_id), is_page=False, only_published=True
+        )
+
+        return list(result) if isinstance(result, list) else []
+
+    @classmethod
+    def _to_model(
+        cls,
+        draft: Any,
+        code: str,
+        require_map: dict[int, str],
+        filled_ids: set[int],
+        contents: dict[int, str] | None = None,
+    ) -> ReportDraftModel:
+        """
+        把一份草稿装成出参模型，顺带算完成度
+
+        完成度**现算不落库**：存冗余计数就要在每次保存、每次后台改条目填写要求时同步维护，
+        算一遍的成本远低于维护一致性的成本。
+
+        计数只认 `require_map` 里的条目（当前规范下仍启用的那些）：草稿里可能留着
+        已被后台停用的条目正文，把它算进「已填」会让完成度虚高，用户按着 100% 去投稿。
+
+        :param draft: 草稿 ORM 对象
+        :param code: 规范代号
+        :param require_map: 条目id -> require_level（该规范当前启用的全部条目）
+        :param filled_ids: 已填写的条目id集合（可能含已下线条目）
+        :param contents: 条目id -> 正文；给 None 表示这次不带逐条正文（列表页）
+        :return: 草稿模型
+        """
+        filled = filled_ids & set(require_map)
+        required_ids = {item_id for item_id, level in require_map.items() if level == '0'}
+
+        return ReportDraftModel(
+            draftId=draft.draft_id,
+            guidelineId=draft.guideline_id,
+            guidelineCode=code,
+            studyTypeKey=draft.study_type_key or '',
+            title=draft.title or '',
+            items=(
+                [ReportDraftItemModel(itemId=item_id, content=text) for item_id, text in sorted(contents.items())]
+                if contents is not None
+                else []
+            ),
+            itemTotal=len(require_map),
+            filledCount=len(filled),
+            requiredTotal=len(required_ids),
+            requiredFilled=len(filled & required_ids),
+            createTime=draft.create_time,
+            updateTime=draft.update_time,
+        )
+
+    @classmethod
+    async def _load(cls, query_db: AsyncSession, draft_id: int, user_id: int) -> tuple[Any, str, list[dict[str, Any]]]:
+        """
+        取草稿 + 它所依据的规范代号 + 该规范的条目
+
+        :param query_db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 访客用户id
+        :return: (草稿对象, 规范代号, 条目列表)
+        """
+        draft = await ReportDraftDao.get_draft_by_id(query_db, draft_id, user_id)
+        if not draft:
+            raise ServiceException(message='草稿不存在')
+        guideline = await GuidelineDao.get_guideline_detail_by_id(query_db, draft.guideline_id)
+        items = await cls._items_of(query_db, draft.guideline_id)
+
+        return draft, (guideline.code if guideline else ''), items
+
+    # ------------------------------------------------------------------ 增删改查
+
+    @classmethod
+    async def list_drafts_services(cls, query_db: AsyncSession, user_id: int) -> list[ReportDraftModel]:
+        """
+        我的草稿列表（不带逐条正文）
+
+        :param query_db: orm对象
+        :param user_id: 访客用户id
+        :return: 草稿列表
+        """
+        drafts = await ReportDraftDao.get_draft_list(query_db, user_id, cls.LIST_LIMIT)
+        if not drafts:
+            return []
+
+        # 规范代号与条目按 guideline_id 只查一次：一个用户的草稿多半集中在一两份规范上，
+        # 逐份草稿各查一遍等于把同一条查询跑 N 遍
+        codes: dict[int, str] = {}
+        require_cache: dict[int, dict[int, str]] = {}
+        for gid in {d.guideline_id for d in drafts}:
+            guideline = await GuidelineDao.get_guideline_detail_by_id(query_db, gid)
+            codes[gid] = guideline.code if guideline else ''
+            require_cache[gid] = await ReportDraftDao.get_item_require_map(query_db, gid)
+
+        # 一条查询取回全部草稿的「哪些条目已填」，**不读正文**：列表只需要计数，
+        # 而正文是这张表里唯一的大字段（单条上限两万字符 × 几十条 × 最多 30 份草稿）
+        filled_map = await ReportDraftDao.get_filled_item_ids(query_db, [d.draft_id for d in drafts], user_id)
+
+        return [
+            cls._to_model(
+                draft,
+                codes[draft.guideline_id],
+                require_cache[draft.guideline_id],
+                filled_map.get(draft.draft_id, set()),
+            )
+            for draft in drafts
+        ]
+
+    @classmethod
+    async def create_draft_services(
+        cls, query_db: AsyncSession, create: ReportDraftCreateModel, user_id: int
+    ) -> ReportDraftModel:
+        """
+        新建一份草稿
+
+        :param query_db: orm对象
+        :param create: 新建入参
+        :param user_id: 访客用户id
+        :return: 新建的草稿（带空的逐条正文）
+        """
+        guideline = await GuidelineDao.get_guideline_by_code(query_db, create.guideline_code)
+        if not guideline:
+            raise ServiceException(message=f'报告规范 {create.guideline_code} 不存在')
+
+        items = await cls._items_of(query_db, guideline.guideline_id)
+        if not items:
+            # 与第三步同一道闸：一条条目都没有的规范，建出来的草稿是个空壳
+            raise ServiceException(message=f'报告规范 {create.guideline_code} 尚未录入 checklist 条目')
+
+        if await ReportDraftDao.count_drafts(query_db, user_id) >= cls.MAX_DRAFTS_PER_USER:
+            raise ServiceException(message=f'草稿数已达上限（{cls.MAX_DRAFTS_PER_USER} 份），请先删除不用的草稿')
+
+        # **commit 之前先把要用的值抄成普通变量**：会话是 expire_on_commit=True，
+        # commit 会让所有 ORM 对象的属性失效，下一次读属性触发的是一次懒加载，
+        # 而在 async 会话里那会直接抛 MissingGreenlet（CLAUDE.md 里 SRD 那条链路记着同一个坑）。
+        # 主键也不例外 —— 连 draft.draft_id 都读不得。
+        code = guideline.code
+        guideline_id = guideline.guideline_id
+        now = datetime.now()
+        try:
+            draft = await ReportDraftDao.add_draft_dao(
+                query_db,
+                {
+                    'user_id': user_id,
+                    'guideline_id': guideline_id,
+                    'study_type_key': create.study_type_key,
+                    'title': create.title.strip() or f'{code} 报告初稿',
+                    'create_by': str(user_id),
+                    'create_time': now,
+                    'update_by': str(user_id),
+                    'update_time': now,
+                },
+            )
+            # add_draft_dao 里已经 flush 过，这时主键已经有值，趁 commit 之前抄下来
+            new_draft_id = draft.draft_id
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        fresh = await ReportDraftDao.get_draft_by_id(query_db, new_draft_id, user_id)
+        require_map = {int(it['itemId']): (it.get('requireLevel') or '0') for it in items}
+
+        return cls._to_model(fresh, code, require_map, set(), {})
+
+    #: 导入稿件的大小上限。一篇论文正文常规在几十 KB；10MB 足够带图表，
+    #: 再大多半是插了大量图片的 docx —— 图片对条目映射毫无用处，只会拖慢解析
+    MAX_IMPORT_BYTES = 10 * 1024 * 1024
+
+    @classmethod
+    async def import_manuscript_services(
+        cls,
+        query_db: AsyncSession,
+        user_id: int,
+        guideline_code: str,
+        study_type_key: str,
+        title: str,
+        filename: str,
+        data: bytes,
+        locale: str = 'zh',
+    ) -> DraftImportResultModel:
+        """
+        导入一份已有稿件：建草稿 → 存原稿 → 提交条目映射任务
+
+        ## 这个口补的是哪个洞
+
+        导入此前只在第三步，而第三步只产出**只读**判定：第四步没有草稿条目可写回，
+        第五步的数据源是草稿于是整个导不出，下次再来还得重新粘一遍。而「哪些条目没覆盖」
+        第三步其实已经算出来了 —— 缺的只是把它落成一份可继续加工的草稿。
+
+        ## 原稿与条目框两份并存
+
+        `source_text` 存整篇原稿，**导出正文以它为准**；条目框只装「从原稿里摘出来的
+        对应段落」，是对照与改写的工作面。不这么分的话，导出拼回来的就不是用户写的那篇
+        稿子了 —— 一句话常同时答好几条，而讨论、致谢、参考文献不对应任何条目、会凭空消失。
+
+        ## 映射是异步的
+
+        建草稿是同步的（所以立刻有 draftId），回填要等 worker 跑完条目映射。
+        复用第三步那套队列与引擎，只是 `purpose='import'` —— 跑完那一下才回填。
+
+        :param query_db: orm对象
+        :param user_id: 访客用户id
+        :param guideline_code: 规范代号
+        :param study_type_key: 第一步判定的研究类型，仅作留档
+        :param title: 草稿名称，留空由后端起一个
+        :param filename: 原始文件名
+        :param data: 文件字节
+        :param locale: 判定语言
+        :return: 导入回执
+        :raises ServiceException: 文件解析失败、规范不存在或无条目、草稿数超限
+        """
+        from module_action.service.manuscript_parse import (  # noqa: PLC0415
+            ManuscriptParseError,
+            parse_manuscript,
+        )
+
+        limit_mb = cls.MAX_IMPORT_BYTES // 1024 // 1024
+        if len(data) > cls.MAX_IMPORT_BYTES:
+            raise ServiceException(message=f'文件超过 {limit_mb}MB 上限')
+
+        # 解析放在 CPU 线程里：pymupdf/python-docx 都是同步阻塞的，
+        # 一份几十页的 PDF 能占住事件循环好几百毫秒
+        try:
+            source_text = await asyncio.to_thread(parse_manuscript, filename, data)
+        except ManuscriptParseError as e:
+            raise ServiceException(message=str(e)) from e
+
+        # 与第三步同一道下限：太短的稿件判不出东西，白跑几十次模型调用
+        if len(source_text) < MIN_MANUSCRIPT_CHARS:
+            raise ServiceException(
+                message=f'从文件里只读到 {len(source_text)} 个字符，不足 {MIN_MANUSCRIPT_CHARS}，请确认这是稿件正文'
+            )
+
+        guideline = await GuidelineDao.get_guideline_by_code(query_db, guideline_code)
+        if not guideline:
+            raise ServiceException(message=f'报告规范 {guideline_code} 不存在')
+        code = guideline.code
+        guideline_id = guideline.guideline_id
+
+        items = await cls._items_of(query_db, guideline_id)
+        if not items:
+            raise ServiceException(message=f'报告规范 {code} 尚未录入 checklist 条目')
+
+        if await ReportDraftDao.count_drafts(query_db, user_id) >= cls.MAX_DRAFTS_PER_USER:
+            raise ServiceException(message=f'草稿数已达上限（{cls.MAX_DRAFTS_PER_USER} 份），请先删除不用的草稿')
+
+        # 行号口径由引擎定义（空行不占号），这里只是为了在列表里显示「导入 N 行」
+        line_count = len(_manuscript_line_map(source_text))
+        safe_name = (filename or '')[:255]
+        now = datetime.now()
+        try:
+            draft = await ReportDraftDao.add_draft_dao(
+                query_db,
+                {
+                    'user_id': user_id,
+                    'guideline_id': guideline_id,
+                    'study_type_key': study_type_key,
+                    'title': title.strip() or f'{code} · {Path(safe_name).stem or "导入稿件"}'[:300],
+                    'source_text': source_text,
+                    'source_name': safe_name,
+                    'source_lines': line_count,
+                    'create_by': str(user_id),
+                    'create_time': now,
+                    'update_by': str(user_id),
+                    'update_time': now,
+                },
+            )
+            # commit 之后连主键都读不得（expire_on_commit），趁现在抄下来
+            new_draft_id = draft.draft_id
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        # 提交条目映射。**草稿已经建好了**，所以即使这一步失败，用户手上仍有一份存着
+        # 原稿的草稿，可以在第三步手动跑一次校验 —— 不至于整个白导
+        submit = ChecklistReviewSubmitModel(
+            guidelineCode=code, manuscript=source_text, locale=locale, draftId=new_draft_id
+        )
+        ticket = await ChecklistReviewService.submit_review_services(
+            query_db, submit, user_id, purpose='import'
+        )
+
+        return DraftImportResultModel(
+            draftId=new_draft_id,
+            sessionId=ticket.session_id,
+            reviewId=ticket.review_id,
+            sourceName=safe_name,
+            sourceLines=line_count,
+            charCount=len(source_text),
+        )
+
+    @classmethod
+    async def get_draft_services(cls, query_db: AsyncSession, draft_id: int, user_id: int) -> ReportDraftModel:
+        """
+        取一份草稿详情（带逐条正文）
+
+        :param query_db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 访客用户id
+        :return: 草稿详情
+        """
+        draft, code, items = await cls._load(query_db, draft_id, user_id)
+        rows = await ReportDraftDao.get_draft_items(query_db, draft_id, user_id)
+        require_map = {int(it['itemId']): (it.get('requireLevel') or '0') for it in items}
+
+        # **只回当前仍启用的条目的正文**。管理员停用/删除一条 checklist 条目后，草稿里那条
+        # 正文就没有输入框可承载了；照旧回给前端的话，前端会把它原样回传，而保存接口按
+        # 「条目必须属于当前规范」判定 —— 于是这份草稿从此每次保存都失败，用户还没有任何
+        # 途径把它清掉。库里那行不动（见 replace_draft_items 的 scope_ids），条目恢复启用就回来了
+        all_contents = {row.item_id: row.content or '' for row in rows}
+        contents = {item_id: text for item_id, text in all_contents.items() if item_id in require_map}
+        filled_ids = {item_id for item_id, text in all_contents.items() if text.strip()}
+
+        return cls._to_model(draft, code, require_map, filled_ids, contents)
+
+    @classmethod
+    async def save_draft_services(
+        cls, query_db: AsyncSession, draft_id: int, save: ReportDraftSaveModel, user_id: int
+    ) -> ReportDraftModel:
+        """
+        保存一份草稿（整体覆盖）
+
+        :param query_db: orm对象
+        :param draft_id: 草稿id
+        :param save: 保存入参
+        :param user_id: 访客用户id
+        :return: 保存后的草稿详情
+        """
+        draft, code, items = await cls._load(query_db, draft_id, user_id)
+
+        # 条目必须属于这份草稿所依据的规范：不校验的话，随手改个 item_id 就能往
+        # 别的规范的条目上写内容，合成时永远取不出来，表现成「保存成功但内容丢了」
+        valid_ids = {int(it['itemId']) for it in items}
+        contents = {it.item_id: it.content for it in save.items}
+        stray = sorted(set(contents) - valid_ids)
+        if stray:
+            raise ServiceException(message=f'条目 {stray[:5]} 不属于当前报告规范')
+
+        try:
+            await ReportDraftDao.edit_draft_dao(
+                query_db,
+                draft_id,
+                user_id,
+                {
+                    'title': save.title.strip() or draft.title,
+                    'update_by': str(user_id),
+                    'update_time': datetime.now(),
+                },
+            )
+            # 只覆盖当前规范仍启用的那些条目，草稿里已下线条目的正文原样留着
+            await ReportDraftDao.replace_draft_items(query_db, draft_id, user_id, contents, valid_ids)
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        fresh = await ReportDraftDao.get_draft_by_id(query_db, draft_id, user_id)
+        rows = await ReportDraftDao.get_draft_items(query_db, draft_id, user_id)
+        require_map = {int(it['itemId']): (it.get('requireLevel') or '0') for it in items}
+        filled_ids = {row.item_id for row in rows if (row.content or '').strip()}
+
+        return cls._to_model(fresh, code, require_map, filled_ids, contents)
+
+    @classmethod
+    async def delete_draft_services(cls, query_db: AsyncSession, draft_id: int, user_id: int) -> CrudResponseModel:
+        """
+        删除一份草稿（逻辑删除，条目正文物理删）
+
+        :param query_db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 访客用户id
+        :return: 删除结果
+        """
+        draft = await ReportDraftDao.get_draft_by_id(query_db, draft_id, user_id)
+        if not draft:
+            raise ServiceException(message='草稿不存在')
+        try:
+            await ReportDraftDao.delete_draft_dao(query_db, draft_id, user_id)
+            # 校验记录不跟着删，只摘掉 draft_id：014 起每条记录自带稿件快照，
+            # 它是一条能独立回看的历史，跟着草稿删等于用户没要求过的数据丢失
+            await ReportReviewDao.detach_reviews_of_draft_dao(query_db, draft_id)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='删除成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    # ------------------------------------------------------------------ 合成初稿
+
+    @classmethod
+    async def compose_draft_services(
+        cls, query_db: AsyncSession, draft_id: int, user_id: int, locale: str = 'zh'
+    ) -> ReportDraftComposeModel:
+        """
+        把一份草稿合成为报告初稿正文
+
+        :param query_db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 访客用户id
+        :param locale: 输出语言（zh / en）
+        :return: 合成结果
+        """
+        draft, _code, items = await cls._load(query_db, draft_id, user_id)
+        rows = await ReportDraftDao.get_draft_items(query_db, draft_id, user_id)
+        contents = {row.item_id: row.content or '' for row in rows}
+
+        lang = 'en' if locale == 'en' else 'zh'
+        # 已被后台停用/删除的条目，它的正文仍是用户写的东西 —— 合成时不能因为「没有对应条目」
+        # 就静默丢掉，那会让用户拿到一份看起来完整、实际少了几段的初稿。挪到末尾单独成节
+        valid_ids = {int(it['itemId']) for it in items}
+        orphan_texts = [
+            text.strip() for item_id, text in sorted(contents.items()) if item_id not in valid_ids and text.strip()
+        ]
+
+        # 一条正文都没有 —— 合出来只会是一串「待补充」，
+        # 送去第三步等于让模型对着一份空稿判几十条「未报告」，白烧一次调用
+        if not any((text or '').strip() for text in contents.values()):
+            raise ServiceException(message='草稿还没有任何内容，请先填写至少一条')
+
+        # 条目要求原文（contentZh/En）**不往下传**：合成层拿不到它，就不可能把它写进稿件，
+        # 见 `report_compose_service` 的模块 docstring
+        compose_items = [
+            ComposeItem(
+                item_id=int(it['itemId']),
+                domain=(it.get('domainEn') if lang == 'en' else it.get('domainZh')) or '',
+                item_no=(it.get('itemNoEn') if lang == 'en' else it.get('itemNoZh')) or '',
+                require_level=(it.get('requireLevel') or '0'),
+            )
+            for it in items
+        ]
+        result = compose_draft_text(draft.title or '', compose_items, contents, lang, orphan_texts)
+
+        return ReportDraftComposeModel(
+            draftId=draft_id,
+            text=result.text,
+            charCount=result.char_count,
+            missingRequired=result.missing_required,
+        )
+
+
+    @classmethod
+    async def export_draft_services(
+        cls, query_db: AsyncSession, draft_id: int, user_id: int, fmt: str = 'docx', locale: str = 'zh'
+    ) -> tuple[bytes, str, str, str]:
+        """
+        导出一份草稿（第五步）
+
+        **数据源是业务库，不是第二步合成的那份文本** —— 那是个瞬时产物，用户可能压根没点过
+        「生成初稿」。三种格式回答三个不同的问题，见 `report_export_service` 的模块 docstring。
+
+        判定列（第三步的校验结果）取最近一次；没跑过校验就整列留空，不报错 ——
+        导出不该被「还没校验」挡住。
+
+        :param query_db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 访客用户id
+        :param fmt: docx / xlsx / json
+        :param locale: 语言（zh / en）
+        :return: (文件字节, 文件名, media type, 扩展名)
+        :raises ServiceException: 草稿不存在，或格式不认识
+        """
+        builder = BUILDERS.get(fmt)
+        if not builder:
+            raise ServiceException(message=f'不支持的导出格式：{fmt}')
+        build, ext, media_type = builder
+
+        draft, code, items = await cls._load(query_db, draft_id, user_id)
+        title = draft.title or ''
+        # 导入来的草稿带着原稿：docx 正文以它为准（见 `ExportDraft.source_text` 的注释）
+        source_text = draft.source_text or ''
+        rows = await ReportDraftDao.get_draft_items(query_db, draft_id, user_id)
+        contents = {r.item_id: (r.content or '') for r in rows}
+
+        # 第三步的判定：有就带上，没有就整列留空。导出不该被「还没校验」挡住
+        verdicts: dict[int, str] = {}
+        review = await ReportReviewDao.get_latest_review_dao(query_db, draft_id, user_id)
+        if review:
+            verdicts = {
+                r.item_id: r.status
+                for r in await ReportReviewDao.get_review_items_dao(query_db, review.review_id)
+            }
+
+        lang = 'en' if locale == 'en' else 'zh'
+
+        def pick(item: dict[str, Any], zh_key: str, en_key: str) -> str:
+            if lang == 'en':
+                return item.get(en_key) or item.get(zh_key) or ''
+            return item.get(zh_key) or ''
+
+        export_items = [
+            ExportItem(
+                item_id=int(it['itemId']),
+                item_no=pick(it, 'itemNoZh', 'itemNoEn'),
+                domain=pick(it, 'domainZh', 'domainEn'),
+                requirement=pick(it, 'contentZh', 'contentEn'),
+                require_level=(it.get('requireLevel') or '0'),
+                content=contents.get(int(it['itemId']), ''),
+                verdict=verdicts.get(int(it['itemId']), ''),
+            )
+            for it in items
+        ]
+        payload = build(
+            ExportDraft(
+                title=title, guideline_code=code, items=tuple(export_items), source_text=source_text
+            ),
+            lang,
+        )
+
+        # 文件名里带草稿名，但**只保留安全字符**：这个值进 Content-Disposition，
+        # 用户能自取的字符串里混进换行或引号就能往响应头里注入
+        safe = re.sub(r'[^0-9A-Za-z一-鿿_-]+', '_', title).strip('_') or code or 'report'
+
+        return payload, f'{safe[:60]}.{ext}', media_type, ext
+
+class ReportReviewService:
+    """
+    第四步的工作清单与改写（报告助手 2→3→4→2 这个环的后半段）
+
+    ## 这个类存在的理由
+
+    第四步原先是一屏静态演示，对前三步状态的引用次数是 0 —— 既没有输入也没有输出。
+    照文档字面实现（一个关键词框 → AI 续写一段）它**依然**是独立的：不知道你在写哪份稿、
+    依据哪份规范、哪几条没写好。文档那句「遵循 STRICTA 条目规范」只有在「你正站在某一条上」
+    时才有意义。
+
+    所以第四步改成一张工作清单：输入是第三步对**这份草稿**的判定，输出写回
+    `action_report_draft_item`。链路因此闭合成 2（填）→ 3（判）→ 4（改）→ 2（回写）。
+
+    ## 落库不在这里
+
+    014 起判定由 `ChecklistReviewService` 在轮询到终态时落库 —— 这里只**读**最近一次判定。
+    此前是前端在拿到结果那一刻另调一个写入口（`POST /report-reviews`，已撤），
+    那条路径有两个后果：用户中途刷新就没人来落库，以及外部粘贴的稿件永远进不了库。
+    两条写入路径并存必然漂移，所以撤掉一条而不是两条都留。
+    """
+
+    @classmethod
+    async def get_latest_review_services(
+        cls, query_db: AsyncSession, draft_id: int, user_id: int
+    ) -> ReportReviewModel:
+        """
+        取某份草稿最近一次跑完的校验（第四步工作清单的数据源）
+
+        **没有校验过不算错**：返回一个 reviewId 为空的壳，前台据此显示「先去第三步跑一次」。
+        报错会让「还没跑过」和「出问题了」长得一模一样。
+
+        **不带 manuscript**：第四步要的是「哪几条待办」，整篇稿件在这里没有用途，
+        而它是这条链路上最不该顺手多发一遍的东西。
+
+        :param query_db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 访客用户id
+        :return: 校验记录；没跑过时 reviewId 为 None
+        """
+        review = await ReportReviewDao.get_latest_review_dao(query_db, draft_id, user_id)
+        if not review:
+            return ReportReviewModel(draftId=draft_id)
+        rows = await ReportReviewDao.get_review_items_dao(query_db, review.review_id)
+
+        return ReportReviewModel(
+            reviewId=review.review_id,
+            draftId=review.draft_id,
+            guidelineId=review.guideline_id,
+            guidelineCode=review.guideline_code or '',
+            runStatus=review.run_status or 'completed',
+            reported=review.reported or 0,
+            vague=review.vague or 0,
+            missing=review.missing or 0,
+            completeness=review.completeness or 0,
+            itemTotal=review.item_total or 0,
+            lineCount=review.line_count or 0,
+            verdicts=[
+                ReviewVerdictModel(
+                    itemId=r.item_id,
+                    status=r.status,
+                    reason=r.reason or '',
+                    evidence=r.evidence or '',
+                    lines=r.lines or '',
+                )
+                for r in rows
+            ],
+            createTime=review.create_time,
+            finishTime=review.finish_time,
+        )
+
+    @staticmethod
+    def _pick_item(item: dict[str, Any], lang: str) -> dict[str, str]:
+        """
+        按语言取条目的四个文案字段
+
+        :param item: 条目字典（驼峰键）
+        :param lang: 语言（zh / en）
+        :return: item_no / domain / requirement / extension
+        """
+
+        def pick(zh_key: str, en_key: str) -> str:
+            if lang == 'en':
+                return item.get(en_key) or item.get(zh_key) or ''
+            return item.get(zh_key) or ''
+
+        return {
+            'item_no': pick('itemNoZh', 'itemNoEn'),
+            'domain': pick('domainZh', 'domainEn'),
+            'requirement': pick('contentZh', 'contentEn'),
+            'extension': pick('extensionZh', 'extensionEn'),
+        }
+
+    @classmethod
+    async def _context_of(cls, query_db: AsyncSession, req: AssistRequestModel, user_id: int, lang: str) -> AssistContext:
+        """
+        为一次改写攒齐上下文
+
+        **两条路，由 `draft_id` 分**：
+
+        · **草稿路径**（带 draft_id + item_id）：条目要求 + 用户已写的正文 + 第三步对这一条
+          的判定，全部从库里取，改完能写回。
+        · **独立路径**（不带 draft_id）：正文用前端传来的 `text`，规范上下文取自
+          `guideline_code`（第一步的结果），`item_id` 可选 —— 给了就连条目要求一起带上。
+          这是文档第 4 节的字面形态，也是唯一一条已写好稿、没有草稿的用户走得通的路。
+
+        **条目要求永远从库里取，两条路都一样**：前端能传的话，它就成了一个可伪造的
+        任意指令注入口。能由前端给的只有用户自己手打的 `text`。
+
+        :param query_db: orm对象
+        :param req: 改写请求
+        :param user_id: 访客用户id
+        :param lang: 语言（zh / en）
+        :return: 改写上下文
+        :raises ServiceException: 草稿不存在，或条目不属于对应的规范
+        """
+        if req.draft_id is not None and req.item_id is not None:
+            return await cls._context_from_draft(query_db, req.draft_id, req.item_id, user_id, lang)
+
+        return await cls._context_standalone(query_db, req, lang)
+
+    @classmethod
+    async def _context_from_draft(
+        cls, query_db: AsyncSession, draft_id: int, item_id: int, user_id: int, lang: str
+    ) -> AssistContext:
+        """
+        草稿路径的上下文：条目要求 + 用户已写的正文 + 第三步对这一条的判定
+
+        :param query_db: orm对象
+        :param draft_id: 草稿id
+        :param item_id: 条目id
+        :param user_id: 访客用户id
+        :param lang: 语言（zh / en）
+        :return: 改写上下文
+        :raises ServiceException: 草稿不存在，或条目不属于这份草稿所依据的规范
+        """
+        _draft, code, items = await ReportDraftService._load(query_db, draft_id, user_id)
+        item = next((it for it in items if int(it['itemId']) == item_id), None)
+        if item is None:
+            raise ServiceException(message='该条目不属于当前报告规范')
+
+        rows = await ReportDraftDao.get_draft_items(query_db, draft_id, user_id)
+        current = next((r.content or '' for r in rows if r.item_id == item_id), '')
+
+        verdict, reason = '', ''
+        review = await ReportReviewDao.get_latest_review_dao(query_db, draft_id, user_id)
+        if review:
+            judged = await ReportReviewDao.get_review_items_dao(query_db, review.review_id)
+            hit = next((r for r in judged if r.item_id == item_id), None)
+            if hit:
+                verdict, reason = hit.status, (hit.reason or '')
+
+        return AssistContext(
+            guideline_code=code,
+            current_text=current,
+            verdict=verdict,
+            verdict_reason=reason,
+            **cls._pick_item(item, lang),
+        )
+
+    @classmethod
+    async def _context_standalone(
+        cls, query_db: AsyncSession, req: AssistRequestModel, lang: str
+    ) -> AssistContext:
+        """
+        独立路径的上下文：用户自己给的正文 +（可选的）规范与条目
+
+        规范代号只做展示与「按哪份规范写」的指令，**查不到也不报错** —— 用户没走第一步
+        就直接来第四步是完全合理的用法，这一步本来就该能单独用。
+
+        :param query_db: orm对象
+        :param req: 改写请求
+        :param lang: 语言（zh / en）
+        :return: 改写上下文
+        :raises ServiceException: 指定了 item_id 但它不属于这份规范
+        """
+        code, fields = '', {}
+        if req.guideline_code:
+            guideline = await GuidelineDao.get_guideline_by_code(query_db, req.guideline_code)
+            if guideline:
+                code = guideline.code
+                if req.item_id is not None:
+                    items = await ReportDraftService._items_of(query_db, guideline.guideline_id)
+                    item = next((it for it in items if int(it['itemId']) == req.item_id), None)
+                    if item is None:
+                        raise ServiceException(message='该条目不属于当前报告规范')
+                    fields = cls._pick_item(item, lang)
+
+        return AssistContext(guideline_code=code, current_text=req.text, **fields)
+
+    @classmethod
+    async def assist_services(
+        cls, query_db: AsyncSession, req: AssistRequestModel, user_id: int, locale: str = 'zh'
+    ) -> AssistResultModel:
+        """
+        跑一次续写 / 润色 / 中译英
+
+        **结果不落库**：由用户在第四步看过之后显式「采用」，才走 `apply_services`。
+        直接写回等于让模型改用户的稿子而不问一声。
+
+        :param query_db: orm对象
+        :param req: 改写请求
+        :param user_id: 访客用户id
+        :param locale: 界面语言
+        :return: 改写结果
+        :raises ServiceException: 上下文取不到、该动作缺少必要输入、或池里模型全挂
+        """
+        lang = 'en' if locale == 'en' else 'zh'
+        ctx = await cls._context_of(query_db, req, user_id, lang)
+        from_draft = req.draft_id is not None
+
+        # 润色与翻译都是改写已有内容，没有输入就没有输出 —— 在调模型之前挡下来，
+        # 省掉一次白花钱的调用，也免得模型对着空串自由发挥。
+        # **两条路径的提示要分开说**：草稿模式该去第二步填，独立模式是「把要改的文字贴进来」，
+        # 给独立模式的用户一句「请先在第二步填写」等于把他支去一个他根本用不上的步骤
+        if needs_current_text(req.action) and not ctx.current_text.strip():
+            raise ServiceException(
+                message='这一条还没有正文，请先填写，或先用「续写」' if from_draft else '请先把要改的正文贴进来'
+            )
+        if req.action == 'continue' and not req.keywords.strip() and not ctx.current_text.strip():
+            raise ServiceException(
+                message='请先给几个关键词，或先在第二步写一句' if from_draft else '请先给几个关键词'
+            )
+        # 一条 checklist 应答不该长过这个数，超了多半是把整篇稿子粘进来了。
+        # 独立模式下入参已由 VO 的 max_length 挡过一道，这里兜的是草稿里存量的超长正文
+        if len(ctx.current_text) > MAX_ASSIST_INPUT_CHARS:
+            raise ServiceException(message=f'正文超过 {MAX_ASSIST_INPUT_CHARS} 字符，请先拆分')
+
+        text, label = await AiAssistService.rewrite(
+            query_db, action=req.action, ctx=ctx, style=req.style, keywords=req.keywords, locale=lang
+        )
+
+        return AssistResultModel(itemId=req.item_id or 0, action=req.action, text=text, modelLabel=label)
+
+    @classmethod
+    async def apply_services(cls, query_db: AsyncSession, apply: AssistApplyModel, user_id: int) -> ReportDraftModel:
+        """
+        把第四步的改写结果写回第二步的草稿条目 —— 这一步让 2→3→4→2 真正闭合
+
+        走的是**单条覆盖**：第四步一次只改一条，套用第二步的整体覆盖语义
+        （`ReportDraftSaveModel`）会把没带上的其余条目全部清空。所以这里先把现有正文
+        整份读回来，只换掉这一条，再整份写回去。
+
+        :param query_db: orm对象
+        :param apply: 写回入参
+        :param user_id: 访客用户id
+        :return: 写回后的草稿详情
+        :raises ServiceException: 草稿不存在，或条目不属于这份草稿所依据的规范
+        """
+        _draft, code, items = await ReportDraftService._load(query_db, apply.draft_id, user_id)
+        valid_ids = {int(it['itemId']) for it in items}
+        if apply.item_id not in valid_ids:
+            raise ServiceException(message='该条目不属于当前报告规范')
+
+        rows = await ReportDraftDao.get_draft_items(query_db, apply.draft_id, user_id)
+        contents = {r.item_id: (r.content or '') for r in rows}
+        contents[apply.item_id] = apply.content
+
+        try:
+            await ReportDraftDao.replace_draft_items(query_db, apply.draft_id, user_id, contents, valid_ids)
+            # 留痕由服务端在这里自己记，**不依赖前端调用** —— 这是整套工具里真正的
+            # 「关键数据修改」（模型生成的文字进了用户的稿子），前端不调这条就没了
+            await ReportTrailService.record(
+                query_db,
+                user_id,
+                'applied',
+                draft_id=apply.draft_id,
+                guideline_code=code,
+                item_id=apply.item_id,
+                char_count=len(apply.content),
+            )
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        fresh = await ReportDraftDao.get_draft_by_id(query_db, apply.draft_id, user_id)
+        after = await ReportDraftDao.get_draft_items(query_db, apply.draft_id, user_id)
+        require_map = {int(it['itemId']): (it.get('requireLevel') or '0') for it in items}
+        filled_ids = {r.item_id for r in after if (r.content or '').strip()}
+
+        return ReportDraftService._to_model(
+            fresh, code, require_map, filled_ids, {r.item_id: (r.content or '') for r in after}
+        )
+
+
+class ReportTrailService:
+    """
+    报告助手操作留痕（文档 3.4「校验过程保留操作日志，确保关键数据修改有迹可循」）
+
+    ## 只记事件元数据，不记稿件内容
+
+    第三步对用户的承诺是「稿件只在校验期间流转，不会入库」。留痕若存渲染好的句子，
+    句子里迟早会混进正文片段，承诺就绕过去了。所以入参**除 `note` 外全是数字与枚举**，
+    人读的那句话由前端按 i18n 渲染。`note` 仅供系统诊断，VO 限长 300 字符。
+
+    ## 最该留痕的其实是第四步的写回
+
+    「关键数据修改」在这套工具里最字面的落点是 `event=applied` —— 模型生成的文字被写回
+    `action_report_draft_item`。一篇稿子里哪几段来自模型、什么时候被采纳的，
+    是投稿时被问起「AI 参与了多少」时唯一能拿出来的答案。所以那条留痕**由服务端在写回时
+    自己记**（见 `ReportReviewService.apply_services`），不依赖前端调用 —— 前端不调，
+    这条最重要的记录就没了。
+    """
+
+    @classmethod
+    async def add_trail_services(cls, query_db: AsyncSession, add: TrailAddModel, user_id: int) -> TrailModel:
+        """
+        追加一条留痕
+
+        :param query_db: orm对象
+        :param add: 入参
+        :param user_id: 操作人
+        :return: 落库后的留痕
+        """
+        trail = ActionReportTrail(
+            user_id=user_id,
+            draft_id=add.draft_id,
+            guideline_code=add.guideline_code or '',
+            event=add.event,
+            actor=add.actor or '',
+            item_id=add.item_id,
+            total=add.total,
+            reported=add.reported,
+            vague=add.vague,
+            missing=add.missing,
+            completeness=add.completeness,
+            char_count=add.char_count,
+            note=add.note or '',
+            create_time=datetime.now(),
+        )
+        try:
+            await ReportTrailDao.add_trail_dao(query_db, trail)
+            # 会话是 expire_on_commit=True：commit 之后再读 ORM 属性（**包括主键**）
+            # 会触发懒加载，在 async 会话里直接抛 MissingGreenlet。DAO 里已经 flush 过，
+            # 主键这会儿就有了，所以先把出参装好、再提交（实跑时踩到过）
+            result = cls._to_model(trail)
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return result
+
+    @classmethod
+    async def record(cls, query_db: AsyncSession, user_id: int, event: str, **fields: Any) -> None:
+        """
+        服务端内部留痕（不经接口）。**失败不抛** —— 留痕是旁路，不该把主流程带崩。
+
+        :param query_db: orm对象
+        :param user_id: 操作人
+        :param event: 事件类型
+        :param fields: 其余字段
+        """
+        try:
+            trail = ActionReportTrail(user_id=user_id, event=event, create_time=datetime.now(), **fields)
+            await ReportTrailDao.add_trail_dao(query_db, trail)
+        except Exception:
+            logger.warning('留痕失败（已忽略）: event=%s user=%s', event, user_id)
+
+    @classmethod
+    async def get_trail_list_services(
+        cls, query_db: AsyncSession, user_id: int, draft_id: int | None = None
+    ) -> list[TrailModel]:
+        """
+        取留痕列表（最近的在前）
+
+        :param query_db: orm对象
+        :param user_id: 操作人
+        :param draft_id: 只看某份草稿；None 表示全部
+        :return: 留痕列表
+        """
+        rows = await ReportTrailDao.get_trail_list_dao(query_db, user_id, draft_id, MAX_TRAIL_ROWS)
+
+        return [cls._to_model(r) for r in rows]
+
+    @classmethod
+    def _to_model(cls, row: Any) -> TrailModel:
+        """ORM 行 → 出参模型"""
+        return TrailModel(
+            trailId=row.trail_id,
+            draftId=row.draft_id,
+            guidelineCode=row.guideline_code or '',
+            event=row.event,
+            actor=row.actor or '',
+            itemId=row.item_id,
+            total=row.total,
+            reported=row.reported,
+            vague=row.vague,
+            missing=row.missing,
+            completeness=row.completeness,
+            charCount=row.char_count,
+            note=row.note or '',
+            createTime=row.create_time,
+        )

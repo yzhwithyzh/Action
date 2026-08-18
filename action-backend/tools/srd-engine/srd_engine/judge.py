@@ -80,7 +80,7 @@ async def judge_batch(
     """批量判定：一次调用判完给定的若干条目。
 
     `per_group` 传一个分组（12 次调用），`all` 传全部 34 条（1 次调用）。
-    代价是同一次调用内的羊群效应（前面打了 0 分会带偏后面），以及输出被截断时
+    代价是同一次调用内的羊群效应（前面打了 3 分会带偏后面），以及输出被截断时
     模型会少返条目 —— 少返的一律补成 unclear + needs_review，绝不静默。
     """
     cards = {it.code: build_evidence_card(it.code, ea, eb) for it in items}

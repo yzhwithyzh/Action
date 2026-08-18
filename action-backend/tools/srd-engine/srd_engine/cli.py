@@ -79,13 +79,13 @@ def cmd_checklist(args: argparse.Namespace) -> int:
 
 def cmd_criteria(args: argparse.Namespace) -> int:
     c = criteria_of(args.code)
-    label = {'dup_when': '0 分锚点（完全相同）', 'diff_when': '3 分锚点（完全不同）',
+    label = {'dup_when': '3 分锚点（完全相同）', 'diff_when': '0 分锚点（完全不同）',
              'unclear_when': 'unclear（证据不足）', 'score_note': '中间档提示', 'note': '补充说明'}
     print(f'条目 {args.code}')
     for key, title in label.items():
         if c.get(key):
             print(f'\n[{title}]\n{c[key].strip()}')
-    print('\n[1 分 / 2 分]\n两个锚点之间按「差异会不会改变临床或方法学解读」取档，通用口径见 prompts.py')
+    print('\n[2 分 / 1 分]\n两个锚点之间按「差异会不会改变临床或方法学解读」取档，通用口径见 prompts.py')
     return 0
 
 
@@ -95,7 +95,7 @@ def cmd_aggregate(args: argparse.Namespace) -> int:
     legacy = any(str(v) in ('dup', 'diff') for v in mapping.values())
     result = from_verdict_map(mapping) if legacy else from_rating_map(mapping)
     if legacy:
-        print('输入是 0.6.0 的 dup/diff 老格式：dup 按 0 分、diff 按 3 分折算', file=sys.stderr)
+        print('输入是 0.6.0 的 dup/diff 老格式：dup 按 3 分、diff 按 0 分折算', file=sys.stderr)
     print(render_text(result, verbose=args.verbose))
     if args.out:
         Path(args.out).write_text(result.model_dump_json(indent=2), encoding='utf-8')

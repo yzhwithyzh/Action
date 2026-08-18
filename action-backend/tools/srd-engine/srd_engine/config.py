@@ -17,9 +17,14 @@ from dataclasses import dataclass, field, replace
 # 0.7.1：整体判定理由改成只讲查表这一步，不再逐领域复述得分与百分比（那些同一份报告里
 #        本来就逐个列着）。判定逻辑一字未动 —— 升版本只是为了让「同版本 → 同措辞」成立，
 #        代价是抽取缓存全失效（缓存键含 ENGINE_VERSION），下一次评估要重抽一遍。
-ENGINE_VERSION = 'srd-engine/0.7.1'
-PROMPT_VERSION = 'prompt/2026-08-05'
-CRITERIA_VERSION = 'criteria/2026-08-05'
+# 0.8.0：**评分方向翻转**（甲方定稿）。0.7.x 沿用 Excel 表 1 表头的「完全相同 0 分 …
+#        完全不同 3 分」，现改为「分数即相似度」：3 分完全相同、0 分完全不同，分越高越重复。
+#        重复百分比随之由 `(满分−得分)/满分` 改为 `得分/满分`。
+#        **这两处一起改的净效果是 pct / level / overall_level 数值一格不动** ——
+#        翻转只重新标注了分数这一层。历史数据靠 `schemas.flip_rating` 迁移。
+ENGINE_VERSION = 'srd-engine/0.8.0'
+PROMPT_VERSION = 'prompt/2026-08-18'
+CRITERIA_VERSION = 'criteria/2026-08-18'
 
 
 @dataclass(frozen=True)

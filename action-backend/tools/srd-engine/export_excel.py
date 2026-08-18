@@ -28,18 +28,19 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from srd_engine.checklist import ALL_ITEMS, DOMAINS, criteria_of
-from srd_engine.schemas import RATING_LABEL_ZH, AssessmentResult
+from srd_engine.schemas import RATING_LABEL_ZH, SCORE_PER_ITEM, AssessmentResult
 
 if TYPE_CHECKING:
     from openpyxl.worksheet.worksheet import Worksheet
 
 LEVEL_ZH = {'none': '无重复', 'low': '低度重复', 'mod': '中度重复', 'high': '高度重复', None: '证据不足'}
-# 分越低越重复 → 0 分最红，3 分最绿。误判「重复」的代价最高，所以红端最扎眼。
+# 底色跟着**重复程度**走，不跟着分数大小走：完全相同最红，完全不同最绿。
+# 误判「重复」的代价最高，所以红端最扎眼。0.8.0 翻转分数后，红端从 0 分挪到了 3 分。
 RATING_FILL = {
-    '0': PatternFill('solid', fgColor='F8CBCB'),        # 红：完全相同
-    '1': PatternFill('solid', fgColor='FCE4D6'),        # 橙：部分相同
-    '2': PatternFill('solid', fgColor='EAF3DE'),        # 浅绿：部分不同
-    '3': PatternFill('solid', fgColor='D8EBD5'),        # 绿：完全不同
+    '3': PatternFill('solid', fgColor='F8CBCB'),        # 红：完全相同
+    '2': PatternFill('solid', fgColor='FCE4D6'),        # 橙：部分相同
+    '1': PatternFill('solid', fgColor='EAF3DE'),        # 浅绿：部分不同
+    '0': PatternFill('solid', fgColor='D8EBD5'),        # 绿：完全不同
     'unclear': PatternFill('solid', fgColor='F2F2F2'),  # 灰：证据不足
 }
 HEAD_FILL = PatternFill('solid', fgColor='305496')
@@ -89,7 +90,7 @@ def sheet_domains(wb: Workbook, results: list[tuple[int, AssessmentResult]]) -> 
             ws.append([
                 no, d.name_zh, '是' if d.is_key else '', LEVEL_ZH[d.level], d.pct,
                 d.score_sum, d.score_max, d.score_max_full, d.unclear_count,
-                f'({d.score_max}−{d.score_sum})/{d.score_max} = {d.pct}%'
+                f'{d.score_sum}/{d.score_max} = {d.pct}%'
                 f'（证据不足的 {d.unclear_count} 条连同其 {3 * d.unclear_count} 分一并剔出）'
                 if d.score_max else '无可评分条目',
                 '是' if d.evidence_sufficient else '否 ← 结论仅供参考',
@@ -102,15 +103,15 @@ def sheet_items(wb: Workbook, results: list[tuple[int, AssessmentResult]]) -> No
     ws = wb.create_sheet('条目明细')
     ws.append(['配对', '领域', '分组', '条目', '评估问题', '评分', '评分档位', '人工复核(评分)',
                '评分理由', '综述A 原文引用', '综述B 原文引用', '把握度', '待复核',
-               '评分锚点（0 分 / 3 分 / 证据不足）', '程序算出的客观事实'])
+               '评分锚点（3 分 / 0 分 / 证据不足）', '程序算出的客观事实'])
     for no, r in results:
         for it in r.items:
             d, g = GROUP_OF[it.code]
             c = criteria_of(it.code)
-            criteria = (f'0 分（完全相同）：{c.get("dup_when", "").strip()}\n'
-                        f'3 分（完全不同）：{c.get("diff_when", "").strip()}\n'
+            criteria = (f'3 分（完全相同）：{c.get("dup_when", "").strip()}\n'
+                        f'0 分（完全不同）：{c.get("diff_when", "").strip()}\n'
                         f'证据不足：{c.get("unclear_when", "").strip()}\n'
-                        f'1 分 / 2 分：两个锚点之间，看差异会不会改变临床或方法学解读')
+                        f'2 分 / 1 分：两个锚点之间，看差异会不会改变临床或方法学解读')
             ws.append([
                 no, d.name_zh, f'{g.code}. {g.name_zh}', it.code, it.question_zh,
                 '' if it.score is None else it.score, RATING_LABEL_ZH[it.effective_rating],
@@ -131,11 +132,11 @@ def sheet_items(wb: Workbook, results: list[tuple[int, AssessmentResult]]) -> No
 def sheet_matrix(wb: Workbook, results: list[tuple[int, AssessmentResult]]) -> None:
     """34 行 × N 列的评分矩阵：横着看一对，竖着看同一条目在所有配对上的分数。
 
-    竖着看是这张表存在的理由 —— 某个条目十对全打 0 分，多半是口径写松了或抽取没喂到料，
-    这种系统性偏差在「条目明细」那种一对一对翻的排版里根本看不出来。
+    竖着看是这张表存在的理由 —— 某个条目十对全打 3 分（判为完全相同），多半是口径写松了
+    或抽取没喂到料，这种系统性偏差在「条目明细」那种一对一对翻的排版里根本看不出来。
     """
     ws = wb.create_sheet('评分矩阵')
-    ws.append(['条目', '评估问题', *[f'配对{no}' for no, _ in results], '均分', '打0分的对数'])
+    ws.append(['条目', '评估问题', *[f'配对{no}' for no, _ in results], '均分', '打3分的对数'])
     by_pair = [{it.code: it for it in r.items} for _, r in results]
     for item in ALL_ITEMS:
         cells = [by_pair[i].get(item.code) for i in range(len(results))]
@@ -144,7 +145,7 @@ def sheet_matrix(wb: Workbook, results: list[tuple[int, AssessmentResult]]) -> N
             item.code, item.question_zh,
             *['' if c is None or c.score is None else c.score for c in cells],
             round(sum(scores) / len(scores), 2) if scores else '',
-            sum(1 for s in scores if s == 0),
+            sum(1 for s in scores if s == SCORE_PER_ITEM),   # 满分 = 判为「完全相同」
         ])
         for col, c in enumerate(cells, start=3):
             if c is not None:
@@ -168,20 +169,20 @@ def sheet_readme(wb: Workbook, out_dir: Path, results: list[tuple[int, Assessmen
         ['模型', r0.model],
         ['判定粒度', f'{r0.judge_granularity}（34 条目一次调用判完）'],
         ['', ''],
-        ['评分口径', '每个条目 0–3 分，分越低越重复：'],
-        ['', '0 = 完全相同　1 = 部分相同　2 = 部分不同　3 = 完全不同　（空 = 证据不足，不计分）'],
+        ['评分口径', '每个条目 0–3 分，分越高越重复：'],
+        ['', '3 = 完全相同　2 = 部分相同　1 = 部分不同　0 = 完全不同　（空 = 证据不足，不计分）'],
         ['', '领域满分 = 3 × 条目数：领域1 /24、领域2 /18、领域3 /42、领域4 /18，合计 /102'],
-        ['', '领域重复度% =（可评分满分 − 得分）÷ 可评分满分 × 100'],
+        ['', '领域重复度% = 得分 ÷ 可评分满分 × 100'],
         ['', '重复程度分档（表 2）：0–25% 无重复｜26–50% 低重复｜51–75% 中度重复｜76–100% 高度重复'],
         ['', '整体判定（表 3）：关键领域（主题、结果）× 非关键领域（方法、质量）查表，不是简单平均'],
         ['', ''],
         ['怎么核对', '打开「条目明细」表，逐行看：'],
-        ['', '① 读 E 列「评估问题」和 N 列「评分锚点」，明确这一条 0 分和 3 分各该长什么样'],
+        ['', '① 读 E 列「评估问题」和 N 列「评分锚点」，明确这一条 3 分和 0 分各该长什么样'],
         ['', '② 看 J/K 列两篇的原文引用，自己打一次分'],
         ['', '③ 与 F 列「评分」比对，把你的分数填进 H 列「人工复核(评分)」'],
         ['', '④ I 列「评分理由」是模型的说法，可用来定位它错在哪一步'],
         ['', ''],
-        ['需要重点看的', '· F 列标红的 0 分（判为完全相同）—— 误判重复的代价最高'],
+        ['需要重点看的', '· F 列标红的 3 分（判为完全相同）—— 误判重复的代价最高'],
         ['', '· M 列标「是」的（模型自己标了待复核）'],
         ['', '· 「评分矩阵」表里竖着看某条目十对全是同一个分 —— 多半是口径或抽取的系统性问题'],
         ['', '· 「汇总」表里带「（初步）」的配对 —— 关键领域证据不足，结论本就不可靠'],
@@ -191,7 +192,7 @@ def sheet_readme(wb: Workbook, out_dir: Path, results: list[tuple[int, Assessmen
         ['', '  核对时请回原文确认'],
         ['', '· 同一配置重跑，条目级判定约有 5% 的自然抖动；四档评分比原来的两档更容易抖 1 分'],
         ['', '· 「证据不足」连同它那 3 分一并剔出分母，所以 unclear 多的配对，分母很小'],
-        ['', '· 1 分 / 2 分的中间档目前只有通用口径（差异会不会改变临床或方法学解读），'],
+        ['', '· 2 分 / 1 分的中间档目前只有通用口径（差异会不会改变临床或方法学解读），'],
         ['', '  尚未逐条写专属锚点，也未经方法学专家评审 —— 这两档的判定请重点复核'],
     ]
     for row in rows:

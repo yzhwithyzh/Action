@@ -12,8 +12,8 @@ from srd_engine.schemas import RATING_LABEL_ZH
 if TYPE_CHECKING:
     from srd_engine.schemas import AssessmentResult, DomainResult, ItemResult
 
-# 分越低越重复，标记也照这个方向排：●=完全相同 … ○=完全不同
-_RATING_MARK = {'0': '●', '1': '◐', '2': '◔', '3': '○', 'unclear': '?'}
+# 分越高越重复，标记按「重复程度」排（不按分数大小排）：●=完全相同 … ○=完全不同
+_RATING_MARK = {'3': '●', '2': '◐', '1': '◔', '0': '○', 'unclear': '?'}
 
 
 def _render_item(it: ItemResult, verbose: bool) -> str:

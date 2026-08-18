@@ -45,25 +45,26 @@ _LEVEL: dict[Lang, dict[Any, str]] = {
     },
 }
 
-#: 条目评分档位。分越低越重复，与上面那套百分比色阶方向相反。
+#: 条目评分档位。**分越高越重复**（引擎 0.8.0 起），与上面那套百分比色阶同向。
 _RATING: dict[Lang, dict[Any, str]] = {
-    'zh': {'0': '完全相同', '1': '部分相同', '2': '部分不同', '3': '完全不同', 'unclear': '证据不足', None: '证据不足'},
+    'zh': {'3': '完全相同', '2': '部分相同', '1': '部分不同', '0': '完全不同', 'unclear': '证据不足', None: '证据不足'},
     'en': {
-        '0': 'Identical',
-        '1': 'Partly identical',
-        '2': 'Partly different',
-        '3': 'Completely different',
+        '3': 'Identical',
+        '2': 'Partly identical',
+        '1': 'Partly different',
+        '0': 'Completely different',
         'unclear': 'Insufficient evidence',
         None: 'Insufficient evidence',
     },
 }
 
-#: 0 分最重复 → 朱砂，3 分最不同 → 青。与页面的条目色阶同向，导出的表看着才不别扭。
+#: 3 分最重复 → 朱砂，0 分最不同 → 青。色阶跟着**重复程度**走而不是跟着分数大小走，
+#: 与页面的条目色阶同向，导出的表看着才不别扭。
 _RATING_FILL = {
-    '0': PatternFill('solid', fgColor='F8CBCB'),
-    '1': PatternFill('solid', fgColor='FCE4D6'),
-    '2': PatternFill('solid', fgColor='E3EDF6'),
-    '3': PatternFill('solid', fgColor='D8EBD5'),
+    '3': PatternFill('solid', fgColor='F8CBCB'),
+    '2': PatternFill('solid', fgColor='FCE4D6'),
+    '1': PatternFill('solid', fgColor='E3EDF6'),
+    '0': PatternFill('solid', fgColor='D8EBD5'),
     'unclear': PatternFill('solid', fgColor='F2F2F2'),
 }
 
@@ -122,7 +123,7 @@ _L: dict[Lang, dict[str, str]] = {
         'citeB': '综述 B 原文引用',
         'citeBTr': '综述 B 中文译文',
         'disclaimer': '本工具为辅助判断，结论须由方法学专家确认后方可引用。',
-        'scoreNote': '评分 0–3 分，分越低越重复；证据不足的条目不计分，也不进分母。',
+        'scoreNote': '评分 0–3 分，分越高越重复；证据不足的条目不计分，也不进分母。',
     },
     'en': {
         'sheet_overview': 'Overview',
@@ -172,7 +173,7 @@ _L: dict[Lang, dict[str, str]] = {
         'citeB': 'Review B — verbatim quote',
         'citeBTr': 'Review B — Chinese translation',
         'disclaimer': 'This tool is decision support only; a methodologist must confirm the verdict before it is cited.',
-        'scoreNote': 'Items score 0–3; lower means more duplication. Unclear items are excluded from both '
+        'scoreNote': 'Items score 0–3; higher means more duplication. Unclear items are excluded from both '
         'the score and the denominator.',
     },
 }

@@ -1,7 +1,8 @@
 import re
 from typing import Annotated
+from urllib.parse import quote
 
-from fastapi import File, Query, Request, Response, UploadFile
+from fastapi import File, Form, Query, Request, Response, UploadFile
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,10 +13,15 @@ from common.constant import ApiNamespace
 from common.router import APIRouterPro
 from common.vo import DataResponseModel, DynamicResponseModel, PageResponseModel, ResponseBaseModel
 from module_action.entity.vo.action_vo import (
+    AssistApplyModel,
+    AssistRequestModel,
+    AssistResultModel,
     CfirDomainModel,
     ChecklistReviewStateModel,
     ChecklistReviewSubmitModel,
+    ChecklistReviewSubmitResultModel,
     CollabRequestSubmitModel,
+    DraftImportResultModel,
     GuestEmailCodeModel,
     GuestInfoModel,
     GuestLoginModel,
@@ -32,6 +38,12 @@ from module_action.entity.vo.action_vo import (
     NewsModel,
     NewsPageQueryModel,
     ReaimDimensionModel,
+    ReportDraftComposeModel,
+    ReportDraftCreateModel,
+    ReportDraftModel,
+    ReportDraftSaveModel,
+    ReportReviewHistoryModel,
+    ReportReviewModel,
     ResourceLinkModel,
     ResourceLinkPageQueryModel,
     SiteTextOverridesModel,
@@ -41,6 +53,8 @@ from module_action.entity.vo.action_vo import (
     StudyTypeModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
+    TrailAddModel,
+    TrailModel,
 )
 from module_action.service.action_service import (
     ChecklistReviewService,
@@ -50,6 +64,9 @@ from module_action.service.action_service import (
     GuidelineService,
     ImplementationService,
     NewsService,
+    ReportDraftService,
+    ReportReviewService,
+    ReportTrailService,
     ResourceLinkService,
     SiteTextService,
     SrdService,
@@ -581,14 +598,20 @@ async def delete_site_srd_assessment(
 # ---------------------------------------------------------------- 报告助手第三步：checklist 逐条校验
 #
 # 提交接口会触发几十次模型调用，必须挂限流且要求访客登录 —— 匿名放开等于把账单交给公网。
-# 稿件正文只进 Redis 队列与 worker 工作目录，不落业务库：那是用户未发表的研究稿件。
+#
+# 六个口：提交 / 轮询 / 停止 / 历史 / 详情 / 删除。014 起提交那一刻就落一行台账
+# （`action_report_review`），所以刷新页面之后还能从历史里把这次校验找回来，
+# 跑挂了的任务也留得下痕迹。稿件正文随台账入库，用户可随时删除（删除是真删正文）。
 
 
 @action_site_controller.post(
     '/checklist-review',
     summary='提交稿件做 checklist 逐条校验',
-    description='报告助手第三步。提交后立即返回任务id，结果通过状态接口轮询获取',
-    response_model=DataResponseModel[str],
+    description=(
+        '报告助手第三步。提交后立即返回 sessionId 与 reviewId，结果通过状态接口轮询获取。'
+        '**reviewId 要存下来**：刷新页面后靠它从历史里找回这次校验'
+    ),
+    response_model=DataResponseModel[ChecklistReviewSubmitResultModel],
 )
 @ApiRateLimit(namespace=ApiNamespace.ACTION_CHECKLIST_REVIEW, preset=ApiRateLimitPreset.USER_RESOURCE_EXECUTION)
 async def submit_site_checklist_review(
@@ -597,24 +620,83 @@ async def submit_site_checklist_review(
     query_db: Annotated[AsyncSession, DBSessionDependency()],
     current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
 ) -> Response:
-    session_id = await ChecklistReviewService.submit_review_services(query_db, submit, current_guest.user_id)
-    logger.info(f'checklist 校验任务已提交：{session_id}')
+    result = await ChecklistReviewService.submit_review_services(query_db, submit, current_guest.user_id)
+    logger.info(f'checklist 校验任务已提交：{result.session_id}（记录 {result.review_id}）')
 
-    return ResponseUtil.success(data=session_id, msg='已提交，正在校验')
+    return ResponseUtil.success(data=result, msg='已提交，正在校验')
+
+
+@action_site_controller.get(
+    '/checklist-reviews',
+    summary='我的 checklist 校验历史',
+    description=(
+        '报告助手第三步的历史列表，只返回本人的记录，不带逐条判定与稿件正文。'
+        '顺带对账：用户关掉页面后没人再轮询，这里对未终结的记录补查一次 worker 状态'
+    ),
+    response_model=DataResponseModel[list[ReportReviewHistoryModel]],
+)
+async def get_site_checklist_review_history(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ChecklistReviewService.list_history_services(query_db, current_guest.user_id)
+
+    return ResponseUtil.success(data=result)
+
+
+# 注意路由顺序与形状：这条是 `/checklist-reviews/{id}`（复数，按记录id 取历史详情），
+# 下面那条是 `/checklist-review/{session_id}`（单数，按任务id 轮询）。两者不同路径不会撞，
+# 但改名时别把复数改没了 —— 那会让详情把轮询的路径吃掉
+@action_site_controller.get(
+    '/checklist-reviews/{review_id}',
+    summary='取一次校验的完整结果',
+    description='历史回看。带逐条判定、原文引用、全稿一致性与当时提交的稿件正文',
+    response_model=DataResponseModel[ReportReviewModel],
+)
+async def get_site_checklist_review_detail(
+    request: Request,
+    review_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ChecklistReviewService.get_review_services(query_db, review_id, current_guest.user_id)
+    logger.info(f'获取 checklist 校验记录 {review_id} 成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.delete(
+    '/checklist-reviews/{review_id}',
+    summary='删除一条校验历史',
+    description='记录逻辑删，**稿件正文与原文引用物理删** —— 用户点删除时期待的是「那篇稿子没了」',
+    response_model=ResponseBaseModel,
+)
+async def delete_site_checklist_review(
+    request: Request,
+    review_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ChecklistReviewService.delete_history_services(query_db, review_id, current_guest.user_id)
+    logger.info(f'删除 checklist 校验记录 {review_id} 成功')
+
+    return ResponseUtil.success(msg=result.message)
 
 
 @action_site_controller.get(
     '/checklist-review/{session_id}',
     summary='查询 checklist 校验任务状态',
-    description='报告助手第三步的轮询接口，完成后 result 里带逐条判定',
+    description='报告助手第三步的轮询接口，完成后 result 里带逐条判定，并顺手把结果落库',
     response_model=DataResponseModel[ChecklistReviewStateModel],
 )
 async def get_site_checklist_review(
     request: Request,
     session_id: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
     current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
 ) -> Response:
-    result = await ChecklistReviewService.review_state_services(session_id)
+    result = await ChecklistReviewService.review_state_services(query_db, session_id, current_guest.user_id)
     logger.info(f'查询 checklist 校验任务 {session_id} 状态成功')
 
     return ResponseUtil.success(data=result)
@@ -623,19 +705,327 @@ async def get_site_checklist_review(
 @action_site_controller.post(
     '/checklist-review/{session_id}/stop',
     summary='停止 checklist 校验任务',
-    description='报告助手第三步的中止按钮',
+    description='报告助手第三步的中止按钮。只能停自己的任务',
     response_model=ResponseBaseModel,
 )
 async def stop_site_checklist_review(
     request: Request,
     session_id: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
     current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
 ) -> Response:
-    result = await ChecklistReviewService.stop_review_services(session_id)
+    result = await ChecklistReviewService.stop_review_services(query_db, session_id, current_guest.user_id)
     logger.info(f'已请求停止 checklist 校验任务 {session_id}')
 
     return ResponseUtil.success(msg=result.message)
 
+
+# ---------------------------------------------------------------- 报告助手第二步：报告草稿
+#
+# 六个口全部要访客登录：草稿是用户未发表的研究内容，匿名可读写等于把它挂到公网上。
+# 越权保护在 DAO 的 where 里，服务层对「不存在」与「不是你的」返回同一句话
+# —— 分开报的话，拿 draft_id 逐个试就能探出别人有几份草稿。
+
+
+@action_site_controller.get(
+    '/report-drafts',
+    summary='我的报告草稿列表',
+    description='报告助手第二步。只返回本人的草稿，不带逐条正文（列表页用不上）',
+    response_model=DataResponseModel[list[ReportDraftModel]],
+)
+async def get_site_report_drafts(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportDraftService.list_drafts_services(query_db, current_guest.user_id)
+    logger.info('获取报告草稿列表成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.post(
+    '/report-drafts',
+    summary='新建一份报告草稿',
+    description='报告助手第二步。按第一步匹配到的规范建，条目为空的规范不许建',
+    response_model=DataResponseModel[ReportDraftModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_REPORT_DRAFT, preset=ApiRateLimitPreset.USER_COMMON_MUTATION)
+async def create_site_report_draft(
+    request: Request,
+    create: ReportDraftCreateModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportDraftService.create_draft_services(query_db, create, current_guest.user_id)
+    logger.info(f'新建报告草稿 {result.draft_id} 成功')
+
+    return ResponseUtil.success(data=result, msg='已新建草稿')
+
+
+# 导入口在**第二步**，不在第三步 —— 第三步只产出只读判定，导进去之后第四步没东西可写回、
+# 第五步整个导不出、下次再来还得重新粘一遍。挂限流：解析 + 几十次模型调用，比新建草稿重得多。
+@action_site_controller.post(
+    '/report-drafts/import',
+    summary='导入已有稿件，建草稿并映射到 checklist 条目',
+    description=(
+        '报告助手第二步的第二条路。上传 docx/pdf/txt/md → 解析 → 建草稿并存原稿 → '
+        '提交条目映射任务。**建草稿是同步的**（立刻回 draftId），映射是异步的，'
+        '拿 sessionId 走 `GET /checklist-review/{sessionId}` 轮询；跑完会把匹配到的'
+        '原文段落回填进条目框，空框就是「没覆盖到的条目」。'
+        '原稿整篇另存（`source_text`），**导出正文以它为准** —— 条目框只是对照与改写的工作面'
+    ),
+    response_model=DataResponseModel[DraftImportResultModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_CHECKLIST_REVIEW, preset=ApiRateLimitPreset.USER_RESOURCE_EXECUTION)
+async def import_site_report_draft(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+    file: Annotated[UploadFile, File(description='稿件文件（docx/pdf/txt/md）')],
+    guideline_code: Annotated[str, Form(alias='guidelineCode', description='规范代号')],
+    study_type_key: Annotated[str, Form(alias='studyTypeKey', description='研究类型，仅留档')] = '',
+    title: Annotated[str, Form(description='草稿名称，留空由后端起')] = '',
+    lang: Annotated[str, Query(description='判定语言 zh/en')] = 'zh',
+) -> Response:
+    result = await ReportDraftService.import_manuscript_services(
+        query_db,
+        current_guest.user_id,
+        guideline_code=guideline_code,
+        study_type_key=study_type_key,
+        title=title,
+        filename=file.filename or '',
+        data=await file.read(),
+        locale='en' if lang == 'en' else 'zh',
+    )
+    logger.info(f'导入稿件建草稿 {result.draft_id}，映射任务 {result.session_id}')
+
+    return ResponseUtil.success(data=result, msg='已导入，正在匹配条目')
+
+
+@action_site_controller.get(
+    '/report-drafts/{draft_id}',
+    summary='取一份报告草稿详情',
+    description='报告助手第二步。带逐条目正文与完成度统计',
+    response_model=DataResponseModel[ReportDraftModel],
+)
+async def get_site_report_draft(
+    request: Request,
+    draft_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportDraftService.get_draft_services(query_db, draft_id, current_guest.user_id)
+    logger.info(f'获取报告草稿 {draft_id} 成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.put(
+    '/report-drafts/{draft_id}',
+    summary='保存一份报告草稿',
+    description='报告助手第二步。**整体覆盖**：传进来的 items 就是全部正文，没带上的条目会被清空',
+    response_model=DataResponseModel[ReportDraftModel],
+)
+# 前端是「停止输入若干秒后自动保存」，天然高频，走 USER_INTERACTIVE_HIGH_FREQ 而不是
+# 普通写接口那一档 —— 后者 24 次/2 分钟，正常编辑就会被限流拦下，用户看到的是「保存失败」
+@ApiRateLimit(namespace=ApiNamespace.ACTION_REPORT_DRAFT, preset=ApiRateLimitPreset.USER_INTERACTIVE_HIGH_FREQ)
+async def save_site_report_draft(
+    request: Request,
+    draft_id: int,
+    save: ReportDraftSaveModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportDraftService.save_draft_services(query_db, draft_id, save, current_guest.user_id)
+    logger.info(f'保存报告草稿 {draft_id} 成功')
+
+    return ResponseUtil.success(data=result, msg='已保存')
+
+
+@action_site_controller.delete(
+    '/report-drafts/{draft_id}',
+    summary='删除一份报告草稿',
+    description='报告助手第二步。逻辑删除，只能删本人的',
+    response_model=ResponseBaseModel,
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_REPORT_DRAFT, preset=ApiRateLimitPreset.USER_DESTRUCTIVE_MUTATION)
+async def delete_site_report_draft(
+    request: Request,
+    draft_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportDraftService.delete_draft_services(query_db, draft_id, current_guest.user_id)
+    logger.info(f'删除报告草稿 {draft_id} 成功')
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_site_controller.post(
+    '/report-drafts/{draft_id}/compose',
+    summary='把草稿合成为报告初稿正文',
+    description=(
+        '报告助手第二步的「一键生成初稿」。返回纯文本正文，可直接送第三步逐条校验。'
+        '正文按章节组织，**不含 checklist 条目要求原文**（那会被第三步误判成已报告）'
+    ),
+    response_model=DataResponseModel[ReportDraftComposeModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_REPORT_DRAFT, preset=ApiRateLimitPreset.USER_RESOURCE_GENERATE)
+async def compose_site_report_draft(
+    request: Request,
+    draft_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+    lang: Annotated[str, Query(description='初稿语言（zh / en）')] = 'zh',
+) -> Response:
+    result = await ReportDraftService.compose_draft_services(query_db, draft_id, current_guest.user_id, lang)
+    logger.info(f'合成报告草稿 {draft_id} 初稿成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/report-drafts/{draft_id}/export',
+    summary='导出报告草稿（第五步）',
+    description=(
+        '三种格式各答一个问题：**docx** 稿件本身（按章节分节 + 附录对照表）· '
+        '**xlsx** 投稿随附的 checklist 对照表 · **json** 结构化留档。'
+        '数据源是业务库而不是第二步那份合成文本 —— 那是瞬时产物，用户可能压根没点过「生成初稿」。'
+        '**不出 PDF**：服务端生成中文 PDF 要在服务器装中文字体，字体缺失时是整篇方块字而不是报错，'
+        '这种失败方式在导出场景代价太高；docx 自己另存更可靠'
+    ),
+    response_class=Response,
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_REPORT_DRAFT, preset=ApiRateLimitPreset.USER_RESOURCE_EXPORT)
+async def export_site_report_draft(
+    request: Request,
+    draft_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+    fmt: Annotated[str, Query(description='导出格式（docx / xlsx / json）')] = 'docx',
+    lang: Annotated[str, Query(description='导出语言（zh / en）')] = 'zh',
+) -> Response:
+    content, filename, media_type, _ext = await ReportDraftService.export_draft_services(
+        query_db, draft_id, current_guest.user_id, fmt, lang
+    )
+    logger.info(f'导出报告草稿 {draft_id}（{fmt}）成功')
+
+    # media_type 必须显式给：本站错误走「HTTP 200 + code≠200」的 JSON 信封，
+    # 前端靠这个头把「一份文件」和「同一条通道上回来的错误信封」分开（useAuth.authedBlob）。
+    # 文件名走 RFC 5987 的 filename*，否则中文名在部分浏览器上是乱码
+    return ResponseUtil.streaming(
+        data=bytes2file_response(content),
+        media_type=media_type,
+        headers={'Content-Disposition': f"attachment; filename*=UTF-8''{quote(filename)}"},
+    )
+
+# ---------------------------------------------------------------- 第三步判定 · 第四步改写
+#
+# 这三个口把 2→3→4→2 那个环的后半段接上：第四步按第三步的判定列出工作清单、逐条改写、
+# 确认后写回第二步的草稿条目。全部要访客登录 —— 读写的都是用户自己的草稿。
+#
+# **判定的写入口不在这一段**：014 起由 `/checklist-review/{session_id}` 轮询时落库
+# （原先前端在拿到结果那一刻另调 `POST /report-reviews`，那个口已撤 ——
+# 用户中途刷新就没人来落库，而且两条写入路径并存必然漂移）。
+
+
+@action_site_controller.get(
+    '/report-drafts/{draft_id}/review',
+    summary='取某份草稿最近一次校验（第四步工作清单）',
+    description='没校验过不算错，返回 reviewId 为空的壳，前台据此提示先去第三步跑一次',
+    response_model=DataResponseModel[ReportReviewModel],
+)
+async def get_site_report_review(
+    request: Request,
+    draft_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportReviewService.get_latest_review_services(query_db, draft_id, current_guest.user_id)
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.post(
+    '/report-assist',
+    summary='第四步：对某一条 checklist 条目做续写 / 润色 / 中译英',
+    description=(
+        '**必须带 draftId + itemId**：条目要求与已写正文都由后端从库里取，不由前端传。'
+        '结果不落库，由用户显式「采用」后走 `/report-assist/apply`。'
+        '同步调用模型池（`ai_models`），秒级返回，不走 Redis 队列'
+    ),
+    response_model=DataResponseModel[AssistResultModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_REPORT_DRAFT, preset=ApiRateLimitPreset.USER_RESOURCE_GENERATE)
+async def assist_site_report_draft(
+    request: Request,
+    assist_req: AssistRequestModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+    lang: Annotated[str, Query(description='界面语言（zh / en）')] = 'zh',
+) -> Response:
+    result = await ReportReviewService.assist_services(query_db, assist_req, current_guest.user_id, lang)
+    logger.info(f'草稿 {assist_req.draft_id} 条目 {assist_req.item_id} 执行 {assist_req.action} 成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.put(
+    '/report-assist/apply',
+    summary='把第四步的改写结果写回第二步的草稿条目',
+    description='**单条覆盖**，不套用第二步的整体覆盖语义——那会把没带上的其余条目清空',
+    response_model=DataResponseModel[ReportDraftModel],
+)
+async def apply_site_report_assist(
+    request: Request,
+    apply_req: AssistApplyModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportReviewService.apply_services(query_db, apply_req, current_guest.user_id)
+    logger.info(f'草稿 {apply_req.draft_id} 条目 {apply_req.item_id} 写回成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.post(
+    '/report-trails',
+    summary='追加一条操作留痕',
+    description=(
+        '文档 3.4 的「操作日志」。**只收数字与枚举**：事件类型、条目计数、字符数、规范代号。'
+        '人读的那句话由前端按 i18n 渲染，库里没有它 —— 存渲染好的句子迟早会混进稿件正文片段，'
+        '第三步「稿件不入库」的承诺就绕过去了。'
+        '第四步写回草稿的那条留痕由服务端自己记，不走这个口'
+    ),
+    response_model=DataResponseModel[TrailModel],
+)
+async def add_site_report_trail(
+    request: Request,
+    add_trail: TrailAddModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportTrailService.add_trail_services(query_db, add_trail, current_guest.user_id)
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/report-trails',
+    summary='取操作留痕（最近的在前）',
+    description='只能看自己的。`draftId` 可选，用来只看某一份草稿的记录',
+    response_model=DataResponseModel[list[TrailModel]],
+)
+async def get_site_report_trails(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+    draft_id: Annotated[int | None, Query(alias='draftId', description='只看某份草稿')] = None,
+) -> Response:
+    result = await ReportTrailService.get_trail_list_services(query_db, current_guest.user_id, draft_id)
+
+    return ResponseUtil.success(data=result)
 
 @action_site_controller.post(
     '/collaborate',

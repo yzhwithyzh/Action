@@ -153,11 +153,12 @@ async with TaskClient(CONFIG) as client:
 }
 ```
 
-**评分怎么读**（0.7.0 起，口径全在引擎侧，见 [srd-engine/README.md](../srd-engine/README.md)）：
-每个条目 0–3 分，**分越低越重复**（0 = 完全相同，3 = 完全不同，`unclear` = 证据不足不计分）。
+**评分怎么读**（0.8.0 起，口径全在引擎侧，见 [srd-engine/README.md](../srd-engine/README.md)）：
+每个条目 0–3 分，**分越高越重复**（3 = 完全相同，0 = 完全不同，`unclear` = 证据不足不计分）。
+甲方 Excel 表 1 的表头写的是相反的「完全相同 0 分」，0.7.x 照抄过那张表，**拿它来核会读反**。
 `score_max` 是可评分条目的满分（3 × 可评分条目数），`score_max_full` 是名义满分
 （领域 /24 /18 /42 /18，整体 /102）—— 两者不等就说明有条目证据不足被剔出了分母。
-`overall_pct` 是重复百分比 =（`score_max` − `score_sum`）÷ `score_max` × 100，
+`overall_pct` 是重复百分比 = `score_sum` ÷ `score_max` × 100，
 而 `overall_level` 不是把它再分一次箱，是拿四个领域的档位查表 3 得来的，两者可能不同向。
 
 完整结果（34 条目逐条评分、引用、投票留痕）在 `results/{session_id}/`：

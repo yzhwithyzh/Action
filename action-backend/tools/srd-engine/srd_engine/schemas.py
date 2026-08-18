@@ -5,10 +5,18 @@
 2. ExtractDoc     —— 单篇结构化抽取产物 facet（P1，可缓存）
 3. ItemVerdict / AssessmentResult —— 评分与聚合产物（P2 / P3）
 
-关于评分（0.7.0 起，对应新版 Excel 表 1 的「评分」四列）：
-每个条目的判定结果是 **0/1/2/3 四档评分**（0 = 完全相同，3 = 完全不同），
-另有引擎自己的 `unclear`（证据不足，不计分也不进分母）。领域与整体的重复百分比
-一律由分数算，不再由「dup 条数占比」算 —— 见 `aggregate.py`。
+关于评分（0.7.0 起对应新版 Excel 表 1 的「评分」四列，0.8.0 起方向翻转）：
+每个条目的判定结果是 **0/1/2/3 四档评分**，**分越高越重复**
+（3 = 完全相同，0 = 完全不同），另有引擎自己的 `unclear`
+（证据不足，不计分也不进分母）。领域与整体的重复百分比一律由分数算，
+不再由「dup 条数占比」算 —— 见 `aggregate.py`。
+
+**0.8.0 翻转了分数方向**：Excel 表 1 原表头写的是「完全相同 0 分 … 完全不同 3 分」，
+甲方定稿改为「分数即相似度」，故 0.8.0 起 rating 键与分数仍相等，但两端的标签对调。
+翻转只动 rating/score 这一层：领域与整体的 `pct`/`level`/`overall_level` 数值**完全不变**
+（旧公式 `(满分−得分)/满分` 与新公式 `得分/满分` 在得分取补后恒等），
+所以历史结果只需把每条目的 rating 换成 `3−rating`、领域 score_sum 换成 `score_max−score_sum`，
+结论不会有任何一格改变。读 0.7.x 的 `result.json` 见下方 `_accept_legacy_rating`。
 
 关于引用字段的约定（重要）：
 - `quote`    应为**原文逐字**。0.4.0 起不再回查校验（甲方决定），仅供人工核对。
@@ -34,30 +42,44 @@ Rating = Literal['0', '1', '2', '3', 'unclear']
 #: 单条目满分。领域满分 = 3 × 条目数（Excel：领域1 /24、领域2 /18、领域3 /42、领域4 /18）。
 SCORE_PER_ITEM = 3
 
-#: 评分 → 分数。unclear 没有分数，既不进分子也不进分母（见 aggregate.py）。
+#: 评分 → 分数。**rating 键就是分数本身**（0.8.0 翻转的是标签，不是这层映射）。
+#: unclear 没有分数，既不进分子也不进分母（见 aggregate.py）。
 RATING_SCORE: dict[str, int | None] = {'0': 0, '1': 1, '2': 2, '3': 3, 'unclear': None}
 
+#: 分越高越重复：3 分是「完全相同」这一端，0 分是「完全不同」那一端。
 RATING_LABEL_ZH: dict[str, str] = {
-    '0': '完全相同',
-    '1': '部分相同',
-    '2': '部分不同',
-    '3': '完全不同',
+    '3': '完全相同',
+    '2': '部分相同',
+    '1': '部分不同',
+    '0': '完全不同',
     'unclear': '证据不足',
 }
 RATING_LABEL_EN: dict[str, str] = {
-    '0': 'identical',
-    '1': 'partly the same',
-    '2': 'partly different',
-    '3': 'completely different',
+    '3': 'identical',
+    '2': 'partly the same',
+    '1': 'partly different',
+    '0': 'completely different',
     'unclear': 'insufficient evidence',
 }
 
-#: 评分 → 旧的三态判定。0/1 偏「重复」，2/3 偏「不重复」。
+#: 评分 → 旧的三态判定。3/2 偏「重复」，1/0 偏「不重复」。
 #: 这层映射只为兼容既有的 CSV / 报告 / 前端展示，**不参与百分比计算** ——
-#: 百分比一律由分数算（aggregate.py），否则 1 分与 0 分、2 分与 3 分就没区别了。
+#: 百分比一律由分数算（aggregate.py），否则 2 分与 3 分、1 分与 0 分就没区别了。
 RATING_VERDICT: dict[str, Verdict] = {
-    '0': 'dup', '1': 'dup', '2': 'diff', '3': 'diff', 'unclear': 'unclear',
+    '3': 'dup', '2': 'dup', '1': 'diff', '0': 'diff', 'unclear': 'unclear',
 }
+
+#: 0.7.x → 0.8.0 的分数翻转。**只对 rating 有效，unclear 原样穿过。**
+LEGACY_RATING_FLIP: dict[str, str] = {'0': '3', '1': '2', '2': '1', '3': '0', 'unclear': 'unclear'}
+
+
+def flip_rating(rating: str) -> str:
+    """0.7.x 的 rating → 0.8.0 的 rating（`3 − r`，unclear 不动）。
+
+    迁移历史数据与读老 `result.json` 都走这里，别在各处手抄 `3 - int(r)` ——
+    抄漏一处的表现是「某条目分数对不上标签」，而这两个值在页面上离得很远，很难对出来。
+    """
+    return LEGACY_RATING_FLIP.get(rating, 'unclear')
 
 
 # --------------------------------------------------------------------------- 1. 解析层
@@ -284,7 +306,7 @@ class ItemVerdict(BaseModel):
     """单条目判定结果 —— 这就是 LLM 被要求填的结构。"""
 
     rating: Rating = Field(
-        description='评分：0=完全相同 1=部分相同 2=部分不同 3=完全不同 unclear=证据不足无法评分'
+        description='评分：3=完全相同 2=部分相同 1=部分不同 0=完全不同 unclear=证据不足无法评分'
     )
     reason_zh: str = Field(description='判定理由（中文，≤200字），必须点明具体的相同点或关键差异点，禁止空泛套话')
     reason_en: str = Field(default='', description='判定理由（英文）')
@@ -335,14 +357,14 @@ class ItemResult(BaseModel):
     @model_validator(mode='before')
     @classmethod
     def _accept_legacy_verdict(cls, data: object) -> object:
-        """0.6.0 的结果 JSON 只有 `verdict` 没有 `rating`，读进来折成 0/3 分。
+        """0.6.0 的结果 JSON 只有 `verdict` 没有 `rating`，读进来折成 3/0 分。
 
         不做这层折算的话，老文件会因为「没有 rating 字段」而静默落到默认值
         `unclear`，整份历史结果变成「全部证据不足」—— 比直接报错更难发现。
         """
         if isinstance(data, dict) and 'rating' not in data and 'verdict' in data:
             data = dict(data)
-            legacy = {'dup': '0', 'diff': '3'}
+            legacy = {'dup': '3', 'diff': '0'}
             data['rating'] = legacy.get(data.get('verdict'), 'unclear')
             if data.get('override_verdict'):
                 data['override_rating'] = legacy.get(data['override_verdict'], 'unclear')
@@ -379,7 +401,7 @@ class DomainResult(BaseModel):
 
     level: Level | None = None
     pct: int = 0
-    #: 可评分条目的得分合计（分越低越重复）
+    #: 可评分条目的得分合计（分越高越重复）
     score_sum: int = 0
     #: 可评分条目的满分 = 3 × 可评分条目数（证据不足的条目不计入）
     score_max: int = 0
@@ -427,6 +449,70 @@ class AssessmentResult(BaseModel):
     review_count: int = 0
     errors: list[str] = Field(default_factory=list)
 
+    @model_validator(mode='before')
+    @classmethod
+    def _accept_legacy_rating(cls, data: object) -> object:
+        """读 0.7.x 的 `result.json` 时把条目评分翻转到 0.8.0 的方向。
+
+        **判据只能是 `engine_version`**：翻转前后的 rating 取值域一模一样（都是
+        '0'–'3'），单看一份结果无从分辨方向，只有它自报的版本号能区分。所以这层
+        必须挂在 `AssessmentResult` 上而不是 `ItemResult` 上 —— 条目对象看不到版本号。
+
+        领域与整体的 `score_sum` 一并取补（`score_max − score_sum`），`pct`/`level`
+        不动：新旧两条公式在得分取补后恒等，翻转不改变任何一格结论。
+
+        0.6.0 及更早只有 `verdict` 没有 `rating`，走 `ItemResult._accept_legacy_verdict`，
+        那边直接按新方向折算，不再经过这里（下面 `startswith` 的白名单里没有 0.6）。
+        """
+        if not isinstance(data, dict):
+            return data
+        version = str(data.get('engine_version') or '')
+        if not version.startswith('srd-engine/0.7'):
+            return data
+
+        data = dict(data)
+        data['domains'] = [_flip_domain(d) for d in data.get('domains') or []]
+        if data.get('overall_score_max') is not None:
+            data['overall_score_sum'] = (
+                int(data.get('overall_score_max') or 0) - int(data.get('overall_score_sum') or 0)
+            )
+        return data
+
     @property
     def items(self) -> list[ItemResult]:
         return [it for d in self.domains for it in d.items]
+
+
+def _flip_domain(domain: object) -> object:
+    """`_accept_legacy_rating` 的领域层：翻转 score_sum 与每个条目的 rating。"""
+    if not isinstance(domain, dict):
+        return domain
+    domain = dict(domain)
+    domain['score_sum'] = int(domain.get('score_max') or 0) - int(domain.get('score_sum') or 0)
+    domain['groups'] = [_flip_group(g) for g in domain.get('groups') or []]
+    return domain
+
+
+def _flip_group(group: object) -> object:
+    if not isinstance(group, dict):
+        return group
+    group = dict(group)
+    group['items'] = [_flip_item(it) for it in group.get('items') or []]
+    return group
+
+
+def _flip_item(item: object) -> object:
+    if not isinstance(item, dict):
+        return item
+    item = dict(item)
+    for key in ('rating', 'override_rating'):
+        if item.get(key):
+            item[key] = flip_rating(str(item[key]))
+    # 投票留痕也翻，否则「3 票里 2 票判 0 分」这类审计信息会和最终评分对不上
+    item['votes'] = [
+        {**v, 'rating': flip_rating(str(v['rating']))}
+        if isinstance(v, dict) and v.get('rating')
+        else v
+        for v in item.get('votes') or []
+    ]
+    return item

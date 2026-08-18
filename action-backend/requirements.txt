@@ -22,6 +22,12 @@ mistralai==1.12.0
 ollama==0.6.1
 openai==2.17.0
 openpyxl==3.1.5
+# 第五步导出 .docx，以及第二步导入 .docx 稿件。此前只作为 agno 的传递依赖存在 ——
+# 生产功能依赖传递依赖，上游哪天不带它了就是接口直接 500，所以显式钉住
+python-docx==1.2.0
+# 第二步导入 .pdf 稿件。此前只是 srd-engine 的可选 extra（`pdf = ["pymupdf>=1.24"]`），
+# 后端 web 进程并不保证装得到 —— 同 python-docx 的理由，用到就得自己钉
+pymupdf==1.27.2.2
 pandas==2.3.3
 Pillow==12.1.1
 portkey-ai==2.1.0

@@ -605,6 +605,7 @@ class GuidelineItemModel(ActionBaseModel):
     ext_label_en: str | None = Field(default=None, description='扩展列列名（英文）')
     extension_zh: str | None = Field(default=None, description='扩展/对照条目内容（中文）')
     extension_en: str | None = Field(default=None, description='扩展/对照条目内容（英文）')
+    require_level: Literal['0', '1'] | None = Field(default=None, description='填写要求（0必填 1条件填写/选填）')
     sort_num: int | None = Field(default=None, description='规范内显示顺序')
     status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
     create_by: str | None = Field(default=None, description='创建者')
@@ -657,32 +658,69 @@ class DeleteGuidelineItemModel(BaseModel):
 
 # ---------------------------------------------------------------- checklist 逐条校验（报告助手第三步）
 
+#: 校验任务的状态取值域。与 `tools/common` 的任务状态、SRD 的 `SrdRunStatus` 同一套词
+ReviewRunStatus = Literal['pending', 'running', 'completed', 'failed', 'stopped']
+
+#: 校验记录的用途。`import` 那一次跑完会回填草稿条目，`check` 不会
+ReviewPurpose = Literal['check', 'import']
+
+#: 稿件字数下限，与 worker 的 `MIN_MANUSCRIPT_CHARS` 对齐。低于这个数判不出东西，
+#: 白跑几十次模型调用 —— 第三步的粘贴口与第二步的导入口共用它
+MIN_MANUSCRIPT_CHARS = 200
+#: 稿件字数上限，与算法的 max_chars 对齐。超出直接回绝而不是默默截断
+MAX_MANUSCRIPT_CHARS = 300000
+
 
 class ChecklistReviewSubmitModel(BaseModel):
     """
     提交稿件做 checklist 逐条校验
 
     公开接口的入参，字段约束直接写在 Field 上（与 CollabRequestSubmitModel 一致，由 pydantic
-    自动校验，不走 @ValidateFields）。稿件正文只在任务队列与 worker 工作目录里流转，
-    **不落业务库** —— 它是用户未发表的研究稿件。
+    自动校验，不走 @ValidateFields）。
+
+    014 起稿件正文**随任务台账一并落库**，用户可按历史回看、也可随时删除（删除是真删正文）。
+    口径变更的理由见 `sql/014-action-report-review-history-pg.sql` 的文件头。
     """
 
     model_config = ConfigDict(alias_generator=to_camel)
 
     guideline_code: str = Field(min_length=1, max_length=64, description='规范代号，如 STRICTA')
-    # 下限与 worker 的 MIN_MANUSCRIPT_CHARS 对齐；上限与算法的 max_chars 对齐，超出直接回绝而不是默默截断
-    manuscript: str = Field(min_length=200, max_length=300000, description='稿件全文')
+    manuscript: str = Field(
+        min_length=MIN_MANUSCRIPT_CHARS, max_length=MAX_MANUSCRIPT_CHARS, description='稿件全文'
+    )
     locale: Literal['zh', 'en'] = Field(default='zh', description='条目与结论使用的语言')
+    #: 稿件来自第二步那份初稿时带上，第四步的工作清单据此认领这次判定。
+    #: 外部粘贴的稿件不带 —— 它没有草稿可挂，但**照样进历史**（这是 014 与旧口径的分野）
+    draft_id: int | None = Field(default=None, description='稿件所属草稿id，仅当稿件来自第二步初稿时带')
+
+
+class ChecklistReviewSubmitResultModel(BaseModel):
+    """
+    提交后的回执
+
+    **`reviewId` 是这次改造的关键**：任务一提交台账就已落库，前端拿着它就能在刷新之后
+    重新找回这次校验 —— 014 之前提交只回一个 session_id，而它只活在前端内存里，
+    刷一下页面这次任务就再也找不回来了（Redis 里明明还躺着结果）。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    session_id: str = Field(description='worker任务id')
+    review_id: int = Field(description='校验记录id')
 
 
 class ChecklistReviewStateModel(BaseModel):
     """
-    校验任务状态（原样透传 worker 的状态快照）
+    校验任务的轮询快照
+
+    `status` 与进度来自 worker，`reviewId` 来自业务库 —— 轮询接口在拿到终态的那一刻
+    顺手把结果落库（同 SRD，理由见 `ChecklistReviewService.review_state_services`）。
     """
 
     model_config = ConfigDict(alias_generator=to_camel)
 
     session_id: str = Field(description='任务id')
+    review_id: int | None = Field(default=None, description='校验记录id')
     status: str = Field(description='pending/running/completed/failed/stopped')
     progress_current: int = Field(default=0, description='当前进度')
     progress_total: int = Field(default=100, description='进度总量')
@@ -690,6 +728,338 @@ class ChecklistReviewStateModel(BaseModel):
     error: str = Field(default='', description='失败原因')
     result: dict | None = Field(default=None, description='完成后的判定结果')
 
+
+# ---------------------------------------------------------------- 报告草稿（报告助手第二步）
+#
+# 草稿正文是用户未发表的研究内容，只进业务库、不进 OSS（那个桶整桶公共读）。
+# 与第三步刻意不落稿件的取舍不同：第三步的稿件是过路数据，这里的草稿是用户
+# 明确要求存下来的东西，不存反而是丢数据。
+
+#: 单条条目正文的上限。checklist 一条应答通常几十到几百字，两万字符足够一条写成小节；
+#: 不设上限的话，一次保存就能往库里灌任意大小的文本
+MAX_DRAFT_ITEM_CHARS = 20000
+#: 一次保存最多带多少条。现有最长的规范 SPIRIT 是 79 条，200 是留足余量的硬闸。
+#: 这个数直接决定单次请求体的上限（200 × 20000 字符 ≈ 4MB），而保存是自动触发的高频接口，
+#: 定得越松、被拒的那些条目就越是「先完整解析一遍再丢掉」的纯开销
+MAX_DRAFT_ITEMS = 200
+
+
+class ReportDraftItemModel(ActionBaseModel):
+    """
+    草稿里一条 checklist 条目的正文
+    """
+
+    item_id: int = Field(description='所应答的 checklist 条目id')
+    content: str = Field(default='', max_length=MAX_DRAFT_ITEM_CHARS, description='用户为该条目写的正文')
+
+
+class ReportDraftModel(ActionBaseModel):
+    """
+    报告草稿
+
+    列表与详情共用：列表不带 items（一份草稿几十条正文，列表页不需要），详情带。
+    完成度四个计数由服务层现算 —— 存冗余计数就要在每次保存、每次后台改条目
+    填写要求时同步维护，算一遍的成本远低于维护一致性的成本。
+    """
+
+    draft_id: int | None = Field(default=None, description='草稿id')
+    guideline_id: int | None = Field(default=None, description='所依据的报告规范id')
+    guideline_code: str | None = Field(default=None, description='规范代号，如 STRICTA')
+    study_type_key: str | None = Field(default=None, description='第一步判定的研究类型')
+    title: str | None = Field(default=None, description='草稿名称')
+    items: list[ReportDraftItemModel] = Field(default_factory=list, description='逐条目正文（仅详情返回）')
+    item_total: int = Field(default=0, description='该规范的条目总数')
+    filled_count: int = Field(default=0, description='已填写的条目数')
+    required_total: int = Field(default=0, description='必填条目数')
+    required_filled: int = Field(default=0, description='已填写的必填条目数')
+    create_time: datetime | None = Field(default=None, description='创建时间')
+    update_time: datetime | None = Field(default=None, description='更新时间')
+
+
+class ReportDraftCreateModel(BaseModel):
+    """
+    新建草稿的入参
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    guideline_code: str = Field(min_length=1, max_length=64, description='规范代号，如 STRICTA')
+    study_type_key: str = Field(default='', max_length=32, description='第一步判定的研究类型，仅作留档')
+    title: str = Field(default='', max_length=300, description='草稿名称，留空由后端起一个')
+
+
+class DraftImportResultModel(BaseModel):
+    """
+    导入已有稿件的回执
+
+    导入是**异步**的：建草稿与存原稿是同步完成的（所以立刻有 `draftId`），而「哪些条目
+    被覆盖了」要跑一遍条目映射，那是几分钟级的 worker 任务，前端拿 `sessionId` 轮询。
+
+    轮询走的就是第三步那个口（`GET /checklist-review/{session_id}`）—— 导入与校验是
+    同一套 worker、同一个引擎、同一张结果表，区别只在 `purpose='import'` 时跑完会
+    **回填草稿条目**。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    draft_id: int = Field(description='新建的草稿id')
+    session_id: str = Field(description='条目映射任务id，用它轮询进度')
+    review_id: int = Field(description='映射任务的记录id')
+    source_name: str = Field(default='', description='原始文件名')
+    source_lines: int = Field(default=0, description='原稿有效行数')
+    char_count: int = Field(default=0, description='原稿字符数')
+
+
+class ReportDraftSaveModel(BaseModel):
+    """
+    保存草稿的入参
+
+    **整体覆盖语义**：传进来的 items 就是这份草稿的全部正文，没带上的条目会被清空。
+    前端每次都提交完整的编辑态，不做增量 patch —— 增量在「用户删掉了一条内容」
+    这件事上无法与「这次没带这条」区分开。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    title: str = Field(default='', max_length=300, description='草稿名称')
+    items: list[ReportDraftItemModel] = Field(
+        default_factory=list, max_length=MAX_DRAFT_ITEMS, description='逐条目正文（整体覆盖）'
+    )
+
+
+class ReportDraftComposeModel(BaseModel):
+    """
+    合成出来的报告初稿
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    draft_id: int = Field(description='草稿id')
+    text: str = Field(description='初稿正文（纯文本，可直接送第三步校验）')
+    char_count: int = Field(default=0, description='正文字符数')
+    missing_required: int = Field(default=0, description='仍未填写的必填条目数')
+
+
+# ---------------------------------------------------------------- 第三步判定 · 第四步改写
+
+#: 逐条判定的取值域。与 `tools/checklist_worker_tool` 的输出、前台的三档色阶一一对应
+VerdictStatus = Literal['reported', 'vague', 'missing']
+
+#: 第四步能对一条条目做的三件事。
+#: continue 续写（据关键词补完这一条）· polish 润色（改写已有正文）· translate 中译英
+AssistAction = Literal['continue', 'polish', 'translate']
+
+#: 润色风格。与前台那组风格 chip 一一对应；续写与翻译不看这个值
+AssistStyle = Literal['', 'rigorous', 'concise', 'critical']
+
+#: 单次改写的输入上限。一条 checklist 应答通常几百字，五千字符足够，
+#: 同时挡住「把整篇稿子塞进来当 prompt」——那是按 token 计费的
+MAX_ASSIST_INPUT_CHARS = 5000
+
+
+class ReviewVerdictModel(BaseModel):
+    """
+    一条 checklist 条目的校验判定
+
+    `reason` 是模型对这一条的判断说明，`evidence` 才是稿件里的逐字片段。
+    014 起 evidence 随稿件一起落库（口径变更的理由见
+    `sql/014-action-report-review-history-pg.sql` 的文件头）。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    item_id: int = Field(description='checklist条目id')
+    status: VerdictStatus = Field(description='判定（reported / vague / missing）')
+    reason: str = Field(default='', max_length=2000, description='判定说明（模型的判断，不是稿件摘抄）')
+    evidence: str = Field(default='', max_length=500, description='判定引用的稿件原文片段')
+    lines: str = Field(default='', max_length=200, description='报告于第几行，逗号分隔')
+
+
+class ReportReviewModel(ActionBaseModel):
+    """
+    一次校验记录
+
+    两处在用，字段各取所需：**第四步的工作清单**只看 verdicts 里的 status/reason，
+    **第三步的历史回看**还要 manuscript 与 evidence 才能还原整屏。
+    """
+
+    review_id: int | None = Field(default=None, description='校验记录id')
+    draft_id: int | None = Field(default=None, description='被校验的草稿id；外部粘贴的稿件为空')
+    guideline_id: int | None = Field(default=None, description='所依据的报告规范id')
+    guideline_code: str = Field(default='', description='报告规范代号')
+    session_id: str = Field(default='', description='worker会话id，仅供排障对账')
+    run_status: ReviewRunStatus = Field(default='completed', description='任务状态')
+    error_msg: str = Field(default='', description='失败原因')
+    progress: int = Field(default=0, description='进度百分比0-100')
+    models: str = Field(default='', description='实际出结果的模型')
+    locale: str = Field(default='zh', description='判定语言（zh/en）')
+    char_count: int = Field(default=0, description='稿件字符数')
+    item_total: int = Field(default=0, description='该规范的条目总数')
+    completeness: int = Field(default=0, description='完整度百分比0-100')
+    reported: int = Field(default=0, description='已报告条目数')
+    vague: int = Field(default=0, description='描述模糊条目数')
+    missing: int = Field(default=0, description='未报告条目数')
+    line_count: int = Field(default=0, description='稿件行数')
+    truncated: bool = Field(default=False, description='稿件是否被截断')
+    manuscript: str = Field(default='', description='稿件正文（仅详情返回；已删除的记录为空）')
+    #: 全稿一致性结果原样透传（库里存的就是引擎那份 JSON）。**不在这里定死结构** ——
+    #: 它的形状跟着 `engine/consistency.py` 的规则表走，写成 Model 就要跟着引擎版本改一遍
+    consistency: dict | None = Field(default=None, description='全稿一致性判定结果')
+    verdicts: list[ReviewVerdictModel] = Field(default_factory=list, description='逐条判定')
+    create_time: datetime | None = Field(default=None, description='提交时间')
+    finish_time: datetime | None = Field(default=None, description='完成时间')
+
+
+class ReportReviewHistoryModel(ActionBaseModel):
+    """
+    「我的校验历史」列表行
+
+    **不带 verdicts，更不带 manuscript**：一次校验最多 282 条判定加一整篇稿件，
+    列表页一条都用不上，带上等于每次开页面拉几 MB。点开某一条时才走详情口。
+    """
+
+    review_id: int | None = Field(default=None, description='校验记录id')
+    session_id: str = Field(default='', description='worker会话id，仅供排障对账')
+    draft_id: int | None = Field(default=None, description='被校验的草稿id；外部粘贴的稿件为空')
+    guideline_code: str = Field(default='', description='报告规范代号')
+    run_status: ReviewRunStatus = Field(default='pending', description='任务状态')
+    error_msg: str = Field(default='', description='失败原因')
+    progress: int = Field(default=0, description='进度百分比0-100')
+    char_count: int = Field(default=0, description='稿件字符数')
+    item_total: int = Field(default=0, description='该规范的条目总数')
+    completeness: int = Field(default=0, description='完整度百分比0-100')
+    reported: int = Field(default=0, description='已报告条目数')
+    vague: int = Field(default=0, description='描述模糊条目数')
+    missing: int = Field(default=0, description='未报告条目数')
+    create_time: datetime | None = Field(default=None, description='提交时间')
+    finish_time: datetime | None = Field(default=None, description='完成时间')
+
+
+class AssistRequestModel(BaseModel):
+    """
+    第四步：续写 / 润色 / 中译英
+
+    ## 两种模式，`draft_id` 有没有决定走哪条
+
+    **独立模式（默认）**：用户自己填关键词或粘一段正文，`guideline_code` 只用来告诉模型
+    「按哪份规范写」。这是《智能报告辅助工具.docx》第 4 节的字面形态 —— 那一节四项功能
+    （续写 / 背景生成 / 润色 / 翻译）的输入全都是用户直接给的，没有一项依赖第二步的草稿
+    或第三步的判定。**曾经强制要求 draft_id + item_id 是个设计错误**：文档那句「遵循
+    STRICTA 条目规范」要的是「知道按哪份规范写」，而那个信息第一步就给了；把它读成
+    「必须站在某一条上」，就把已经写好稿、直接来第三步的用户整个挡在了第四步之外。
+
+    **草稿模式**：带上 `draft_id` + `item_id`，条目要求、已写正文、第三步对这一条的判定
+    都由服务层从库里取，改完还能「采用」写回草稿条目。这是有草稿时的快捷方式，不是前提。
+
+    ## 安全边界
+
+    `text` 是用户自己手打/粘贴的内容，收进来没有问题；**不能收的是「按 id 去库里捞」的
+    那一类入参**（`draft_id` / `item_id` 仍旧只用来查，且查之前校验归属）——
+    前端能指定 id 就意味着能拿别人的草稿当 prompt。条目要求也一律从库里取、不由前端传，
+    否则它会变成一个可伪造的任意指令注入口。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    draft_id: int | None = Field(default=None, description='所属草稿id；独立模式不传')
+    item_id: int | None = Field(default=None, description='要改写的 checklist 条目id；独立模式可不传')
+    guideline_code: str = Field(default='', max_length=64, description='按哪份规范写，取自第一步')
+    #: 独立模式下待润色/翻译的正文，或续写时已有的半句。草稿模式下忽略（正文从库里取）
+    text: str = Field(default='', max_length=MAX_ASSIST_INPUT_CHARS, description='用户自己给的正文')
+    action: AssistAction = Field(description='续写 / 润色 / 中译英')
+    style: AssistStyle = Field(default='', description='润色风格，仅 action=polish 时有意义')
+    keywords: str = Field(default='', max_length=500, description='续写关键词，仅 action=continue 时有意义')
+
+    @model_validator(mode='after')
+    def check_mode(self) -> 'AssistRequestModel':
+        """
+        草稿模式必须两个 id 齐全 —— 只给 draft_id 不给 item_id 无从知道改哪一条。
+
+        独立模式两个都不给；只给 item_id（不给 draft_id）是允许的：那表示
+        「照第一步那份规范的第 N 条来写」，条目要求照样从库里取，只是没有草稿可写回。
+        """
+        if self.draft_id is not None and self.item_id is None:
+            raise ValueError('带 draftId 时必须同时给 itemId')
+
+        return self
+
+
+class AssistResultModel(BaseModel):
+    """
+    改写结果。**不直接落库** —— 由用户在第四步看过之后显式「采用」，才走写回接口
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    item_id: int = Field(description='对应的 checklist 条目id')
+    action: str = Field(description='本次执行的动作')
+    text: str = Field(description='改写后的正文')
+    model_label: str = Field(default='', description='实际出结果的模型，便于排障')
+
+
+class AssistApplyModel(BaseModel):
+    """
+    把第四步的改写结果写回第二步的草稿条目
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    draft_id: int = Field(description='所属草稿id')
+    item_id: int = Field(description='要写回的 checklist 条目id')
+    content: str = Field(default='', max_length=MAX_DRAFT_ITEM_CHARS, description='写回的正文')
+
+
+#: 留痕事件的取值域。**枚举而不是自由文本**：前端能传任意字符串就等于绕过了
+#: 「稿件不入库」那条承诺，人读的句子由前端按 i18n 渲染，库里只存这个键
+TrailEvent = Literal['submitted', 'judged', 'cross', 'failed', 'applied']
+
+#: 一次列表最多回多少条留痕
+MAX_TRAIL_ROWS = 50
+
+
+class TrailAddModel(BaseModel):
+    """
+    追加一条留痕
+
+    **除 `note` 外全是数字与枚举**。`note` 仅供系统诊断（worker 的失败原因），
+    接口层限长 300 字符，**前端不得往里塞用户稿件内容** —— 那正是这张表刻意避开的东西。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    event: TrailEvent = Field(description='事件类型')
+    draft_id: int | None = Field(default=None, description='关联草稿id；外部稿件不传')
+    guideline_code: str = Field(default='', max_length=64, description='报告规范代号')
+    actor: str = Field(default='', max_length=200, description='执行者：用户名或模型标识')
+    item_id: int | None = Field(default=None, description='event=applied 时被写回的条目id')
+    total: int | None = Field(default=None, ge=0, description='判定条目总数')
+    reported: int | None = Field(default=None, ge=0, description='已报告条目数')
+    vague: int | None = Field(default=None, ge=0, description='描述模糊条目数')
+    missing: int | None = Field(default=None, ge=0, description='未报告条目数')
+    completeness: int | None = Field(default=None, ge=0, le=100, description='完整性百分比')
+    char_count: int | None = Field(default=None, ge=0, description='稿件字符数（只记长度）')
+    note: str = Field(default='', max_length=300, description='系统诊断信息，不得写入稿件内容')
+
+
+class TrailModel(ActionBaseModel):
+    """
+    一条留痕（出参）
+    """
+
+    trail_id: int | None = Field(default=None, description='留痕id')
+    draft_id: int | None = Field(default=None, description='关联草稿id')
+    guideline_code: str = Field(default='', description='报告规范代号')
+    event: str = Field(default='', description='事件类型')
+    actor: str = Field(default='', description='执行者')
+    item_id: int | None = Field(default=None, description='被写回的条目id')
+    total: int | None = Field(default=None, description='判定条目总数')
+    reported: int | None = Field(default=None, description='已报告条目数')
+    vague: int | None = Field(default=None, description='描述模糊条目数')
+    missing: int | None = Field(default=None, description='未报告条目数')
+    completeness: int | None = Field(default=None, description='完整性百分比')
+    char_count: int | None = Field(default=None, description='稿件字符数')
+    note: str = Field(default='', description='系统诊断信息')
+    create_time: datetime | None = Field(default=None, description='发生时间')
 
 # ---------------------------------------------------------------- 研究类型
 
@@ -716,6 +1086,47 @@ class StudyTypeModel(ActionBaseModel):
     sort_num: int | None = Field(default=None, description='显示顺序')
     guidelines: list[str] = Field(default_factory=list, description='关联规范代号列表')
     stats: list[StudyTypeStatModel] = Field(default_factory=list, description='统计方法推荐')
+class StudyTypePageQueryModel(StudyTypeModel):
+    """
+    研究类型列表查询入参
+    """
+
+    keyword: str | None = Field(default=None, description='按标识或名称模糊搜索')
+
+
+class StudyTypeSaveModel(BaseModel):
+    """
+    研究类型的新增/编辑入参（后台「研究类型管理」）
+
+    ## 三个字段各有各的下游，改错了症状完全不同
+
+    - **`type_key` 是问卷词表的键**。前台第一步的选项写在 `pages/assistant.vue` 的
+      `composables/wizardQuery.ts::TYPE_OPTS` 里，文案键是 `assistant.typeOpt.<type_key>`。
+      **后台加一个类型，前台不同步就选不出来**（数组里没有它），改一个已有的键则会让那个选项
+      的文案退化成键名本身。所以新增/改键时接口会把这件事明说出来，页面上也有提示。
+    - **`hot_guideline` 决定第二步展开哪份 checklist**，必须指向 `action_guideline.code`
+      且那份规范真有条目 —— 指错了前台第二步展不开，用户只会看到一片空白。这条是硬闸。
+    - **`guidelines` 只是展示标签**，不是外键。库里现有「针灸专属条目」「针刺检索策略」
+      「GRADE 证据分级」这类值在 `action_guideline` 里根本不存在，它们是给用户看的说明文字。
+      所以这一栏不校验，只按顺序存。
+
+    ## 两张子表是整体覆盖
+
+    `guidelines` 与 `stats` 传进来是什么就是什么，没带上的行会被删掉 —— 与第二步草稿
+    保存同一种语义：「这次没带这条」与「用户删掉了这条」必须得到同一个结果。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    type_id: int | None = Field(default=None, description='类型id，新增时不传')
+    type_key: str = Field(min_length=1, max_length=32, pattern=r'^[a-z][a-z0-9_]*$', description='类型标识')
+    name_zh: str = Field(min_length=1, max_length=100, description='名称（中文）')
+    name_en: str = Field(default='', max_length=200, description='名称（英文）')
+    hot_guideline: str = Field(default='', max_length=64, description='重点推荐规范代号')
+    sort_num: int | None = Field(default=None, ge=0, description='显示顺序，留空排到末尾')
+    status: Literal['0', '1'] = Field(default='0', description='状态（0正常 1停用）')
+    guidelines: list[str] = Field(default_factory=list, max_length=20, description='关联规范代号（展示标签，整体覆盖）')
+    stats: list[StudyTypeStatModel] = Field(default_factory=list, max_length=20, description='统计方法推荐（整体覆盖）')
 
 
 # ---------------------------------------------------------------- CFIR
@@ -810,8 +1221,10 @@ class ReaimDimensionModel(ActionBaseModel):
 # ---------------------------------------------------------------- SRD
 
 #: 条目评分（新版 Excel 表 1 的四列 + 引擎自己的第五态）。
-#: **分越低越重复**：0 完全相同 / 1 部分相同 / 2 部分不同 / 3 完全不同 / unclear 证据不足。
-#: 与领域、整体的「重复百分比」方向相反，前端渲染时别把两者混成一个色阶。
+#: **分越高越重复**：3 完全相同 / 2 部分相同 / 1 部分不同 / 0 完全不同 / unclear 证据不足。
+#: 与领域、整体的「重复百分比」同向（引擎 0.8.0 起）。
+#: **注意甲方 Excel 表 1 的表头写的是相反的「完全相同 0 分」** —— 拿那张表核对时会读反，
+#: 以引擎 `srd_engine/schemas.py` 的 RATING_LABEL_* 为准。
 SrdRating = Literal['0', '1', '2', '3', 'unclear']
 
 #: 任务状态，取值与 tools/common/task_store.py 的 STATUS_* 一致
@@ -868,7 +1281,7 @@ class SrdDomainModel(ActionBaseModel):
     is_key: Literal['0', '1'] | None = Field(default=None, description='是否关键领域')
     level: DupLevel | None = Field(default=None, description='重复程度')
     pct: int | None = Field(default=None, description='重复度百分比')
-    score_sum: int | None = Field(default=None, description='领域得分（分越低越重复）')
+    score_sum: int | None = Field(default=None, description='领域得分（分越高越重复）')
     score_max: int | None = Field(default=None, description='可评分条目满分=3×可评分条目数')
     score_max_full: int | None = Field(default=None, description='名义满分=3×条目数')
     dup_count: int | None = Field(default=None, description='偏重复条目数（评分0/1）')

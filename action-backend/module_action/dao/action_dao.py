@@ -19,6 +19,11 @@ from module_action.entity.do.action_do import (
     ActionGuidelineItem,
     ActionNews,
     ActionReaimDimension,
+    ActionReportDraft,
+    ActionReportDraftItem,
+    ActionReportReview,
+    ActionReportReviewItem,
+    ActionReportTrail,
     ActionResourceLink,
     ActionSiteText,
     ActionSrdAssessment,
@@ -1096,6 +1101,119 @@ class StudyTypeDao:
             .scalars()
             .all()
         )
+    @classmethod
+    async def get_study_type_by_key(cls, db: AsyncSession, type_key: str) -> ActionStudyType | None:
+        """
+        按标识取一行研究类型（判重用）
+
+        :param db: orm对象
+        :param type_key: 类型标识
+        :return: 研究类型；没有则 None
+        """
+        return (
+            (await db.execute(select(ActionStudyType).where(ActionStudyType.type_key == type_key)))
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_study_type_by_id(cls, db: AsyncSession, type_id: int) -> ActionStudyType | None:
+        """
+        按id取一行研究类型
+
+        :param db: orm对象
+        :param type_id: 类型id
+        :return: 研究类型；没有则 None
+        """
+        return (
+            (await db.execute(select(ActionStudyType).where(ActionStudyType.type_id == type_id)))
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_max_type_sort_num(cls, db: AsyncSession) -> int:
+        """
+        当前最大显示顺序。新类型排到末尾，免得挤到「随机对照试验」前面
+
+        :param db: orm对象
+        :return: 最大值；表空时 0
+        """
+        return (await db.execute(select(func.coalesce(func.max(ActionStudyType.sort_num), 0)))).scalar() or 0
+
+    @classmethod
+    async def add_study_type_dao(cls, db: AsyncSession, obj: ActionStudyType) -> ActionStudyType:
+        """
+        新增一行研究类型
+
+        :param db: orm对象
+        :param obj: 研究类型
+        :return: 落库后的对象（已 flush，主键可用）
+        """
+        db.add(obj)
+        await db.flush()
+
+        return obj
+
+    @classmethod
+    async def edit_study_type_dao(cls, db: AsyncSession, type_id: int, fields: dict[str, Any]) -> None:
+        """
+        改一行研究类型
+
+        :param db: orm对象
+        :param type_id: 类型id
+        :param fields: 待改字段
+        """
+        await db.execute(update(ActionStudyType).where(ActionStudyType.type_id == type_id).values(**fields))
+
+    @classmethod
+    async def delete_study_types_dao(cls, db: AsyncSession, type_ids: list[int]) -> None:
+        """
+        删除研究类型，连同它的两张子表
+
+        **物理删**：这张表没有 del_flag，而且留一行「已删除」的类型在库里毫无用处
+        —— 前台问卷是按 type_key 取的，软删只会让同名 key 再也加不回来。
+
+        :param db: orm对象
+        :param type_ids: 类型id列表
+        """
+        if not type_ids:
+            return
+        await db.execute(delete(ActionStudyTypeGuideline).where(ActionStudyTypeGuideline.type_id.in_(type_ids)))
+        await db.execute(delete(ActionStudyTypeStat).where(ActionStudyTypeStat.type_id.in_(type_ids)))
+        await db.execute(delete(ActionStudyType).where(ActionStudyType.type_id.in_(type_ids)))
+
+    @classmethod
+    async def replace_type_children_dao(
+        cls, db: AsyncSession, type_id: int, guidelines: list[str], stats: list[tuple[str, str]]
+    ) -> None:
+        """
+        整体覆盖某个研究类型的两张子表
+
+        先删后插而不是逐条 upsert：保存是**整体覆盖语义**，「这次没带这条」与
+        「用户删掉了这条」必须得到同一个结果，先删后插天然如此。顺序按数组下标写进
+        `sort_num` —— 前台 chip 的排列顺序就是它。
+
+        :param db: orm对象
+        :param type_id: 类型id
+        :param guidelines: 规范代号（展示标签）
+        :param stats: (中文, 英文) 二元组列表
+        """
+        await db.execute(delete(ActionStudyTypeGuideline).where(ActionStudyTypeGuideline.type_id == type_id))
+        await db.execute(delete(ActionStudyTypeStat).where(ActionStudyTypeStat.type_id == type_id))
+        rows: list[Any] = [
+            ActionStudyTypeGuideline(type_id=type_id, guideline_code=code, sort_num=i)
+            for i, code in enumerate(g.strip() for g in guidelines)
+            if code
+        ]
+        rows += [
+            ActionStudyTypeStat(type_id=type_id, text_zh=zh, text_en=en, sort_num=i)
+            for i, (zh, en) in enumerate(stats)
+            if (zh or '').strip()
+        ]
+        if rows:
+            db.add_all(rows)
+
 
 
 class ImplementationDao:
@@ -1734,3 +1852,608 @@ class GuestProfileDao:
         await db.flush()
 
         return db_profile
+
+
+class ReportDraftDao:
+    """
+    报告草稿数据库操作层（报告助手第二步）
+
+    **越权保护做在这一层的 where 里**，不靠上层写 if：每个按 draft_id 取数或改数的方法都
+    强制带 user_id —— 主表直接比对 `user_id`，从表（条目正文）走 `_owned_draft()` 那个
+    子查询限定「这个 draft_id 确实属于这个人」。把判断放上层的问题在于将来多一个调用方
+    就多一次遗漏的机会，而这里漏一次等于任何登录用户能读写、删除别人的稿件。
+    """
+
+    @classmethod
+    def _owned_draft(cls, draft_id: int, user_id: int, include_deleted: bool = False) -> Any:
+        """
+        「这个 draft_id 属于这个人」的子查询，供条目正文表的语句挂 where 用
+
+        :param draft_id: 草稿id
+        :param user_id: 归属访客用户id
+        :param include_deleted: 是否连已逻辑删除的草稿一起算（删除流程内部用）
+        :return: 可用于 in_() 的子查询
+        """
+        conditions = [ActionReportDraft.draft_id == draft_id, ActionReportDraft.user_id == user_id]
+        if not include_deleted:
+            conditions.append(ActionReportDraft.del_flag == '0')
+
+        return select(ActionReportDraft.draft_id).where(*conditions)
+
+    @classmethod
+    async def get_draft_by_id(cls, db: AsyncSession, draft_id: int, user_id: int) -> ActionReportDraft | None:
+        """
+        取一份草稿（限本人）
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 归属访客用户id
+        :return: 草稿对象；不存在或不属于该用户时为 None
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionReportDraft).where(
+                        ActionReportDraft.draft_id == draft_id,
+                        ActionReportDraft.user_id == user_id,
+                        ActionReportDraft.del_flag == '0',
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_draft_list(cls, db: AsyncSession, user_id: int, limit: int) -> list[ActionReportDraft]:
+        """
+        我的草稿列表（最近改的在前）
+
+        :param db: orm对象
+        :param user_id: 归属访客用户id
+        :param limit: 条数上限
+        :return: 草稿列表
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionReportDraft)
+                    .where(ActionReportDraft.user_id == user_id, ActionReportDraft.del_flag == '0')
+                    .order_by(nullslast(ActionReportDraft.update_time.desc()), ActionReportDraft.draft_id.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def count_drafts(cls, db: AsyncSession, user_id: int) -> int:
+        """
+        统计我的草稿数（用于新建时的配额闸）
+
+        :param db: orm对象
+        :param user_id: 归属访客用户id
+        :return: 草稿数
+        """
+        return (
+            await db.execute(
+                select(func.count())
+                .select_from(ActionReportDraft)
+                .where(ActionReportDraft.user_id == user_id, ActionReportDraft.del_flag == '0')
+            )
+        ).scalar() or 0
+
+    @classmethod
+    async def add_draft_dao(cls, db: AsyncSession, values: dict[str, Any]) -> ActionReportDraft:
+        """
+        新增草稿
+
+        :param db: orm对象
+        :param values: 草稿字段字典
+        :return: 新增的草稿对象
+        """
+        db_draft = ActionReportDraft(**values)
+        db.add(db_draft)
+        await db.flush()
+
+        return db_draft
+
+    @classmethod
+    async def edit_draft_dao(cls, db: AsyncSession, draft_id: int, user_id: int, values: dict[str, Any]) -> None:
+        """
+        更新草稿主表字段（限本人）
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 归属访客用户id
+        :param values: 待更新字段字典
+        """
+        await db.execute(
+            update(ActionReportDraft)
+            .where(ActionReportDraft.draft_id == draft_id, ActionReportDraft.user_id == user_id)
+            .values(**values)
+        )
+
+    @classmethod
+    async def delete_draft_dao(cls, db: AsyncSession, draft_id: int, user_id: int) -> None:
+        """
+        逻辑删除草稿（限本人）
+
+        条目正文一并物理删除：草稿都不在了，留着几十行孤儿正文没有任何用途，
+        而它们是用户的研究内容，留在库里反而是多余的留存。
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 归属访客用户id
+        """
+        # 先删从表再软删主表：从表那句的归属判断挂在主表的 del_flag='0' 上，
+        # 反过来做的话子查询就找不到这份草稿了，正文会留成孤儿行
+        await db.execute(
+            delete(ActionReportDraftItem).where(
+                ActionReportDraftItem.draft_id.in_(cls._owned_draft(draft_id, user_id))
+            )
+        )
+        await db.execute(
+            update(ActionReportDraft)
+            .where(ActionReportDraft.draft_id == draft_id, ActionReportDraft.user_id == user_id)
+            .values(del_flag='2', update_time=datetime.now())
+        )
+
+    @classmethod
+    async def get_draft_items(cls, db: AsyncSession, draft_id: int, user_id: int) -> list[ActionReportDraftItem]:
+        """
+        取一份草稿的全部条目正文（限本人）
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 归属访客用户id
+        :return: 条目正文列表；草稿不存在或不属于该用户时为空
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionReportDraftItem)
+                    .where(ActionReportDraftItem.draft_id.in_(cls._owned_draft(draft_id, user_id)))
+                    .order_by(ActionReportDraftItem.item_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def replace_draft_items(
+        cls, db: AsyncSession, draft_id: int, user_id: int, contents: dict[int, str], scope_ids: set[int]
+    ) -> None:
+        """
+        整体覆盖一份草稿的条目正文（**只在 scope_ids 这个范围内覆盖**）
+
+        先删后插而不是逐条 upsert：保存是**整体覆盖语义**（见 ReportDraftSaveModel），
+        「这次没带这条」与「用户清空了这条」必须得到同一个结果，先删后插天然如此。
+        空内容不入库 —— 「没有行」与「填了空串」在完成度统计里是同一回事。
+
+        **`scope_ids` 是这次保存有权改动的条目集合**（当前规范下仍启用的条目）。
+        管理员在后台停用或删除一条 checklist 条目之后，用户草稿里那条正文就落在范围之外：
+        它不再出现在编辑页上，用户也就无从保留它，如果照旧「全表删光再插回来」，
+        下一次自动保存就会把它悄悄抹掉。留着它，条目被重新启用时内容还在。
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 归属访客用户id
+        :param contents: 条目id -> 正文
+        :param scope_ids: 本次允许覆盖的条目id集合
+        """
+        owned = (await db.execute(cls._owned_draft(draft_id, user_id))).scalars().first()
+        if owned is None:
+            return
+        if scope_ids:
+            await db.execute(
+                delete(ActionReportDraftItem).where(
+                    ActionReportDraftItem.draft_id == draft_id,
+                    ActionReportDraftItem.item_id.in_(scope_ids),
+                )
+            )
+        now = datetime.now()
+        rows = [
+            ActionReportDraftItem(draft_id=draft_id, item_id=item_id, content=content, update_time=now)
+            for item_id, content in contents.items()
+            if content.strip() and item_id in scope_ids
+        ]
+        if rows:
+            db.add_all(rows)
+
+    @classmethod
+    async def get_filled_item_ids(cls, db: AsyncSession, draft_ids: list[int], user_id: int) -> dict[int, set[int]]:
+        """
+        批量取「哪些条目已填」，**不读正文**
+
+        列表页只需要完成度计数。正文是这张表里唯一的大字段，为了算个数把 30 份草稿、
+        每份几十条、每条最多两万字符全捞进内存，是这个接口最容易被打穿的地方。
+
+        :param db: orm对象
+        :param draft_ids: 草稿id列表
+        :param user_id: 归属访客用户id
+        :return: 草稿id -> 已填条目id集合
+        """
+        if not draft_ids:
+            return {}
+        owned = select(ActionReportDraft.draft_id).where(
+            ActionReportDraft.draft_id.in_(draft_ids),
+            ActionReportDraft.user_id == user_id,
+            ActionReportDraft.del_flag == '0',
+        )
+        rows = (
+            await db.execute(
+                select(ActionReportDraftItem.draft_id, ActionReportDraftItem.item_id).where(
+                    ActionReportDraftItem.draft_id.in_(owned),
+                    ActionReportDraftItem.content.isnot(None),
+                    func.length(func.trim(ActionReportDraftItem.content)) > 0,
+                )
+            )
+        ).all()
+        result: dict[int, set[int]] = {draft_id: set() for draft_id in draft_ids}
+        for draft_id, item_id in rows:
+            result[draft_id].add(item_id)
+
+        return result
+
+    @classmethod
+    async def get_item_require_map(cls, db: AsyncSession, guideline_id: int) -> dict[int, str]:
+        """
+        取某份规范全部启用条目的「填写要求」
+
+        只取 item_id 与 require_level 两列：完成度统计不需要条目正文，
+        而条目正文是这张表里最大的字段。
+
+        :param db: orm对象
+        :param guideline_id: 规范id
+        :return: 条目id -> require_level（'0'必填 '1'选填）
+        """
+        rows = (
+            await db.execute(
+                select(ActionGuidelineItem.item_id, ActionGuidelineItem.require_level).where(
+                    ActionGuidelineItem.guideline_id == guideline_id,
+                    ActionGuidelineItem.status == '0',
+                    ActionGuidelineItem.del_flag == '0',
+                )
+            )
+        ).all()
+
+        return {row[0]: (row[1] or '0') for row in rows}
+
+
+class ReportReviewDao:
+    """
+    第三步校验结果数据库操作层
+
+    **越权保护同样做在 where 里**，做法照抄 `ReportDraftDao`：每个方法都把
+    「这份记录属于这个用户」写进条件，而不是让上层先查一次再判。
+
+    这两张表是第三步与第四步之间那段管道 —— 第四步的工作清单从这里取「哪几条描述模糊、
+    哪几条未报告」，改写后写回 `action_report_draft_item`。
+    """
+
+    @classmethod
+    async def add_review_dao(cls, db: AsyncSession, review: ActionReportReview) -> ActionReportReview:
+        """
+        落一行校验任务台账
+
+        **提交那一刻就调用它**（还没有任何判定），结果由 `replace_review_items_dao` 后补。
+        014 之前这张表是「跑完才写」，于是失败与中途离开的任务一条都没留下 —— 而那正是
+        事后要排查的那批。
+
+        :param db: orm对象
+        :param review: 校验记录
+        :return: 落库后的记录（已 flush，review_id 可用）
+        """
+        db.add(review)
+        await db.flush()
+
+        return review
+
+    @classmethod
+    async def edit_review_dao(cls, db: AsyncSession, review_id: int, values: dict[str, Any]) -> None:
+        """
+        更新校验记录的若干列（对账用）
+
+        :param db: orm对象
+        :param review_id: 校验记录id
+        :param values: 列名到值的映射
+        """
+        if not values:
+            return
+        await db.execute(
+            update(ActionReportReview).where(ActionReportReview.review_id == review_id).values(**values)
+        )
+
+    @classmethod
+    async def replace_review_items_dao(cls, db: AsyncSession, review_id: int, verdicts: list[dict[str, Any]]) -> None:
+        """
+        写入一次校验的逐条判定，先清后写
+
+        **先删再插而不是 upsert**：对账可能对同一次任务跑第二遍（比如轮询与历史列表撞在
+        一起），而唯一索引 `(review_id, item_id)` 会让第二遍整批插入失败。清掉重写是幂等的。
+
+        :param db: orm对象
+        :param review_id: 校验记录id
+        :param verdicts: 逐条判定（item_id/status/reason/evidence/lines 的字典列表）
+        """
+        await db.execute(delete(ActionReportReviewItem).where(ActionReportReviewItem.review_id == review_id))
+        if not verdicts:
+            return
+        db.add_all(
+            [
+                ActionReportReviewItem(
+                    review_id=review_id,
+                    item_id=int(v['item_id']),
+                    status=str(v['status']),
+                    reason=v.get('reason') or '',
+                    evidence=v.get('evidence') or '',
+                    lines=v.get('lines') or '',
+                )
+                for v in verdicts
+            ]
+        )
+
+    @classmethod
+    async def trim_user_reviews_dao(cls, db: AsyncSession, user_id: int, keep: int) -> None:
+        """
+        只保留一个访客最近 keep 次校验，更早的连同判定一起物理删
+
+        不设上限的话，反复点「重新校验」会让这两张表随用户手速无限长 —— 而每行现在还挂着
+        一整篇稿件正文，比 014 之前更该管。**按访客而不是按草稿修剪**：外部粘贴的稿件没有
+        草稿可依附，按草稿修剪对它们完全不起作用。
+
+        :param db: orm对象
+        :param user_id: 归属访客用户id
+        :param keep: 保留几次
+        """
+        stale = (
+            (
+                await db.execute(
+                    select(ActionReportReview.review_id)
+                    .where(ActionReportReview.user_id == user_id)
+                    .order_by(ActionReportReview.review_id.desc())
+                    .offset(keep)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not stale:
+            return
+        await db.execute(delete(ActionReportReviewItem).where(ActionReportReviewItem.review_id.in_(stale)))
+        await db.execute(delete(ActionReportReview).where(ActionReportReview.review_id.in_(stale)))
+
+    @classmethod
+    async def get_review_by_id_dao(cls, db: AsyncSession, review_id: int, user_id: int) -> ActionReportReview | None:
+        """
+        按 id 取一次校验（限本人）
+
+        :param db: orm对象
+        :param review_id: 校验记录id
+        :param user_id: 归属访客用户id
+        :return: 校验记录；没有或不属于该用户时为 None
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionReportReview).where(
+                        ActionReportReview.review_id == review_id,
+                        ActionReportReview.user_id == user_id,
+                        ActionReportReview.del_flag == '0',
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_review_by_session_dao(
+        cls, db: AsyncSession, session_id: str, user_id: int
+    ) -> ActionReportReview | None:
+        """
+        按 worker 任务id 取校验记录（限本人，轮询接口用）
+
+        :param db: orm对象
+        :param session_id: worker任务id
+        :param user_id: 归属访客用户id
+        :return: 校验记录；没有或不属于该用户时为 None
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionReportReview)
+                    .where(
+                        ActionReportReview.session_id == session_id,
+                        ActionReportReview.user_id == user_id,
+                        ActionReportReview.del_flag == '0',
+                    )
+                    .order_by(ActionReportReview.review_id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_user_reviews_dao(cls, db: AsyncSession, user_id: int, limit: int) -> list[ActionReportReview]:
+        """
+        「我的校验历史」列表（限本人，含未跑完的）
+
+        :param db: orm对象
+        :param user_id: 归属访客用户id
+        :param limit: 最多取几条
+        :return: 校验记录列表，新的在前
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionReportReview)
+                    .where(ActionReportReview.user_id == user_id, ActionReportReview.del_flag == '0')
+                    .order_by(ActionReportReview.review_id.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def soft_delete_review_dao(cls, db: AsyncSession, review_id: int) -> None:
+        """
+        删除一条校验历史：记录逻辑删，**正文物理删**
+
+        这是 014 存稿件正文的对价（见 `sql/014-action-report-review-history-pg.sql` 的文件头）。
+        用户点「删除」时期待的是「那篇稿子没了」，而不是「列表里看不见了」——
+        只置 `del_flag` 的话正文会一直躺在库里。反过来，台账那几列（session_id / 状态 /
+        错误 / 计数 / 时间）留着不动：事后排查「上周那次校验为什么挂了」靠的正是它们，
+        而它们不含任何稿件内容。
+
+        :param db: orm对象
+        :param review_id: 校验记录id
+        """
+        await db.execute(
+            update(ActionReportReview)
+            .where(ActionReportReview.review_id == review_id)
+            .values(del_flag='2', manuscript=None)
+        )
+        await db.execute(
+            update(ActionReportReviewItem)
+            .where(ActionReportReviewItem.review_id == review_id)
+            .values(evidence=None)
+        )
+
+    @classmethod
+    async def get_latest_review_dao(
+        cls, db: AsyncSession, draft_id: int, user_id: int
+    ) -> ActionReportReview | None:
+        """
+        取某份草稿最近一次**跑完的**校验（限本人，第四步工作清单的数据源）
+
+        `run_status == 'completed'` 这道过滤是 014 加的，别去掉：台账化之后表里会有排队中、
+        跑挂了的行，取到它们的话第四步会拿着一份空判定列出「0 条待办」，
+        和「这份稿子全绿」长得一模一样。
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 归属访客用户id
+        :return: 校验记录；没有或不属于该用户时为 None
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionReportReview)
+                    .where(
+                        ActionReportReview.draft_id == draft_id,
+                        ActionReportReview.user_id == user_id,
+                        ActionReportReview.run_status == 'completed',
+                        ActionReportReview.del_flag == '0',
+                    )
+                    .order_by(ActionReportReview.review_id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_review_items_dao(cls, db: AsyncSession, review_id: int) -> list[ActionReportReviewItem]:
+        """
+        取一次校验的全部逐条判定
+
+        调用方必须先用 `get_latest_review_dao` 确认过归属 —— 本方法不再判一次。
+
+        :param db: orm对象
+        :param review_id: 校验记录id
+        :return: 判定列表
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionReportReviewItem)
+                    .where(ActionReportReviewItem.review_id == review_id)
+                    .order_by(ActionReportReviewItem.item_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def detach_reviews_of_draft_dao(cls, db: AsyncSession, draft_id: int) -> None:
+        """
+        草稿被删时把它的校验记录**摘下来，而不是删掉**
+
+        014 之前这里是物理删，理由是「判定脱离了草稿没有任何意义（条目正文都没了）」。
+        那个理由随 014 失效了：每行校验记录现在自带一份稿件快照与逐条 evidence，
+        它本身就是一条完整的、能独立回看的历史。跟着草稿一起删等于用户删一份草稿、
+        校验历史里悄悄少掉几条 —— 那是没人要求过的数据丢失。
+
+        摘下来之后它就是一条普通的「外部稿件」历史，用户可以在第三步的历史列表里
+        自己删（那条路径会连正文一起真删）。
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        """
+        await db.execute(
+            update(ActionReportReview).where(ActionReportReview.draft_id == draft_id).values(draft_id=None)
+        )
+class ReportTrailDao:
+    """
+    报告助手操作留痕数据库操作层
+
+    **只追加，不修改、不删除**：审计记录能改就不是审计记录了。草稿被删时留痕也**不删**
+    —— 「这份稿子有哪几段来自模型」这个问题，在草稿删掉之后反而更需要答得出来，
+    所以 `draft_id` 只是个弱关联，不做级联。
+    """
+
+    @classmethod
+    async def add_trail_dao(cls, db: AsyncSession, trail: ActionReportTrail) -> ActionReportTrail:
+        """
+        追加一条留痕
+
+        :param db: orm对象
+        :param trail: 留痕对象
+        :return: 落库后的对象
+        """
+        db.add(trail)
+        await db.flush()
+
+        return trail
+
+    @classmethod
+    async def get_trail_list_dao(
+        cls, db: AsyncSession, user_id: int, draft_id: int | None, limit: int
+    ) -> list[ActionReportTrail]:
+        """
+        取某人的留痕（可按草稿过滤），最近的在前
+
+        **越权保护做在 where 里**：`user_id` 是条件的一部分，不靠上层先查一次再判。
+
+        :param db: orm对象
+        :param user_id: 操作人
+        :param draft_id: 只看某份草稿；None 表示看全部
+        :param limit: 最多回多少条
+        :return: 留痕列表
+        """
+        conditions = [ActionReportTrail.user_id == user_id]
+        if draft_id is not None:
+            conditions.append(ActionReportTrail.draft_id == draft_id)
+
+        return list(
+            (
+                await db.execute(
+                    select(ActionReportTrail)
+                    .where(*conditions)
+                    .order_by(ActionReportTrail.trail_id.desc())
+                    .limit(limit)
+                )
+            )
+            .scalars()
+            .all()
+        )

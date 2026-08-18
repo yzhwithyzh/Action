@@ -32,6 +32,8 @@ from module_action.entity.vo.action_vo import (
     SiteTextGroupModel,
     SiteTextModel,
     SiteTextPageQueryModel,
+    StudyTypeModel,
+    StudyTypeSaveModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
 )
@@ -44,6 +46,7 @@ from module_action.service.action_service import (
     ResourceLinkService,
     SiteRebuildService,
     SiteTextService,
+    StudyTypeService,
     TeamMemberService,
 )
 from module_admin.entity.vo.common_vo import UploadResponseModel
@@ -1002,6 +1005,89 @@ async def delete_admin_collab(
     query_db: Annotated[AsyncSession, DBSessionDependency()],
 ) -> Response:
     result = await CollabRequestService.delete_request_services(query_db, request_ids)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+# ---------------------------------------------------------------- 研究类型（报告助手第一步的问卷词表）
+#
+# 与「规范分类管理」（`action_guideline_category`，规范目录的陈列分类）用途不同、不要合并：
+# 这张表决定报告助手第一步问「你的研究属于哪一类」时有哪些选项，以及每个选项挂哪些规范、
+# 推荐哪些统计方法。同一类研究在两边取同样的 key，但不构成外键关系。
+
+
+@action_admin_controller.get(
+    '/study-type/list',
+    summary='获取研究类型列表',
+    description='后台维护用。**不分页** —— 这是张词表，眼下 8 行，可预见也就十几行',
+    response_model=DataResponseModel[list[StudyTypeModel]],
+    dependencies=[UserInterfaceAuthDependency('action:studyType:list')],
+)
+async def get_admin_study_type_list(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    keyword: Annotated[str | None, Query(description='按标识或名称模糊搜索')] = None,
+) -> Response:
+    result = await StudyTypeService.get_study_type_page_services(query_db, keyword)
+    logger.info('获取研究类型列表成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.post(
+    '/study-type',
+    summary='新增研究类型',
+    description=(
+        '**入库只是一半**：前台第一步的选项写在 `composables/wizardQuery.ts` 的 TYPE_OPTS 里，'
+        '文案键是 `assistant.typeOpt.<typeKey>`，不同步的话这个类型在官网上选不出来。'
+        '接口会把这句话放进返回消息里'
+    ),
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:studyType:add')],
+)
+async def add_admin_study_type(
+    request: Request,
+    add_study_type: StudyTypeSaveModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    result = await StudyTypeService.add_study_type_services(query_db, add_study_type, current_user.user.user_name)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.put(
+    '/study-type',
+    summary='编辑研究类型',
+    description='两张子表（关联规范标签 / 统计推荐）是**整体覆盖**：传进来是什么就是什么，没带上的行会被删掉',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:studyType:edit')],
+)
+async def edit_admin_study_type(
+    request: Request,
+    edit_study_type: StudyTypeSaveModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    result = await StudyTypeService.edit_study_type_services(query_db, edit_study_type, current_user.user.user_name)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.delete(
+    '/study-type/{type_ids}',
+    summary='删除研究类型',
+    description='连同它的关联规范标签与统计推荐一起删。**物理删** —— 这张表没有 del_flag',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:studyType:remove')],
+)
+async def delete_admin_study_type(
+    request: Request,
+    type_ids: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await StudyTypeService.delete_study_type_services(query_db, type_ids)
     logger.info(result.message)
 
     return ResponseUtil.success(msg=result.message)
