@@ -261,6 +261,7 @@ class ApiNamespace:
     ACTION_REPORT_DRAFT: 官网报告助手报告草稿读写接口命名空间
     ACTION_SRD_ASSESS: 官网 SRD 系统综述重复性评估提交接口命名空间
     ACTION_SRD_EXPORT: 官网 SRD 评估结果导出 Excel 接口命名空间
+    ACTION_NEWS_IMAGE: 官网新闻正文配图上传接口命名空间
     ACTION_TEAM_AVATAR: 官网团队成员头像上传接口命名空间
     ACTION_GUIDELINE_FILE: 官网报告规范文档上传接口命名空间
     ACTION_RESOURCE_LOGO: 官网资源中心标识图上传接口命名空间
@@ -384,6 +385,7 @@ class ApiNamespace:
     ACTION_REPORT_DRAFT = 'action:report:draft'
     ACTION_SRD_ASSESS = 'action:srd:assess'
     ACTION_SRD_EXPORT = 'action:srd:export'
+    ACTION_NEWS_IMAGE = 'action:news:image'
     ACTION_TEAM_AVATAR = 'action:team:avatar'
     ACTION_GUIDELINE_FILE = 'action:guideline:file'
     ACTION_RESOURCE_LOGO = 'action:resource:logo'

@@ -172,6 +172,47 @@ async def delete_admin_news(
     return ResponseUtil.success(msg=result.message)
 
 
+@action_admin_controller.post(
+    '/news/image',
+    summary='上传新闻正文配图',
+    description=(
+        '后台维护用，富文本编辑器里插入或**粘贴**图片时调它，直传阿里云 OSS，'
+        '返回可直接写进 `<img src>` 的公网地址'
+    ),
+    response_model=DynamicResponseModel[UploadResponseModel],
+    dependencies=[UserInterfaceAuthDependency('action:news:edit')],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_NEWS_IMAGE, preset=ApiRateLimitPreset.COMMON_UPLOAD)
+async def upload_admin_news_image(
+    request: Request,
+    file: Annotated[UploadFile, File(...)],
+) -> Response:
+    # 正文配图与团队头像同理，但**这一条更容易被忽略**：正文是富文本，图片是编辑时
+    # 顺手插进去/粘贴进去的，走 /common/upload 会落到后端本地磁盘并拼出
+    # `/prod-api/profile/upload/...` 这种**后台自己域下的相对路径** ——
+    # 官网是另一个域的静态站，那个地址在官网上取不到，新闻详情页会整片裂图。
+    extension = OssUtil.normalize_extension(file.filename or '')
+    content = await file.read()
+    if not content:
+        raise ServiceException(message='上传的图片为空')
+    if len(content) > MAX_IMAGE_SIZE:
+        raise ServiceException(message=f'图片大小不能超过 {MAX_IMAGE_SIZE // 1024 // 1024}MB')
+
+    object_key = OssUtil.build_object_key('news', extension)
+    url = await OssUtil.put_object(object_key, content, extension)
+    logger.info(f'新闻正文配图上传成功：{object_key}')
+
+    # fileName 与 url 同为公网地址，理由同头像接口
+    return ResponseUtil.success(
+        model_content=UploadResponseModel(
+            fileName=url,
+            newFileName=object_key.rsplit('/', 1)[-1],
+            originalFilename=file.filename,
+            url=url,
+        )
+    )
+
+
 # ------------------------------------------------------------------ 团队成员
 
 
