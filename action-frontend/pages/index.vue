@@ -24,12 +24,40 @@ interface HomeNewsRow {
   isExternal: '0' | '1' | null
 }
 
+/** 资源中心外链（一条一张卡片），来自 action_resource_link */
+interface ResourceLinkRow {
+  linkId: number
+  nameZh: string | null
+  nameEn: string | null
+  summaryZh: string | null
+  summaryEn: string | null
+  url: string
+  logoUrl: string | null
+}
+
 const { pick } = useBilingual()
+
+/**
+ * 「一个平台，四类能力」五张卡片下方的标签行。
+ *
+ * 原先是模板里写死的中文 `<li>`，切到英文界面纹丝不动 —— 它们是 `aria-hidden` 的装饰性
+ * 标签，不是数据，所以既没走 i18n 也没进库，漏得很隐蔽。现在一枚标签一个 `$t()` 键
+ * （`index.modTag.*`），顺序即这里的数组顺序。
+ *
+ * 数组只放键名不放文案：vue-i18n 的消息里存不了数组（`tools/extract_site_texts.py`
+ * 的 `_flatten` 把非 dict 一律当叶子，塞进去会被 `str()` 成一串 `['a', 'b']` 入库）。
+ */
+const MOD_TAGS = {
+  gl: ['gl1', 'gl2', 'gl3', 'gl4', 'gl5', 'gl6'],
+  as: ['as1', 'as2', 'as3', 'as4', 'as5'],
+  im: ['im1', 'im2', 'im3'],
+  sr: ['sr1', 'sr2', 'sr3', 'sr4'],
+  co: ['co1', 'co2', 'co3'],
+} as const
 
 // 首页新闻区与 /news 同源，只取前 3 条。顺序照接口返回，不在前端二次排序
 // （DAO 已按 置顶 > 发布日期倒序 NULLS LAST > id 倒序 排好）。
-// swr：新闻由后台随时发布，不能停在构建期那一刻的快照上。
-const { data: newsRes } = await useSiteList<HomeNewsRow>('/news', { pageNum: 1, pageSize: 3 }, 'home-news', { swr: true })
+const { data: newsRes } = await useSiteList<HomeNewsRow>('/news', { pageNum: 1, pageSize: 3 }, 'home-news')
 const newsRows = computed<HomeNewsRow[]>(() => newsRes.value?.rows ?? [])
 
 /** `2026-07-01` → `2026-07` */
@@ -39,6 +67,15 @@ const ym = (d: string | null) => (d ? d.slice(0, 7) : '')
 const hrefOf = (r: HomeNewsRow) => r.linkUrl || `/news/${r.newsId}`
 const opensNewTab = (r: HomeNewsRow) => r.isExternal === '1' && !!r.linkUrl
 
+/**
+ * 资源中心的 6 张外链卡片原本写死在下面的模板里（域名、logo 路径、i18n 的 s055–s065），
+ * 甲方增删一条循证枢纽或某组织换域名都得改源码重新构建。现读 action_resource_link 表。
+ * 后台改完访客刷新即见（`useSiteApi` 默认重取），首屏 HTML 仍要等下一次 generate。
+ */
+const { data: resRes } = await useSiteObject<ResourceLinkRow[]>('/resource-links', 'home-resources')
+const resourceRows = computed<ResourceLinkRow[]>(() => resRes.value?.data ?? [])
+
+// 重取回来的新节点由 useReveal 的 MutationObserver 自动接管，这里不用再手动 rescan
 useReveal()
 </script>
 
@@ -64,7 +101,7 @@ useReveal()
           </div>
           <!-- 工具预览：报告助手第一步「立项匹配」界面预览 -->
           <div class="tp-shell reveal">
-            <div class="tp" role="img" aria-label="报告助手界面预览：选择研究类型为随机对照试验，自动挂载 CONSORT、STRICTA、SPIRIT 规范，逐条校验报告完整性清单，当前完整性 82%。">
+            <div class="tp" role="img" :aria-label="t('index.previewAria')">
               <div class="tp-chrome" aria-hidden="true">
                 <span class="tp-dots"><i></i><i></i><i></i></span>
                 <span class="tp-title">{{ t('index.s009') }}</span>
@@ -114,7 +151,7 @@ useReveal()
             <h3>{{ t('index.s023') }}</h3>
             <p class="mod-desc">{{ t('index.s024') }}</p>
             <ul class="mod-list" aria-hidden="true">
-              <li>RCT · CONSORT/STRICTA</li><li>方案 · SPIRIT</li><li>系统综述 · PRISMA</li><li>病例 · CARE</li><li>指南 · RIGHT</li><li>动物 · ARRIVE</li>
+              <li v-for="k in MOD_TAGS.gl" :key="k">{{ t(`index.modTag.${k}`) }}</li>
             </ul>
             <span class="mod-go" v-html="t('index.s025')"></span>
           </NuxtLink>
@@ -126,30 +163,30 @@ useReveal()
             <h3>{{ t('index.s027') }}</h3>
             <p class="mod-desc">{{ t('index.s028') }}</p>
             <ul class="mod-list" aria-hidden="true">
-              <li>研究类型匹配</li><li>在线模板</li><li>内容校验</li><li>AI 辅助撰写</li><li>导出分享</li>
+              <li v-for="k in MOD_TAGS.as" :key="k">{{ t(`index.modTag.${k}`) }}</li>
             </ul>
             <span class="mod-go" v-html="t('index.s029')"></span>
           </NuxtLink>
 
           <!-- 模块 3：实施科学工具 -->
           <NuxtLink class="mod-card reveal" to="/implementation">
+            <span class="mod-badge">{{ t('index.s033') }}</span>
             <svg class="mod-ic" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="24" cy="24" r="6" /><path d="M24 6v6M24 36v6M6 24h6M36 24h6M11 11l4.5 4.5M32.5 32.5 37 37M37 11l-4.5 4.5M15.5 32.5 11 37" /></svg>
             <h3>{{ t('index.s030') }}</h3>
             <p class="mod-desc">{{ t('index.s031') }}</p>
             <ul class="mod-list" aria-hidden="true">
-              <li>CFIR 评估优化</li><li>ERIC 策略匹配</li><li>RE-AIM 转化评价</li>
+              <li v-for="k in MOD_TAGS.im" :key="k">{{ t(`index.modTag.${k}`) }}</li>
             </ul>
             <span class="mod-go" v-html="t('index.s032')"></span>
           </NuxtLink>
 
           <!-- 模块：方法学评估工具 -->
           <NuxtLink class="mod-card reveal" to="/srd">
-            <span class="mod-badge">{{ t('index.s033') }}</span>
             <svg class="mod-ic" viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><rect x="7" y="6" width="20" height="26" rx="2.5" /><rect x="21" y="16" width="20" height="26" rx="2.5" /><path d="M11 13h10M11 19h7M25 23h10M25 29h7" /></svg>
             <h3>{{ t('index.s034') }}</h3>
             <p class="mod-desc">{{ t('index.s035') }}</p>
             <ul class="mod-list" aria-hidden="true">
-              <li>SRD 重复性评估</li><li>逐条比对</li><li>整体判定</li><li>导出表格</li>
+              <li v-for="k in MOD_TAGS.sr" :key="k">{{ t(`index.modTag.${k}`) }}</li>
             </ul>
             <span class="mod-go" v-html="t('index.s036')"></span>
           </NuxtLink>
@@ -160,7 +197,7 @@ useReveal()
             <h3>{{ t('index.s037') }}</h3>
             <p class="mod-desc">{{ t('index.s038') }}</p>
             <ul class="mod-list" aria-hidden="true">
-              <li>专家咨询通道</li><li>用户交流论坛</li><li>机构合作网络</li>
+              <li v-for="k in MOD_TAGS.co" :key="k">{{ t(`index.modTag.${k}`) }}</li>
             </ul>
             <span class="mod-go" v-html="t('index.s039')"></span>
           </NuxtLink>
@@ -223,35 +260,26 @@ useReveal()
         <h2 class="title reveal">{{ t('index.s053') }}</h2>
         <p class="lead reveal">{{ t('index.s054') }}</p>
         <div class="res-cards">
-          <a class="res-row reveal" href="https://www.equator-network.org" target="_blank" rel="noopener noreferrer">
-            <img class="res-logo" src="/assets/logo-equator.png" alt="" loading="lazy" width="96" height="96" />
-            <span class="rr-main"><b>EQUATOR Network</b><span>{{ t('index.s055') }}</span></span>
+          <!-- 一条记录一张卡片，顺序照接口返回（DAO 已按 sortNum 排好），后台「资源中心管理」页维护 -->
+          <a
+            v-for="r in resourceRows"
+            :key="r.linkId"
+            class="res-row reveal"
+            :href="r.url"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            <img
+              v-if="r.logoUrl"
+              class="res-logo"
+              :src="r.logoUrl"
+              alt=""
+              loading="lazy"
+              width="96"
+              height="96"
+            />
+            <span class="rr-main"><b>{{ pick(r, 'name') }}</b><span>{{ pick(r, 'summary') }}</span></span>
             <svg class="r-ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg><span class="vh">{{ t('index.s056') }}</span>
-          </a>
-          <a class="res-row reveal" href="https://www.cochrane.org" target="_blank" rel="noopener noreferrer">
-            <img class="res-logo" src="/assets/logo-cochrane.png" alt="" loading="lazy" width="96" height="96" />
-            <span class="rr-main"><b>Cochrane</b><span>{{ t('index.s057') }}</span></span>
-            <svg class="r-ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg><span class="vh">{{ t('index.s058') }}</span>
-          </a>
-          <a class="res-row reveal" href="https://www.consort-spirit.org" target="_blank" rel="noopener noreferrer">
-            <img class="res-logo" src="/assets/logo-consort.png" alt="" loading="lazy" width="96" height="96" />
-            <span class="rr-main"><b>CONSORT &amp; SPIRIT</b><span>{{ t('index.s059') }}</span></span>
-            <svg class="r-ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg><span class="vh">{{ t('index.s060') }}</span>
-          </a>
-          <a class="res-row reveal" href="https://www.prisma-statement.org" target="_blank" rel="noopener noreferrer">
-            <img class="res-logo" src="/assets/logo-prisma.png" alt="" loading="lazy" width="96" height="96" />
-            <span class="rr-main"><b>PRISMA</b><span>{{ t('index.s061') }}</span></span>
-            <svg class="r-ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg><span class="vh">{{ t('index.s062') }}</span>
-          </a>
-          <a class="res-row reveal" href="https://arriveguidelines.org" target="_blank" rel="noopener noreferrer">
-            <img class="res-logo" src="/assets/logo-arrive.png" alt="" loading="lazy" width="96" height="96" />
-            <span class="rr-main"><b>ARRIVE</b><span>{{ t('index.s063') }}</span></span>
-            <svg class="r-ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg><span class="vh">{{ t('index.s064') }}</span>
-          </a>
-          <a class="res-row reveal" href="https://www.care-statement.org" target="_blank" rel="noopener noreferrer">
-            <img class="res-logo" src="/assets/logo-care.png" alt="" loading="lazy" width="96" height="96" />
-            <span class="rr-main"><b>CARE</b><span>{{ t('index.s065') }}</span></span>
-            <svg class="r-ext" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M8 7h9v9" /></svg><span class="vh">{{ t('index.s066') }}</span>
           </a>
         </div>
       </div>
@@ -456,11 +484,8 @@ useReveal()
 .page-index .res-row .rr-main span{display:block;font-size:13.5px;color:var(--muted);margin-top:2px}
 .page-index .res-row .r-ext{width:19px;height:19px;color:var(--indigo-300);flex-shrink:0;transition:color .2s,transform .2s}
 .page-index .res-row:hover .r-ext{color:var(--cinnabar);transform:translate(2px,-2px)}
-@media (prefers-reduced-motion:no-preference){
-.page-index html.js .reveal{opacity:0;transform:translateY(18px);
-      transition:opacity .8s var(--ease),transform .8s var(--ease)}
-.page-index html.js .reveal.is-visible{opacity:1;transform:none}
-}
+/* 揭示动画只在 base.css 里定义：加了 .page-index 前缀的那两条永远匹配不上
+   （html 不可能是某个 div 的后代），删掉以免误以为本页另有一套。 */
 @media(max-width:960px){
 .page-index .hero-grid{grid-template-columns:1fr;gap:44px}
 .page-index .tp{max-width:520px;margin:0 auto}

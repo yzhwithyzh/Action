@@ -97,7 +97,8 @@ create table action_guideline (
     study_type    varchar(64)   default '',
     summary_zh    text,
     summary_en    text,
-    version       varchar(64)   default '',
+    version_zh    varchar(64)   default '',
+    version_en    varchar(64)   default '',
     file_url_zh   varchar(500)  default '',
     file_url_en   varchar(500)  default '',
     external_url  varchar(500)  default '',
@@ -117,18 +118,22 @@ comment on table  action_guideline is '官网-报告规范目录';
 comment on column action_guideline.code is '规范代号（CONSORT/STRICTA/SPIRIT…）';
 comment on column action_guideline.study_type is '适用研究类型（rct/nrct/protocol/case/sr/obs/guideline/animal）';
 comment on column action_guideline.release_state is '开放状态（open开放 beta内测 soon即将上线）';
+-- 版本号是要显示给访客的一句话（「2010 修订 · 6 领域 / 17 条目」），不是内部版本标识，
+-- 所以和 name/summary 一样分中英两列：只留一列的话英文界面会原样显示中文。
+comment on column action_guideline.version_zh is '版本（中文）';
+comment on column action_guideline.version_en is '版本（英文）';
 comment on column action_guideline.file_url_zh is '中文版下载地址（文件存阿里云 OSS，由后台上传；初始为空串）';
 comment on column action_guideline.file_url_en is '英文版下载地址（文件存阿里云 OSS，由后台上传；初始为空串）';
 comment on column action_guideline.external_url is '外部官方链接（如已发表共识的 DOI 或官方站点）';
 create unique index uk_action_guideline_code on action_guideline (lower(code)) where del_flag = '0';
 
 -- action_guideline 种子数据（6 行）
-insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (1, 'STRICTA', 'STRICTA（针刺临床试验干预措施报告标准）', 'STRICTA (Standards for Reporting Interventions in Clinical Trials of Acupuncture)', 'rct', 'STRICTA（针刺临床试验干预措施报告标准）是 CONSORT 的官方扩展，规定 RCT 中针刺干预应如何报告：针刺理论依据、针刺细节（选穴、深度、得气反应）、治疗方案、联合干预、施术者背景，以及对照/对照措施的设置。', 'STRICTA (Standards for Reporting Interventions in Clinical Trials of Acupuncture) is a CONSORT extension. It specifies how acupuncture interventions should be reported in RCTs: acupuncture rationale, needling details (points, depth, response sought), treatment regimen, co-interventions, practitioner background and control/comparator.', '2010 修订 · 6 领域 / 17 条目', '', '', '', '', 'open', 0, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
-insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (2, 'SPIRIT', 'SPIRIT-TCM Extension 2018（中医药临床试验方案标准条目）', 'SPIRIT-TCM Extension 2018', 'protocol', 'SPIRIT-TCM Extension 2018 在 SPIRIT 声明（干预性试验方案标准条目）基础上针对中医药（含针刺）适配，规定试验方案在开始前需预先明确的内容，使计划中的方法在实施前即透明可核。', 'The SPIRIT-TCM Extension 2018 adapts the SPIRIT statement (Standard Protocol Items: Recommendations for Interventional Trials) for traditional Chinese medicine, including acupuncture. It guides what a trial protocol must pre-specify, so the planned methods are transparent before the trial begins.', '2018 扩展版', '', '', '', '', 'open', 1, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
-insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (3, 'PRISMA', 'PRISMA for Acupuncture（针刺系统综述与 Meta 分析报告规范）', 'PRISMA for Acupuncture', 'sr', 'PRISMA for Acupuncture 为综合针刺证据的系统综述与 Meta 分析提供报告条目，重点回应证据合成中如何处理针刺特有属性（干预细节、辨证分型、假针/安慰对照等）。', 'PRISMA for Acupuncture provides reporting items for systematic reviews and meta-analyses that synthesise acupuncture evidence, addressing how acupuncture-specific characteristics (intervention details, syndrome differentiation, sham/placebo controls) should be handled in evidence synthesis.', '现行清单', '', '', '', '/assets/logo-prisma.png', 'open', 2, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
-insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (4, 'CARE', 'CARE for Acupuncture（针刺病例报告规范）', 'CARE for Acupuncture', 'case', 'CARE for Acupuncture 将 CARE（病例报告）声明扩展至针刺病例报告与病例系列。它依循 EQUATOR 方法学、由国际多学科专家组制定，补齐了通用病例报告规范所缺失的针刺细节：针具类型、选穴与操作、辨证分型、得气与不良事件。', 'CARE for Acupuncture extends the CARE (CAse REport) statement to acupuncture case reports and case series. Developed under the EQUATOR methodology by an international, multidisciplinary panel, it adds the acupuncture-specific detail that generic case-report guidance omits — needle type, point selection and operation, syndrome differentiation, de qi, and adverse events.', 'v1.0 · 13 领域 / 30 条目', '', '', 'https://doi.org/10.1136/bmjebm-2025-113641', '/assets/logo-care.png', 'open', 3, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
-insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (5, 'RIGHT', 'RIGHT for Acupuncture（针刺临床实践指南报告规范）', 'RIGHT for Acupuncture', 'guideline', 'RIGHT for Acupuncture 将 RIGHT（卫生实践指南报告条目）声明扩展至含针刺推荐的临床实践指南，使指南制定者透明报告证据基础、推荐强度与针刺相关细节。', 'RIGHT for Acupuncture extends the RIGHT (Reporting Items for practice Guidelines in HealThcare) statement to clinical practice guidelines that include acupuncture recommendations, so guideline developers report the evidence base, recommendation strength and acupuncture specifics transparently.', '现行版', '', '', '', '', 'open', 4, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
-insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (6, 'ARRIVE', 'ARRIVE 2.0（活体动物实验报告规范）', 'ARRIVE 2.0 (Animal Research: Reporting of In Vivo Experiments)', 'animal', 'ARRIVE 2.0（活体动物实验报告规范）规范动物研究的报告，是支撑针刺科学的机制与临床前研究基础。其「核心 10 项」与推荐条目覆盖研究设计、样本量、随机化、盲法、结局指标与统计分析。', 'ARRIVE 2.0 (Animal Research: Reporting of In Vivo Experiments) governs the reporting of animal studies — the mechanism and pre-clinical research that underpins acupuncture science. The ''Essential 10'' plus the recommended set cover study design, sample size, randomisation, blinding, outcome measures and statistics.', '2.0 版（2020）', '', '', '', '/assets/logo-arrive.png', 'open', 5, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
+insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version_zh, version_en, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (1, 'STRICTA', 'STRICTA（针刺临床试验干预措施报告标准）', 'STRICTA (Standards for Reporting Interventions in Clinical Trials of Acupuncture)', 'rct', 'STRICTA（针刺临床试验干预措施报告标准）是 CONSORT 的官方扩展，规定 RCT 中针刺干预应如何报告：针刺理论依据、针刺细节（选穴、深度、得气反应）、治疗方案、联合干预、施术者背景，以及对照/对照措施的设置。', 'STRICTA (Standards for Reporting Interventions in Clinical Trials of Acupuncture) is a CONSORT extension. It specifies how acupuncture interventions should be reported in RCTs: acupuncture rationale, needling details (points, depth, response sought), treatment regimen, co-interventions, practitioner background and control/comparator.', '2010 修订 · 6 领域 / 17 条目', 'Revised 2010 · 6 domains / 17 items', '', '', '', '', 'open', 0, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
+insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version_zh, version_en, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (2, 'SPIRIT', 'SPIRIT-TCM Extension 2018（中医药临床试验方案标准条目）', 'SPIRIT-TCM Extension 2018', 'protocol', 'SPIRIT-TCM Extension 2018 在 SPIRIT 声明（干预性试验方案标准条目）基础上针对中医药（含针刺）适配，规定试验方案在开始前需预先明确的内容，使计划中的方法在实施前即透明可核。', 'The SPIRIT-TCM Extension 2018 adapts the SPIRIT statement (Standard Protocol Items: Recommendations for Interventional Trials) for traditional Chinese medicine, including acupuncture. It guides what a trial protocol must pre-specify, so the planned methods are transparent before the trial begins.', '2018 扩展版', 'Extension 2018', '', '', '', '', 'open', 1, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
+insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version_zh, version_en, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (3, 'PRISMA', 'PRISMA for Acupuncture（针刺系统综述与 Meta 分析报告规范）', 'PRISMA for Acupuncture', 'sr', 'PRISMA for Acupuncture 为综合针刺证据的系统综述与 Meta 分析提供报告条目，重点回应证据合成中如何处理针刺特有属性（干预细节、辨证分型、假针/安慰对照等）。', 'PRISMA for Acupuncture provides reporting items for systematic reviews and meta-analyses that synthesise acupuncture evidence, addressing how acupuncture-specific characteristics (intervention details, syndrome differentiation, sham/placebo controls) should be handled in evidence synthesis.', '现行清单', 'Current checklist', '', '', '', '/assets/logo-prisma.png', 'open', 2, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
+insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version_zh, version_en, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (4, 'CARE', 'CARE for Acupuncture（针刺病例报告规范）', 'CARE for Acupuncture', 'case', 'CARE for Acupuncture 将 CARE（病例报告）声明扩展至针刺病例报告与病例系列。它依循 EQUATOR 方法学、由国际多学科专家组制定，补齐了通用病例报告规范所缺失的针刺细节：针具类型、选穴与操作、辨证分型、得气与不良事件。', 'CARE for Acupuncture extends the CARE (CAse REport) statement to acupuncture case reports and case series. Developed under the EQUATOR methodology by an international, multidisciplinary panel, it adds the acupuncture-specific detail that generic case-report guidance omits — needle type, point selection and operation, syndrome differentiation, de qi, and adverse events.', 'v1.0 · 13 领域 / 30 条目', 'v1.0 · 13 domains / 30 items', '', '', 'https://doi.org/10.1136/bmjebm-2025-113641', '/assets/logo-care.png', 'open', 3, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
+insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version_zh, version_en, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (5, 'RIGHT', 'RIGHT for Acupuncture（针刺临床实践指南报告规范）', 'RIGHT for Acupuncture', 'guideline', 'RIGHT for Acupuncture 将 RIGHT（卫生实践指南报告条目）声明扩展至含针刺推荐的临床实践指南，使指南制定者透明报告证据基础、推荐强度与针刺相关细节。', 'RIGHT for Acupuncture extends the RIGHT (Reporting Items for practice Guidelines in HealThcare) statement to clinical practice guidelines that include acupuncture recommendations, so guideline developers report the evidence base, recommendation strength and acupuncture specifics transparently.', '现行版', 'Current version', '', '', '', '', 'open', 4, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
+insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version_zh, version_en, file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status, del_flag, create_by, create_time, update_by, update_time, remark) values (6, 'ARRIVE', 'ARRIVE 2.0（活体动物实验报告规范）', 'ARRIVE 2.0 (Animal Research: Reporting of In Vivo Experiments)', 'animal', 'ARRIVE 2.0（活体动物实验报告规范）规范动物研究的报告，是支撑针刺科学的机制与临床前研究基础。其「核心 10 项」与推荐条目覆盖研究设计、样本量、随机化、盲法、结局指标与统计分析。', 'ARRIVE 2.0 (Animal Research: Reporting of In Vivo Experiments) governs the reporting of animal studies — the mechanism and pre-clinical research that underpins acupuncture science. The ''Essential 10'' plus the recommended set cover study design, sample size, randomisation, blinding, outcome measures and statistics.', '2.0 版（2020）', 'Version 2.0 (2020)', '', '', '', '/assets/logo-arrive.png', 'open', 5, '0', '0', 'migration', '2026-07-28 22:48:34', '', null, null);
 
 -- ----------------------------
 -- 3、研究类型（报告助手：类型 -> 规范 + 统计推荐）
@@ -149,16 +154,23 @@ create table action_study_type (
     primary key (type_id)
 );
 comment on table  action_study_type is '官网-研究类型';
-comment on column action_study_type.type_key is '类型标识（rct/nrct/case/sr/obs）';
-comment on column action_study_type.hot_guideline is '重点推荐规范代号';
+comment on column action_study_type.type_key is '类型标识（rct/nrct/case/sr/obs/protocol/animal/guideline）';
+comment on column action_study_type.hot_guideline is '重点推荐规范代号，必须是 action_guideline.code 且该规范下有 checklist 条目';
 create unique index uk_action_study_type_key on action_study_type (type_key);
 
--- action_study_type 种子数据（5 行）
+-- action_study_type 种子数据（8 行）
+-- 这是**报告助手第一步的问卷词表**，与 action_guideline_category（规范目录的陈列分类）
+-- 用途不同、刻意不合并；两边对同一类东西取同样的 key，但不构成外键关系。
 insert into action_study_type (type_id, type_key, name_zh, name_en, hot_guideline, sort_num, status, create_by, create_time, update_by, update_time) values (1, 'rct', '随机对照试验 RCT', 'Randomised Controlled Trial', 'STRICTA', 0, '0', 'migration', '2026-07-28 20:06:51', '', NULL);
 insert into action_study_type (type_id, type_key, name_zh, name_en, hot_guideline, sort_num, status, create_by, create_time, update_by, update_time) values (2, 'nrct', '非随机对照试验', 'Non-randomised controlled trial', 'STRICTA', 1, '0', 'migration', '2026-07-28 20:06:51', '', NULL);
 insert into action_study_type (type_id, type_key, name_zh, name_en, hot_guideline, sort_num, status, create_by, create_time, update_by, update_time) values (3, 'case', '病例报告 / 系列', 'Case report / series', 'CARE', 2, '0', 'migration', '2026-07-28 20:06:51', '', NULL);
 insert into action_study_type (type_id, type_key, name_zh, name_en, hot_guideline, sort_num, status, create_by, create_time, update_by, update_time) values (4, 'sr', '系统评价 / Meta 分析', 'Systematic review / Meta-analysis', 'PRISMA', 3, '0', 'migration', '2026-07-28 20:06:51', '', NULL);
 insert into action_study_type (type_id, type_key, name_zh, name_en, hot_guideline, sort_num, status, create_by, create_time, update_by, update_time) values (5, 'obs', '观察性研究', 'Observational study', 'STROBE', 4, '0', 'migration', '2026-07-28 20:06:51', '', NULL);
+insert into action_study_type (type_id, type_key, name_zh, name_en, hot_guideline, sort_num, status, create_by, create_time, update_by, update_time) values (6, 'protocol', '临床试验方案 Protocol', 'Clinical trial protocol', 'SPIRIT', 5, '0', 'migration', '2026-08-12 18:00:00', '', NULL);
+insert into action_study_type (type_id, type_key, name_zh, name_en, hot_guideline, sort_num, status, create_by, create_time, update_by, update_time) values (7, 'animal', '动物实验', 'Animal experiment', 'ARRIVE', 6, '0', 'migration', '2026-08-12 18:00:00', '', NULL);
+insert into action_study_type (type_id, type_key, name_zh, name_en, hot_guideline, sort_num, status, create_by, create_time, update_by, update_time) values (8, 'guideline', '临床实践指南', 'Clinical practice guideline', 'RIGHT', 7, '0', 'migration', '2026-08-12 18:00:00', '', NULL);
+-- 显式写 id 插入不会推进 bigserial 的序列，后台再新增就会撞主键，所以这里校准一次
+select setval(pg_get_serial_sequence('action_study_type', 'type_id'), (select max(type_id) from action_study_type));
 
 drop table if exists action_study_type_guideline;
 create table action_study_type_guideline (
@@ -171,7 +183,7 @@ create table action_study_type_guideline (
 comment on table action_study_type_guideline is '官网-研究类型与报告规范关联';
 create index idx_astg_type on action_study_type_guideline (type_id);
 
--- action_study_type_guideline 种子数据（10 行）
+-- action_study_type_guideline 种子数据（15 行）
 insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (1, 1, 'CONSORT', 0);
 insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (2, 1, 'STRICTA', 1);
 insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (3, 1, 'SPIRIT', 2);
@@ -182,6 +194,13 @@ insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) 
 insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (8, 4, 'PRISMA', 0);
 insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (9, 4, '针刺检索策略', 1);
 insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (10, 5, 'STROBE', 0);
+insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (11, 6, 'SPIRIT', 0);
+-- 方案里的针刺干预细节仍要按 STRICTA 写，不因为是「方案」就免了
+insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (12, 6, 'STRICTA', 1);
+insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (13, 7, 'ARRIVE', 0);
+insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (14, 8, 'RIGHT', 0);
+insert into action_study_type_guideline (id, type_id, guideline_code, sort_num) values (15, 8, 'GRADE 证据分级', 1);
+select setval(pg_get_serial_sequence('action_study_type_guideline', 'id'), (select max(id) from action_study_type_guideline));
 
 drop table if exists action_study_type_stat;
 create table action_study_type_stat (
@@ -195,7 +214,7 @@ create table action_study_type_stat (
 comment on table action_study_type_stat is '官网-研究类型统计方法推荐';
 create index idx_asts_type on action_study_type_stat (type_id);
 
--- action_study_type_stat 种子数据（14 行）
+-- action_study_type_stat 种子数据（23 行）
 insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (1, 1, '组间比较：t 检验 / Mann–Whitney U 检验', 'Between-group: t-test / Mann–Whitney U', 0);
 insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (2, 1, '分类资料：卡方 / Fisher 检验', 'Categorical: chi-square / Fisher', 1);
 insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (3, 1, '重复测量：混合效应模型 / GEE', 'Repeated measures: mixed models / GEE', 2);
@@ -210,6 +229,16 @@ insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) val
 insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (12, 5, '多因素回归：Logistic / Cox 模型', 'Multivariable regression: Logistic / Cox', 0);
 insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (13, 5, '混杂校正：分层 / 倾向评分', 'Confounding: stratification / propensity score', 1);
 insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (14, 5, '分类资料：卡方检验', 'Categorical: chi-square', 2);
+insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (15, 6, '预先设定主要结局的组间比较方法（t 检验 / 秩和检验）', 'Pre-specify the primary-outcome comparison (t-test / rank-sum)', 0);
+insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (16, 6, '预先给出样本量计算参数与把握度', 'Pre-specify sample-size parameters and power', 1);
+insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (17, 6, '预先规定缺失数据处理与 ITT / PP 分析集', 'Pre-specify missing-data handling and ITT / PP analysis sets', 2);
+insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (18, 7, '组间比较：单因素 / 双因素方差分析 + 事后多重比较', 'Between-group: one-/two-way ANOVA with post-hoc tests', 0);
+insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (19, 7, '小样本优先非参数检验（Kruskal–Wallis）', 'Small samples: prefer non-parametric tests (Kruskal–Wallis)', 1);
+insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (20, 7, '须报告随机分组、盲法与每组动物数（ARRIVE 核心 10 项）', 'Report randomisation, blinding and n per group (ARRIVE Essential 10)', 2);
+insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (21, 8, '一般不做原始统计分析，重在证据质量分级（GRADE）', 'Usually no primary analysis; grade the certainty of evidence (GRADE)', 0);
+insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (22, 8, '若含 Meta 分析，合并方法按 PRISMA 报告', 'If a meta-analysis is included, report pooling per PRISMA', 1);
+insert into action_study_type_stat (id, type_id, text_zh, text_en, sort_num) values (23, 8, '推荐强度与证据体的一致性须明确说明', 'State the link between recommendation strength and the evidence body', 2);
+select setval(pg_get_serial_sequence('action_study_type_stat', 'id'), (select max(id) from action_study_type_stat));
 
 -- ----------------------------
 -- 4、CFIR 针刺版：领域 -> 构念 -> 应对策略
@@ -637,3 +666,71 @@ select setval('action_srd_group_group_id_seq', 12, true);
 select setval('action_srd_item_item_id_seq', 34, true);
 select setval('action_collab_request_request_id_seq', 1, false);
 select setval('action_guest_profile_profile_id_seq', 1, false);
+
+-- ----------------------------
+-- 20、报告助手报告草稿（增量文件 008 的全量副本）
+--
+-- 第二步「在线报告模板」的承载体：一行 = 一份报告初稿，逐条目正文在从表。
+-- 针灸四字段挂主表而不挂条目——它们不属于任何单条 checklist 条目，
+-- 而要在生成初稿时注入多条（文档说的「关键参数一次定义、全文联动同步」）。
+-- 无种子数据：草稿是访客自己建的。
+-- ----------------------------
+drop table if exists action_report_draft;
+
+create table action_report_draft (
+    draft_id       serial       primary key,
+    user_id        bigint       not null,
+    guideline_id   int          not null,
+    study_type_key varchar(32)  default '',
+    title          varchar(300) default '',
+    acu_basis      varchar(32)  default '',
+    acu_basis_note varchar(1000) default '',
+    acu_needle     varchar(1000) default '',
+    acu_deqi       varchar(1000) default '',
+    acu_control    varchar(1000) default '',
+    status         char(1)      default '0',
+    del_flag       char(1)      default '0',
+    create_by      varchar(64)  default '',
+    create_time    timestamp,
+    update_by      varchar(64)  default '',
+    update_time    timestamp
+);
+
+comment on table  action_report_draft is '官网-报告助手报告草稿';
+comment on column action_report_draft.draft_id is '草稿id';
+comment on column action_report_draft.user_id is '归属访客用户id（sys_user.user_id）';
+comment on column action_report_draft.guideline_id is '所依据的报告规范id（action_guideline.guideline_id）';
+comment on column action_report_draft.study_type_key is '第一步判定的研究类型（action_study_type.type_key），仅作留档';
+comment on column action_report_draft.title is '草稿名称，由用户自取';
+comment on column action_report_draft.acu_basis is '穴位选取依据（bianzheng辨证 / duizheng对症 / jingyan经验）';
+comment on column action_report_draft.acu_basis_note is '选穴依据补充说明';
+comment on column action_report_draft.acu_needle is '进针手法（角度、深度、行针手法）';
+comment on column action_report_draft.acu_deqi is '得气感应（酸麻胀重等患者感知描述）';
+comment on column action_report_draft.acu_control is '对照 / 对照措施设置（非穴道对照、假电针参数等）';
+comment on column action_report_draft.status is '状态（0正常 1停用）';
+comment on column action_report_draft.del_flag is '删除标志（0存在 2删除）';
+
+create index idx_action_report_draft_user on action_report_draft (user_id, update_time desc);
+
+drop table if exists action_report_draft_item;
+
+create table action_report_draft_item (
+    id          serial primary key,
+    draft_id    int    not null,
+    item_id     int    not null,
+    content     text,
+    update_time timestamp
+);
+
+comment on table  action_report_draft_item is '官网-报告草稿逐条目正文';
+comment on column action_report_draft_item.draft_id is '所属草稿id（action_report_draft.draft_id）';
+comment on column action_report_draft_item.item_id is '所应答的 checklist 条目id（action_guideline_item.item_id）';
+comment on column action_report_draft_item.content is '用户为该条目写的正文';
+
+-- 唯一索引挡的是「同一条目两份正文」：保存是先删后插（见 ReportDraftDao.replace_draft_items），
+-- 同一账号两个标签页并发保存时，落后的那次会撞在这个索引上失败而不是写出重复行
+create unique index uk_action_report_draft_item on action_report_draft_item (draft_id, item_id);
+
+-- 两张表都无种子，用 is_called=false 使首次 nextval 返回 1
+select setval('action_report_draft_draft_id_seq', 1, false);
+select setval('action_report_draft_item_id_seq', 1, false);

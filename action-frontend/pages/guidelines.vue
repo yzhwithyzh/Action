@@ -1,24 +1,21 @@
 <script setup lang="ts">
 /**
  * guidelines.html 迁移而来。
- * 模板与样式保持原状；样式已加 .page-guidelines 命名空间，避免 SPA 路由切换时跨页污染。
+ * 模板与样式基本保持原状；样式已加 .page-guidelines 命名空间，避免 SPA 路由切换时跨页污染。
+ *
+ * 三处例外：
+ *  1. 筛选条原本写死成 7 个 chip，靠一张 CAT_OF 表把接口的 studyType 折算成 chip 键、
+ *     标签另取 guidelines.s005–s010。后台新增规范时只要 studyType 不在那 6 个键里就会掉进
+ *     'all'，任何 chip 都筛不出来、卡片上的「研究设计」标签还是空白（库里的 STROBE
+ *     就是这个状态）。现改为读 `action_guideline_category` 表：chip、标签、图标同源，
+ *     对应关系是 category.catKey === guideline.studyType，后台两个页面都从同一张表取值。
+ *  2. 迁移时丢了 guidelines.html 的二级子栏目导航，四段里的后三段却留着 `is-hidden`
+ *     （base.css 里是 `display:none !important`），于是「在线预览与下载 / 版本管理 /
+ *     试点测试」三段从来没渲染过。现照 pages/about.vue 的写法把 Tab 补回来。
+ *  3. 原第②段「在线预览与下载」的折叠列表已删除，改为独立页 `pages/guideline/[id].vue`：
+ *     卡片点进去直接内嵌 PDF 原文，而不是在本页展开一对下载按钮。
+ *     第③版本管理、第④试点测试两段内容待定稿，暂由 SHOW_WIP_TABS 关着（见下）。
  */
-interface GuidelineRow {
-  guidelineId: number
-  code: string
-  nameZh: string | null
-  nameEn: string | null
-  studyType: string | null
-  summaryZh: string | null
-  summaryEn: string | null
-  version: string | null
-  fileUrlZh: string | null
-  fileUrlEn: string | null
-  externalUrl: string | null
-  logoUrl: string | null
-  releaseState: 'open' | 'beta' | 'soon' | null
-}
-
 const { t } = useI18n()
 const { pick } = useBilingual()
 
@@ -27,55 +24,27 @@ useHead({
   meta: [{ name: 'description', content: t('guidelines._desc') }],
 })
 
+// 规范目录与分类都是后台「规范目录管理 / 规范分类管理」页可随时改的内容；
+// hydration 后自动重取一次，见 `useSiteApi` 的 `revalidate`（默认开）
 const { data: glRes } = await useSiteList<GuidelineRow>(
   '/guidelines',
-  { pageNum: 1, pageSize: 20 },
+  { pageNum: 1, pageSize: 100 },
   'guidelines-page',
 )
 const rows = computed<GuidelineRow[]>(() => glRes.value?.rows ?? [])
 
-/**
- * 接口的 studyType 用 action_study_type.type_key 那套术语，页面筛选条用另一套。
- * 见 deferred-work.md 的 W23：两套词表只在 rct/case 上同名。
- */
-const CAT_OF: Record<string, string> = {
-  rct: 'rct',
-  protocol: 'protocol',
-  sr: 'review',
-  case: 'case',
-  guideline: 'cpg',
-  animal: 'animal',
-}
-const catOf = (r: GuidelineRow) => CAT_OF[r.studyType ?? ''] ?? 'all'
+const { data: catRes } = await useSiteObject<GuidelineCategoryRow[]>('/guideline-categories', 'guideline-cats')
+const cats = computed<GuidelineCategoryRow[]>(() => catRes.value?.data ?? [])
 
-/** 研究设计标签：复用筛选条已有的 i18n 键，不另起一套文案 */
-const CAT_LABEL: Record<string, string> = {
-  rct: 'guidelines.s005',
-  protocol: 'guidelines.s006',
-  review: 'guidelines.s007',
-  case: 'guidelines.s008',
-  cpg: 'guidelines.s009',
-  animal: 'guidelines.s010',
-}
-const catLabel = (r: GuidelineRow) => {
-  const key = CAT_LABEL[catOf(r)]
+/** catKey → 分类，卡片标签与图标都从这里取 */
+const catMap = computed(() => new Map(cats.value.map((c) => [c.catKey, c])))
+const catOf = (r: GuidelineRow) => (r.studyType ? catMap.value.get(r.studyType) : undefined)
 
-  return key ? t(key) : ''
-}
+/** 研究设计标签。分类被停用/删除时留空而不是回填 studyType 原值 —— 那是内部标识，不该露给访客 */
+const catLabel = (r: GuidelineRow) => pick(catOf(r), 'name')
 
-/** 卡片图标（纯装饰，接口不含图形数据），按研究设计取 */
-const ICON: Record<string, string[]> = {
-  rct: ['M4 5h16M4 5v14M4 19h16', 'M8 15l3-4 2 2 3-5'],
-  protocol: ['M8 3h6l4 4v14H6V5', 'M8 3v4H4', 'M9 13h6M9 17h4'],
-  review: ['M12 3v18', 'M5 8l7-5 7 5', 'M5 8v8l7 5 7-5V8'],
-  case: ['M7 3h7l4 4v14H6V4', 'M14 3v4h4', 'M12 11v6M9 14h6'],
-  cpg: ['M12 3l8 4v6c0 4.5-3.2 7-8 8-4.8-1-8-3.5-8-8V7z', 'M9 12l2 2 4-4'],
-  animal: ['M4 20c0-3 2-5 4-5s4 2 4 5', 'M15 8c2 0 4 1.5 4 4s-2 4-4 4', 'M17 12h.01'],
-}
-const iconOf = (r: GuidelineRow) => ICON[catOf(r)] ?? []
-
-/** 三个链接字段是否至少有一个可用 —— 全空时不渲染 .dl-side */
-const hasAnyLink = (r: GuidelineRow) => Boolean(r.fileUrlZh || r.fileUrlEn || r.externalUrl)
+/** 卡片图标：分类表里一行一条 SVG path 的 d 属性，留空则不画 */
+const iconOf = (r: GuidelineRow) => categoryIconPaths(catOf(r))
 
 /** 开放状态 → 文案键。原页面 CARE 用 `.st pub`（已发表）、其余 `.st cur`（现行）；
  *  接口只有 open/beta/soon 三态，无「已发表」语义，故统一按状态映射，不臆造 pub。 */
@@ -92,105 +61,147 @@ const stLabel = (r: GuidelineRow) => {
 }
 
 const activeCat = ref('all')
-/** 筛选用 CSS 隐藏而不卸载节点，理由同 news.vue（原页面也是 toggle('hide')） */
-const isHidden = (r: GuidelineRow) => activeCat.value !== 'all' && catOf(r) !== activeCat.value
+/**
+ * 筛选直接比 studyType 与 catKey，不再经过任何映射表 —— 这正是原来筛不出来的病根：
+ * 中间多一层硬编码映射，映射表没覆盖到的分类就会静默失配。
+ * 用 CSS 隐藏而不卸载节点，理由同 news.vue（原页面也是 toggle('hide')）。
+ */
+const isHidden = (r: GuidelineRow) => activeCat.value !== 'all' && r.studyType !== activeCat.value
 
-useReveal()
+/** 空分类不渲染 chip：一个点下去必然空列表的按钮，比没有这个按钮更糟 */
+const shownCats = computed(() => cats.value.filter((c) => rows.value.some((r) => r.studyType === c.catKey)))
+
+const { rescan, revealNow } = useReveal()
+
+function selectCat(key: string) {
+  activeCat.value = key
+  // 这一刀 MutationObserver 顶不了：筛选只是给卡片切 `.hide`（display:none ⇄ 可见），
+  // 没有节点新增，观察不到。被藏起来时 IntersectionObserver 不会触发，
+  // 显示回来若没人补扫就永远停在 .reveal{opacity:0} 上 —— 即「筛选对了但一片空白」。
+  void rescan()
+}
+
+/**
+ * 「版本管理 / 试点测试」两段暂不对外（内容待定稿），连子栏目导航一起藏起来 ——
+ * 只剩一格的 Tab 条是纯噪音。改成 true 即整体恢复，两段模板与样式都还在。
+ *
+ * 关着的时候本页只有第①段分类导航，卡片直接跳 `/guideline/[id]` 看原文。
+ */
+const SHOW_WIP_TABS: boolean = false
+
+/**
+ * 二级子栏目 Tab —— 迁移自 guidelines.html 内联脚本，顺序即子导航顺序。
+ * 各段内容同时在 DOM 里，只显示当前一段。
+ */
+const TABS = ['nav', 'versions', 'pilot'] as const
+type Tab = (typeof TABS)[number]
+
+const isTab = (v: string): v is Tab => (TABS as readonly string[]).includes(v)
+
+/** SSR 预渲染时固定输出第一段，与原站首屏一致；带 hash 进来的情况在 onMounted 里纠正 */
+const activeTab = ref<Tab>('nav')
+
+/** @param id 目标子栏目 */
+function goTab(id: Tab) {
+  activeTab.value = id
+  // 不走 router.replace：no_prefix 策略下 Nuxt 的 scrollBehavior 会按 hash 再跳一次，
+  // 与下面的 scrollIntoView 打架。原生 replaceState 保留 history.state，路由状态不丢。
+  window.history.replaceState(window.history.state, '', `#${id}`)
+  nextTick(() => {
+    revealNow(id)
+    document.getElementById('gl-subnav')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  })
+}
+
+onMounted(() => {
+  if (!SHOW_WIP_TABS) return
+  const hash = window.location.hash.slice(1)
+  if (!isTab(hash) || hash === activeTab.value) return
+  // 深链进来只切换、不滚动 —— 子导航本身已在首屏
+  activeTab.value = hash
+  nextTick(() => revealNow(hash))
+})
+
+watch([rows, cats], () => {
+  // 选中的分类可能在重取回来的新数据里没有规范了（后台改了归类或停用了分类），
+  // 那个 chip 会从筛选条上消失，但 activeCat 还指着它 —— 结果是「一个都没选中却空列表」
+  if (activeCat.value !== 'all' && !shownCats.value.some((c) => c.catKey === activeCat.value))
+    activeCat.value = 'all'
+})
 </script>
 
 <template>
   <div class="page-guidelines">
+    <nav v-if="SHOW_WIP_TABS" class="subnav" id="gl-subnav" :aria-label="t('guidelines.tabsAria')">
+      <div class="wrap subnav-in">
+        <a
+          v-for="(tab, i) in TABS"
+          :key="tab"
+          :href="`#${tab}`"
+          :class="{ active: activeTab === tab }"
+          :aria-current="activeTab === tab ? 'true' : undefined"
+          @click.prevent="goTab(tab)"
+        ><span class="n" aria-hidden="true">{{ i + 1 }}</span><span>{{ t(`guidelines.tabs.${tab}`) }}</span></a>
+      </div>
+    </nav>
+
     <!-- ===================== ① 分类导航 ===================== -->
-    <section class="sec" id="nav">
+    <section class="sec" id="nav" :class="{ 'is-hidden': SHOW_WIP_TABS && activeTab !== 'nav' }">
       <div class="wrap">
         <span class="kicker reveal">{{ t('guidelines.s001') }}</span>
         <h2 class="title reveal">{{ t('guidelines.s002') }}</h2>
         <p class="lead reveal">{{ t('guidelines.s003') }}</p>
 
-        <div class="gl-filter reveal" role="group" aria-label="按研究类型筛选">
+        <div class="gl-filter reveal" role="group" :aria-label="t('guidelines.filterAria')">
           <button
-            v-for="c in ['all', 'rct', 'protocol', 'review', 'case', 'cpg', 'animal']"
-            :key="c"
             class="gl-chip"
-            :class="{ on: activeCat === c }"
-            :aria-pressed="activeCat === c"
-            :data-filter="c"
-            @click="activeCat = c"
+            :class="{ on: activeCat === 'all' }"
+            :aria-pressed="activeCat === 'all'"
+            data-filter="all"
+            @click="selectCat('all')"
           >
-            {{ t(c === 'all' ? 'guidelines.s004' : CAT_LABEL[c]) }}
+            {{ t('guidelines.s004') }}
+          </button>
+          <button
+            v-for="c in shownCats"
+            :key="c.catId"
+            class="gl-chip"
+            :class="{ on: activeCat === c.catKey }"
+            :aria-pressed="activeCat === c.catKey"
+            :data-filter="c.catKey"
+            @click="selectCat(c.catKey)"
+          >
+            {{ pick(c, 'name') }}
           </button>
         </div>
 
         <div class="gl-grid">
-          <a v-for="r in rows" :key="r.guidelineId" class="gl-card reveal" :class="{ hide: isHidden(r) }" href="#download" :data-cat="catOf(r)">
+          <!-- 点卡片进原文阅读页（内嵌 PDF），不再在本页展开折叠块 -->
+          <NuxtLink
+            v-for="r in rows"
+            :key="r.guidelineId"
+            class="gl-card reveal"
+            :class="{ hide: isHidden(r) }"
+            :to="`/guideline/${r.guidelineId}`"
+            :data-cat="r.studyType"
+          >
             <div class="gl-top">
-              <span class="gl-ic" aria-hidden="true">
+              <span v-if="iconOf(r).length" class="gl-ic" aria-hidden="true">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
                   <path v-for="(d, k) in iconOf(r)" :key="k" :d="d" />
                 </svg>
               </span>
-              <span><span class="gl-type">{{ catLabel(r) }}</span><span class="gl-abbr">{{ r.code }}</span></span>
+              <span><span v-if="catLabel(r)" class="gl-type">{{ catLabel(r) }}</span><span class="gl-abbr">{{ r.code }}</span></span>
             </div>
             <p class="gl-basis">{{ pick(r, 'summary') }}</p>
-            <div class="gl-meta"><span v-if="r.version">{{ r.version }}</span></div>
+            <div class="gl-meta"><span v-if="pick(r, 'version')">{{ pick(r, 'version') }}</span></div>
             <span class="gl-go" v-html="t('guidelines.s015')"></span>
-          </a>
+          </NuxtLink>
         </div>
       </div>
     </section>
-    <!-- ===================== ② 在线预览与下载 ===================== -->
-    <section class="sec is-hidden" id="download" style="background:var(--paper-2)">
-      <div class="wrap">
-        <span class="kicker reveal">{{ t('guidelines.s039') }}</span>
-        <h2 class="title reveal">{{ t('guidelines.s040') }}</h2>
-        <p class="lead reveal">{{ t('guidelines.s041') }}</p>
-
-        <div class="dl-list">
-          <details v-for="r in rows" :key="r.guidelineId" class="dl-item reveal">
-            <summary class="dl-sum">
-              <span class="dl-badge" aria-hidden="true">
-                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7">
-                  <path v-for="(d, k) in iconOf(r)" :key="k" :d="d" />
-                </svg>
-                <span>{{ catLabel(r) }}</span>
-              </span>
-              <span class="dl-h">
-                <span class="dl-abbr">{{ r.code }}</span>
-                <p>{{ pick(r, 'name') }}</p>
-              </span>
-              <span v-if="r.version" class="dl-tag live">{{ r.version }}</span>
-              <svg class="dl-caret" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
-            </summary>
-            <div class="dl-body">
-              <div class="dl-body-in">
-                <div class="dl-intro">
-                  <p>{{ pick(r, 'summary') }}</p>
-                </div>
-                <div v-if="hasAnyLink(r)" class="dl-side">
-                  <h4>{{ t('guidelines.s046') }}</h4>
-                  <div class="dl-btns">
-                    <a v-if="r.fileUrlZh" class="dl-btn" :href="r.fileUrlZh" download>
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14" /></svg>
-                      <span>{{ t('guidelines.s047') }}</span><span class="ext">DOCX</span>
-                    </a>
-                    <a v-if="r.fileUrlEn" class="dl-btn" :href="r.fileUrlEn" download>
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14" /></svg>
-                      <span>{{ t('guidelines.s048') }}</span><span class="ext">DOCX</span>
-                    </a>
-                    <a v-if="r.externalUrl" class="dl-btn prev" :href="r.externalUrl" target="_blank" rel="noopener noreferrer">
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M7 17 17 7M8 7h9v9" /></svg>
-                      <span>{{ t('guidelines.s049') }}</span><span class="ext">{{ t('guidelines.s050') }}</span>
-                    </a>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </details>
-        </div>
-      </div>
-    </section>
-    <!-- ===================== ③ 版本管理 ===================== -->
-    <section class="sec is-hidden" id="versions">
+    <!-- ===================== ② 版本管理（暂不对外） ===================== -->
+    <section v-if="SHOW_WIP_TABS" class="sec" id="versions" :class="{ 'is-hidden': activeTab !== 'versions' }">
       <div class="wrap">
         <span class="kicker reveal">{{ t('guidelines.s116') }}</span>
         <h2 class="title reveal">{{ t('guidelines.s117') }}</h2>
@@ -212,7 +223,7 @@ useReveal()
                 <tr v-for="r in rows" :key="r.guidelineId">
                   <td><span class="abbr">{{ r.code }}</span><span class="sub">{{ pick(r, 'name') }}</span></td>
                   <td>{{ catLabel(r) }}</td>
-                  <td>{{ r.version }}</td>
+                  <td>{{ pick(r, 'version') }}</td>
                   <td><span class="st" :class="ST_CLASS[r.releaseState ?? 'open'] ?? 'cur'">{{ stLabel(r) }}</span></td>
                   <td>
                     <a v-if="r.externalUrl" :href="r.externalUrl" target="_blank" rel="noopener noreferrer">{{ r.externalUrl }}</a>
@@ -226,8 +237,8 @@ useReveal()
         </div>
       </div>
     </section>
-    <!-- ===================== ④ 试点测试 ===================== -->
-    <section class="sec is-hidden" id="pilot" style="background:var(--paper-2)">
+    <!-- ===================== ③ 试点测试（暂不对外） ===================== -->
+    <section v-if="SHOW_WIP_TABS" class="sec" id="pilot" :class="{ 'is-hidden': activeTab !== 'pilot' }" style="background:var(--paper-2)">
       <div class="wrap">
         <span class="kicker reveal">{{ t('guidelines.s155') }}</span>
         <h2 class="title reveal">{{ t('guidelines.s156') }}</h2>
@@ -262,12 +273,13 @@ useReveal()
 
             <div class="pilot-cta reveal">
               <a class="btn btn-primary" href="https://doi.org/10.1136/bmjebm-2025-113641" target="_blank" rel="noopener noreferrer" v-html="t('guidelines.s170')"></a>
-              <a class="btn btn-ghost" href="#download">{{ t('guidelines.s171') }}</a>
+              <!-- 原先跳第②段「在线预览与下载」，那一段已换成 /guideline/[id]，这里退回分类导航 -->
+              <a class="btn btn-ghost" href="#nav" @click.prevent="goTab('nav')">{{ t('guidelines.s171') }}</a>
             </div>
             <p class="src reveal" v-html="t('guidelines.s172')"></p>
           </div>
 
-          <aside class="pilot-facts reveal" aria-label="试点测试关键数字">
+          <aside class="pilot-facts reveal" :aria-label="t('guidelines.pilotFactsAria')">
             <div class="fact"><b>38</b><span>{{ t('guidelines.s173') }}</span></div>
             <div class="fact"><b>16</b><span>{{ t('guidelines.s174') }}</span></div>
             <div class="fact"><b>3</b><span>{{ t('guidelines.s175') }}</span></div>
@@ -356,45 +368,8 @@ useReveal()
 .page-guidelines .gl-go{margin-top:auto;padding-top:6px;display:inline-flex;align-items:center;gap:7px;font-weight:600;font-size:14px;color:var(--cinnabar)}
 .page-guidelines .gl-go .arrow{transition:transform .3s var(--ease)}
 .page-guidelines .gl-card:hover .gl-go .arrow{transform:translateX(3px)}
-.page-guidelines .dl-list{margin-top:clamp(28px,3.5vw,38px);display:flex;flex-direction:column;gap:12px}
-.page-guidelines .dl-item{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius-lg);overflow:hidden;
-    transition:border-color .25s var(--ease),box-shadow .25s var(--ease)}
-.page-guidelines .dl-item[open]{border-color:var(--indigo-200);box-shadow:var(--shadow-sm)}
-.page-guidelines .dl-sum{display:flex;align-items:center;gap:16px;padding:20px 24px;cursor:pointer;list-style:none;user-select:none}
-.page-guidelines .dl-sum::-webkit-details-marker{display:none}
-.page-guidelines .dl-badge{flex-shrink:0;width:52px;height:52px;border-radius:13px;background:var(--indigo-100);color:var(--indigo-700);
-    display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:"Spectral",serif;font-weight:700;
-    font-size:11px;line-height:1;gap:2px}
-.page-guidelines .dl-badge svg{width:23px;height:23px}
-.page-guidelines .dl-h{flex:1;min-width:0}
-.page-guidelines .dl-h .dl-abbr{font-family:"Spectral","Noto Serif SC",serif;font-weight:700;font-size:1.22rem;color:var(--indigo-900);line-height:1.15}
-.page-guidelines .dl-h .dl-abbr .zh{font-family:"Noto Serif SC",serif}
-.page-guidelines .dl-h p{font-size:13.5px;color:var(--muted);margin-top:3px;line-height:1.5}
-.page-guidelines .dl-tag{flex-shrink:0;font-size:12px;font-weight:700;padding:5px 12px;border-radius:999px;white-space:nowrap}
-.page-guidelines .dl-tag.live{color:var(--indigo-600);background:var(--indigo-100)}
-.page-guidelines .dl-tag.pub{color:var(--cinnabar-d);background:rgba(192,54,44,.09)}
-.page-guidelines .dl-caret{flex-shrink:0;width:22px;height:22px;color:var(--indigo-400,#7d90ad);transition:transform .3s var(--ease)}
-.page-guidelines .dl-item[open] .dl-caret{transform:rotate(180deg)}
-.page-guidelines .dl-body{padding:2px 24px 24px;border-top:1px solid var(--line)}
-.page-guidelines .dl-body-in{padding-top:20px;display:grid;grid-template-columns:1.35fr 1fr;gap:clamp(20px,3vw,40px)}
-.page-guidelines .dl-intro p{font-size:14.5px;color:var(--ink);line-height:1.66}
-.page-guidelines .dl-intro p+p{margin-top:12px}
-.page-guidelines .dl-intro .muted{color:var(--muted);font-size:13.5px}
-.page-guidelines .dl-doms{margin-top:16px;display:flex;flex-wrap:wrap;gap:6px}
-.page-guidelines .dl-doms li{list-style:none;font-size:12.5px;font-weight:600;color:var(--indigo-700);background:var(--paper-2);
-    border:1px solid var(--line);padding:4px 10px;border-radius:8px}
-.page-guidelines .dl-doms li b{color:var(--cinnabar-d);font-family:"Spectral",serif;margin-right:5px}
-.page-guidelines .dl-side{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:20px}
-.page-guidelines .dl-side h4{font-size:13px;font-weight:700;letter-spacing:.02em;color:var(--indigo-900);
-    font-family:"Source Sans 3","Noto Sans SC",sans-serif;margin-bottom:14px;text-transform:uppercase}
-.page-guidelines .dl-btns{display:flex;flex-direction:column;gap:9px}
-.page-guidelines .dl-btn{display:flex;align-items:center;gap:11px;padding:11px 14px;border-radius:11px;border:1.5px solid var(--line);
-    background:var(--surface);font-size:14px;font-weight:600;color:var(--indigo-800);transition:.2s var(--ease)}
-.page-guidelines .dl-btn:hover{border-color:var(--indigo-300);background:var(--indigo-100);transform:translateX(2px)}
-.page-guidelines .dl-btn svg{width:19px;height:19px;flex-shrink:0;color:var(--indigo-500)}
-.page-guidelines .dl-btn .ext{margin-left:auto;font-size:11px;font-weight:700;color:var(--muted);letter-spacing:.04em}
-.page-guidelines .dl-btn.prev{border-color:var(--indigo-200);background:var(--indigo-100)}
-.page-guidelines .dl-btn.prev svg{color:var(--cinnabar)}
+/* 原「在线预览与下载」折叠列表（.dl-*）的样式随那一段一起删了 —— 现在原文在
+   pages/guideline/[id].vue，样式也跟着走，别在这里留一套没人用的选择器。 */
 .page-guidelines .tbl-wrap{margin-top:clamp(26px,3vw,34px);border:1px solid var(--line);border-radius:var(--radius-lg);overflow:hidden;background:var(--surface)}
 .page-guidelines .tbl-scroll{overflow-x:auto}
 .page-guidelines table.act{width:100%;border-collapse:collapse;min-width:640px;font-size:14.5px}
@@ -411,6 +386,14 @@ useReveal()
 .page-guidelines .st.pub::before{background:var(--cinnabar)}
 .page-guidelines .st.cur{color:var(--indigo-600);background:var(--indigo-100)}
 .page-guidelines .st.cur::before{background:var(--indigo-500)}
+/* beta/soon 迁移时只在 JS 里给了类名、没配样式；版本管理段此前被 is-hidden 遮着看不出来，
+   现在这一段真的会渲染，缺样式就是一颗没颜色、没圆点的空药丸 */
+.page-guidelines .st.beta{color:#8a5a00;background:rgba(214,158,46,.13)}
+.page-guidelines .st.beta::before{background:#d69e2e}
+.page-guidelines .st.soon{color:var(--muted);background:var(--paper-2)}
+.page-guidelines .st.soon::before{background:var(--muted)}
+/* 与 base.css 的 .is-hidden 同义，写在页面里是为了不依赖那条全局 !important（同 pages/about.vue） */
+.page-guidelines .sec.is-hidden{display:none}
 .page-guidelines .tbl-note{padding:14px 18px;font-size:13px;color:var(--muted);background:var(--paper-2);border-top:1px solid var(--line);line-height:1.55}
 .page-guidelines .tbl-note b{color:var(--indigo-700)}
 .page-guidelines .pilot-grid{display:grid;grid-template-columns:1.15fr 1fr;gap:clamp(26px,4vw,52px);margin-top:clamp(30px,4vw,44px);align-items:start}
@@ -430,20 +413,13 @@ useReveal()
 .page-guidelines .mini-tbl table{min-width:0}
 .page-guidelines .mini-tbl table.act tbody td{padding:11px 14px;font-size:13.5px}
 .page-guidelines .mini-tbl table.act thead th{padding:11px 14px}
-@media (prefers-reduced-motion:no-preference){
-.page-guidelines html.js .reveal{opacity:0;transform:translateY(18px);transition:opacity .8s var(--ease),transform .8s var(--ease)}
-.page-guidelines html.js .reveal.is-visible{opacity:1;transform:none}
-}
+/* 揭示动画只在 base.css 里定义：加了 .page-guidelines 前缀的那两条永远匹配不上
+   （html 不可能是某个 div 的后代），删掉以免误以为本页另有一套。 */
 @media(max-width:1000px){
-.page-guidelines .dl-body-in{grid-template-columns:1fr;gap:22px}
 .page-guidelines .pilot-grid{grid-template-columns:1fr;gap:30px}
 }
 @media(max-width:820px){
 .page-guidelines .pilot-facts{grid-template-columns:1fr 1fr}
 .page-guidelines .mobile-menu .btn{width:100%;justify-content:center;margin-top:24px}
-}
-@media(max-width:520px){
-.page-guidelines .dl-sum{flex-wrap:wrap;gap:12px}
-.page-guidelines .dl-tag{order:3}
 }
 </style>

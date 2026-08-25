@@ -127,7 +127,8 @@ img,svg{max-width:100%;display:block}
 
 @media (prefers-reduced-motion:no-preference){
     html.js .reveal{opacity:0;transform:translateY(18px);transition:opacity .8s var(--ease),transform .8s var(--ease)}
-    html.js .reveal.is-visible{opacity:1;transform:none}
+    /* 揭示标记是属性不是类：类会被 Vue 的 patchClass 在 :class 变化时整个重写掉，见 useReveal.ts */
+    html.js .reveal[data-revealed]{opacity:1;transform:none}
   }
 
 .is-hidden{display:none !important}

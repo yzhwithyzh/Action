@@ -18,6 +18,7 @@ from module_action.entity.do.action_do import (
     ActionGuidelineCategory,
     ActionGuidelineItem,
     ActionNews,
+    ActionPublication,
     ActionReaimDimension,
     ActionReportDraft,
     ActionReportDraftItem,
@@ -45,6 +46,7 @@ from module_action.entity.vo.action_vo import (
     GuidelinePageQueryModel,
     NewsModel,
     NewsPageQueryModel,
+    PublicationPageQueryModel,
     ResourceLinkModel,
     ResourceLinkPageQueryModel,
     SiteTextPageQueryModel,
@@ -415,6 +417,190 @@ class ResourceLinkDao:
         await db.execute(
             update(ActionResourceLink)
             .where(ActionResourceLink.link_id.in_(link_ids))
+            .values(del_flag='2', update_time=datetime.now())
+        )
+
+
+class PublicationDao:
+    """
+    官网成果发表数据库操作层
+
+    `authors` / `affiliations` / `keywords` 在库里是 JSON 文本，本层原样进出，
+    结构化转换在 `PublicationService` —— DAO 不认识业务对象的形状。
+    """
+
+    @classmethod
+    async def get_publication_detail_by_id(cls, db: AsyncSession, publication_id: int) -> ActionPublication | None:
+        """
+        根据成果id获取详情
+
+        :param db: orm对象
+        :param publication_id: 成果id
+        :return: 成果对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionPublication).where(
+                        ActionPublication.publication_id == publication_id, ActionPublication.del_flag == '0'
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    def _conditions(cls, query_object: PublicationPageQueryModel, only_published: bool) -> list[Any]:
+        """
+        拼列表查询的过滤条件（列表与年份词表共用，两处口径必须一致）
+
+        :param query_object: 查询参数对象
+        :param only_published: 是否只取已发布
+        :return: 条件列表
+        """
+        conditions: list[Any] = [
+            ActionPublication.del_flag == '0',
+            ActionPublication.status == '0' if only_published else True,
+            ActionPublication.status == query_object.status if query_object.status and not only_published else True,
+            ActionPublication.publication_year == query_object.year if query_object.year else True,
+            ActionPublication.title.ilike(f'%{query_object.title}%') if query_object.title else True,
+            ActionPublication.doi.ilike(f'%{query_object.doi}%') if query_object.doi else True,
+        ]
+        if query_object.keyword:
+            # 用 ilike 而不是全库其余表那样的 like：这张表里大半是英文标题与作者名，
+            # PostgreSQL 的 like 区分大小写，搜 "acupuncture" 会一条都搜不到
+            kw = f'%{query_object.keyword}%'
+            conditions.append(
+                ActionPublication.title.ilike(kw)
+                | ActionPublication.journal.ilike(kw)
+                | ActionPublication.doi.ilike(kw)
+                # authors / keywords 是 JSON 文本，直接按串匹配即可：这两列的内容
+                # 本来就是「一串名字」「一串词」，按子串搜正是用户要的
+                | ActionPublication.authors.ilike(kw)
+                | ActionPublication.keywords.ilike(kw)
+            )
+
+        return conditions
+
+    @classmethod
+    async def get_publication_list(
+        cls,
+        db: AsyncSession,
+        query_object: PublicationPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        根据查询参数获取成果发表列表
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取已发布（官网公开接口传 True）
+        :return: 成果列表
+        """
+        query = (
+            select(ActionPublication)
+            .where(*cls._conditions(query_object, only_published))
+            # 年份倒序 + 年内 sort_num：官网列表页按年分组，组内顺序由后台定。
+            # nullslast 是必需的 —— PG 的 desc() 默认 NULLS FIRST，会把没填年份的
+            # 记录顶到最新一年前面，看起来像排序坏了（同 NewsDao 的 publish_date）
+            .order_by(
+                nullslast(ActionPublication.publication_year.desc()),
+                ActionPublication.sort_num,
+                ActionPublication.publication_id.desc(),
+            )
+            .distinct()
+        )
+
+        return await PageUtil.paginate(db, query, query_object.page_num, query_object.page_size, is_page)
+
+    @classmethod
+    async def get_year_counts(
+        cls, db: AsyncSession, query_object: PublicationPageQueryModel, only_published: bool = True
+    ) -> list[tuple[int | None, int]]:
+        """
+        按年份聚合条数，供官网列表页的年份下拉使用
+
+        :param db: orm对象
+        :param query_object: 查询参数对象（`year` 之外的过滤条件同样生效）
+        :param only_published: 是否只统计已发布
+        :return: [(年份, 条数)]，年份倒序，未标注年份的排在最后
+        """
+        # 年份下拉自身不能被「已选年份」过滤掉，否则选完一个年份就再也切不回别的年份
+        conditions = cls._conditions(query_object.model_copy(update={'year': None}), only_published)
+        rows = (
+            await db.execute(
+                select(ActionPublication.publication_year, func.count())
+                .where(*conditions)
+                .group_by(ActionPublication.publication_year)
+                .order_by(nullslast(ActionPublication.publication_year.desc()))
+            )
+        ).all()
+
+        return [(row[0], int(row[1])) for row in rows]
+
+    @classmethod
+    async def get_max_sort_num(cls, db: AsyncSession, publication_year: int | None) -> int:
+        """
+        取同一年内已有成果的最大 sort_num，供新增时默认排到该年末尾
+
+        :param db: orm对象
+        :param publication_year: 发表年份
+        :return: 最大显示顺序，该年无记录时返回 -1
+        """
+        result = (
+            await db.execute(
+                select(func.max(ActionPublication.sort_num)).where(
+                    ActionPublication.del_flag == '0',
+                    ActionPublication.publication_year.is_(None)
+                    if publication_year is None
+                    else ActionPublication.publication_year == publication_year,
+                )
+            )
+        ).scalar()
+
+        return -1 if result is None else int(result)
+
+    @classmethod
+    async def add_publication_dao(cls, db: AsyncSession, values: dict[str, Any]) -> ActionPublication:
+        """
+        新增成果发表
+
+        :param db: orm对象
+        :param values: 已把 JSON 列序列化好的字段字典
+        :return: 新增的成果对象
+        """
+        db_publication = ActionPublication(**values)
+        db.add(db_publication)
+        await db.flush()
+
+        return db_publication
+
+    @classmethod
+    async def edit_publication_dao(cls, db: AsyncSession, values: dict[str, Any]) -> None:
+        """
+        编辑成果发表
+
+        :param db: orm对象
+        :param values: 需要更新的字段字典（含主键）
+        :return: None
+        """
+        await db.execute(update(ActionPublication), [values])
+
+    @classmethod
+    async def delete_publication_dao(cls, db: AsyncSession, publication_ids: list[int]) -> None:
+        """
+        逻辑删除成果发表
+
+        :param db: orm对象
+        :param publication_ids: 成果id列表
+        :return: None
+        """
+        await db.execute(
+            update(ActionPublication)
+            .where(ActionPublication.publication_id.in_(publication_ids))
             .values(del_flag='2', update_time=datetime.now())
         )
 

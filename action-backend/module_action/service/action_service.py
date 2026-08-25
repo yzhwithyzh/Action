@@ -24,6 +24,7 @@ from module_action.dao.action_dao import (
     GuidelineItemDao,
     ImplementationDao,
     NewsDao,
+    PublicationDao,
     ReportDraftDao,
     ReportReviewDao,
     ReportTrailDao,
@@ -65,6 +66,9 @@ from module_action.entity.vo.action_vo import (
     GuidelinePageQueryModel,
     NewsModel,
     NewsPageQueryModel,
+    PublicationModel,
+    PublicationPageQueryModel,
+    PublicationYearModel,
     ReaimDimensionModel,
     ReportDraftComposeModel,
     ReportDraftCreateModel,
@@ -97,6 +101,7 @@ from module_action.entity.vo.action_vo import (
     TrailModel,
 )
 from module_action.service.ai_assist_service import AiAssistService
+from module_action.service.publication_parse import build_citation_text
 from module_action.service.report_assist_prompt import AssistContext, needs_current_text
 from module_action.service.report_compose_service import ComposeItem, compose_draft_text
 from module_action.service.report_export_service import BUILDERS, ExportDraft, ExportItem
@@ -407,6 +412,251 @@ class ResourceLinkService:
             raise ServiceException(message='传入资源id为空')
         try:
             await ResourceLinkDao.delete_link_dao(query_db, id_list)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='删除成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+
+class PublicationService:
+    """
+    官网成果发表服务层
+
+    这一层唯一的特别之处是 **JSON 列的进出**：`authors` / `affiliations` / `keywords`
+    在库里是文本，在接口上是结构化列表，两个方向的转换都收在这里（`_encode` / `_decode`），
+    DAO 与控制器都不必知道这件事。
+    """
+
+    #: 列表接口不吐这几列。摘要一篇动辄两三千字，官网列表页是**预渲染**的，
+    #: 一页 10 条就往 HTML 里烤进几万字没人看的文本；引用文本同理只在详情页用
+    _LIST_OMIT = ('abstract', 'citationText')
+
+    @classmethod
+    def _dump_json(cls, value: Any) -> str:
+        """
+        列表 → 库里的 JSON 文本
+
+        `ensure_ascii=False`：这几列会被人在数据库里直接看、也会被 `ilike` 搜，
+        存成 `\\u9488\\u523a` 的话中文关键词一条都搜不到。
+
+        :param value: 待序列化的列表
+        :return: JSON 文本，空列表也写成 `[]` 而不是 null
+        """
+        return json.dumps(value or [], ensure_ascii=False)
+
+    @classmethod
+    def _load_json(cls, raw: Any) -> list[Any]:
+        """
+        库里的 JSON 文本 → 列表
+
+        坏数据不抛异常只记日志：这几列是人可以直接改库的，一条脏数据不该让整页列表 500。
+
+        :param raw: 库里的值
+        :return: 列表，解析不出时空列表
+        """
+        if isinstance(raw, list):
+            return raw
+        if not raw:
+            return []
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            logger.warning(f'成果发表的 JSON 列解析失败，按空处理：{str(raw)[:120]}')
+
+            return []
+
+        return value if isinstance(value, list) else []
+
+    @classmethod
+    def _decode(cls, row: dict[str, Any], brief: bool = False) -> dict[str, Any]:
+        """
+        一行出参：把三个 JSON 列换成结构化列表
+
+        :param row: DAO 出参（已是驼峰键的字典）
+        :param brief: 列表场景，顺带丢掉摘要与引用文本
+        :return: 可直接进 PublicationModel 的字典
+        """
+        out = dict(row)
+        out['authors'] = cls._load_json(out.get('authors'))
+        out['affiliations'] = cls._load_json(out.get('affiliations'))
+        out['keywords'] = cls._load_json(out.get('keywords'))
+        if brief:
+            for field in cls._LIST_OMIT:
+                out.pop(field, None)
+
+        return out
+
+    @classmethod
+    def _encode(cls, page_object: PublicationModel) -> dict[str, Any]:
+        """
+        一行入参：转成可直接写库的字段字典
+
+        `exclude_unset` 是编辑接口的语义基础（没带上的字段不动），所以三个 JSON 列
+        也必须**只在调用方确实给了的时候**才序列化 —— 无脑写 `[]` 会把没打算改作者的
+        那次编辑变成「清空作者」。
+
+        :param page_object: 入参对象
+        :return: 字段字典
+        """
+        values = page_object.model_dump(exclude_unset=True)
+        if 'authors' in values:
+            # by_alias：库里存的是 affiliationIndex（与接口出参、后台表单同形），
+            # 存 snake_case 的话读回来还要再翻一次
+            values['authors'] = cls._dump_json(
+                [a.model_dump(by_alias=True) for a in (page_object.authors or [])]
+            )
+        if 'affiliations' in values:
+            values['affiliations'] = cls._dump_json(page_object.affiliations)
+        if 'keywords' in values:
+            values['keywords'] = cls._dump_json(page_object.keywords)
+
+        return values
+
+    @classmethod
+    def _fill_citation(cls, page_object: PublicationModel) -> None:
+        """
+        引用文本留空时按字段自动拼一条
+
+        只在**留空**时填：各刊要求的引用格式不同，人工写过的那条不许覆盖。
+
+        :param page_object: 入参对象
+        :return: None
+        """
+        if (page_object.citation_text or '').strip():
+            return
+        text = build_citation_text(
+            {
+                'authors': [a.model_dump() for a in (page_object.authors or [])],
+                'title': page_object.title,
+                'journal': page_object.journal,
+                'publication_year': page_object.publication_year,
+                'volume': page_object.volume,
+                'issue': page_object.issue,
+                'pages': page_object.pages,
+                'doi': page_object.doi,
+            }
+        )
+        if text:
+            page_object.citation_text = text
+
+    @classmethod
+    async def get_publication_list_services(
+        cls,
+        query_db: AsyncSession,
+        query_object: PublicationPageQueryModel,
+        is_page: bool = False,
+        only_published: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        获取成果发表列表
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :param only_published: 是否只取已发布（官网公开接口传 True）
+        :return: 成果列表
+        """
+        result = await PublicationDao.get_publication_list(query_db, query_object, is_page, only_published)
+        if isinstance(result, PageModel):
+            result.rows = [cls._decode(row, brief=True) for row in (result.rows or [])]
+
+            return result
+
+        return [cls._decode(row, brief=True) for row in result]
+
+    @classmethod
+    async def get_year_list_services(
+        cls, query_db: AsyncSession, query_object: PublicationPageQueryModel
+    ) -> list[PublicationYearModel]:
+        """
+        获取年份词表（官网列表页的年份下拉）
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :return: [{year, count}]，年份倒序
+        """
+        rows = await PublicationDao.get_year_counts(query_db, query_object, only_published=True)
+
+        return [PublicationYearModel(year=year, count=count) for year, count in rows]
+
+    @classmethod
+    async def publication_detail_services(cls, query_db: AsyncSession, publication_id: int) -> PublicationModel:
+        """
+        获取成果发表详情
+
+        :param query_db: orm对象
+        :param publication_id: 成果id
+        :return: 成果详情
+        """
+        publication = await PublicationDao.get_publication_detail_by_id(query_db, publication_id)
+        if not publication:
+            raise ServiceException(message='成果不存在')
+
+        return PublicationModel(**cls._decode(CamelCaseUtil.transform_result(publication)))
+
+    @classmethod
+    async def add_publication_services(
+        cls, query_db: AsyncSession, page_object: PublicationModel
+    ) -> CrudResponseModel:
+        """
+        新增成果发表
+
+        :param query_db: orm对象
+        :param page_object: 成果对象
+        :return: 新增结果
+        """
+        # 未指定顺序时排到**本年**末尾：列表页按年分组，排到全表末尾对同年的顺序毫无意义
+        if page_object.sort_num is None:
+            page_object.sort_num = await PublicationDao.get_max_sort_num(query_db, page_object.publication_year) + 1
+        cls._fill_citation(page_object)
+        try:
+            await PublicationDao.add_publication_dao(query_db, cls._encode(page_object))
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='新增成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def edit_publication_services(
+        cls, query_db: AsyncSession, page_object: PublicationModel
+    ) -> CrudResponseModel:
+        """
+        编辑成果发表
+
+        :param query_db: orm对象
+        :param page_object: 成果对象
+        :return: 编辑结果
+        """
+        if not await PublicationDao.get_publication_detail_by_id(query_db, page_object.publication_id):
+            raise ServiceException(message='成果不存在')
+        cls._fill_citation(page_object)
+        try:
+            await PublicationDao.edit_publication_dao(query_db, cls._encode(page_object))
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='更新成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def delete_publication_services(cls, query_db: AsyncSession, publication_ids: str) -> CrudResponseModel:
+        """
+        删除成果发表
+
+        :param query_db: orm对象
+        :param publication_ids: 成果id字符串，多个以逗号分隔
+        :return: 删除结果
+        """
+        id_list = [int(i) for i in publication_ids.split(',') if i.strip()]
+        if not id_list:
+            raise ServiceException(message='传入成果id为空')
+        try:
+            await PublicationDao.delete_publication_dao(query_db, id_list)
             await query_db.commit()
 
             return CrudResponseModel(is_success=True, message='删除成功')

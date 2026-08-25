@@ -47,6 +47,8 @@ PAGE_LABELS: dict[str, str] = {
     'implementation': '实施性研究',
     'news': '新闻动态',
     'newsDetail': '新闻详情',
+    'publications': '成果发表',
+    'publicationDetail': '成果详情',
     'team': '团队成员详情',
     'srd': 'SRD 重复性评估',
 }

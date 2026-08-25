@@ -12,6 +12,7 @@ const PLATFORM_LINKS = [
 const MORE_LINKS = [
   { key: 'collaborate', to: '/collaborate' },
   { key: 'news', to: '/news' },
+  { key: 'publications', to: '/publications' },
   { key: 'about', to: '/about' },
   { key: 'resources', to: '/#resources' },
 ]
@@ -22,13 +23,11 @@ const MORE_LINKS = [
     <div class="wrap">
       <div class="fgrid">
         <div class="fbrand">
-          <svg class="seal" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-            <rect x="1.5" y="1.5" width="45" height="45" rx="11" fill="var(--indigo-700)" />
-            <circle cx="24" cy="24" r="10.5" stroke="var(--indigo-200)" stroke-width="1.4" />
-            <circle cx="24" cy="24" r="3" fill="var(--cinnabar)" />
-            <path d="M24 4v12M24 32v12" stroke="#fff" stroke-width="1.6" stroke-linecap="round" />
-          </svg>
-          <b class="fbrand-name">{{ t('brand.name') }}</b>
+          <!-- 页脚是 --indigo-900 深底，必须用浅色那一版：深绿字标压上去等于没有 -->
+          <img
+            class="fbrand-logo" src="/assets/action-logo-light.png" :alt="t('brand.name')"
+            width="760" height="181"
+          >
           <p>{{ t('footer.desc') }}</p>
         </div>
 
@@ -52,7 +51,7 @@ const MORE_LINKS = [
 
         <div class="fcontact">
           <h2>{{ t('footer.contact') }}</h2>
-          <a class="fmail" href="mailto:action@gztcm-action.cn">action@gztcm-action.cn</a>
+          <a class="fmail" href="mailto:action_acu@163.com">action_acu@163.com</a>
           <a>{{ t('footer.org') }}</a>
           <a>{{ t('footer.address') }}</a>
         </div>
@@ -60,18 +59,11 @@ const MORE_LINKS = [
 
       <div class="copy">
         <span>{{ t('footer.copyright') }}</span>
-        <span>{{ t('footer.icp') }}</span>
+        <!-- 备案号要求是指向 beian.miit.gov.cn 的可点链接，所以这条走 v-html；
+             文案里的标签由后端白名单把关（action_vo.py 的 assert_safe_markup） -->
+        <span v-html="t('footer.icp')" />
       </div>
     </div>
   </footer>
 </template>
 
-<style>
-/* 原实现里品牌名是 <b> 上的内联样式，这里提出为类，视觉等价 */
-.fbrand-name {
-  color: #fff;
-  font-family: 'Spectral', 'Noto Serif SC', serif;
-  letter-spacing: .06em;
-  font-size: 18px;
-}
-</style>

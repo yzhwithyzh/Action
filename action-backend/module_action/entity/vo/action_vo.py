@@ -254,6 +254,241 @@ class DeleteResourceLinkModel(BaseModel):
     link_ids: str = Field(description='需要删除的资源id，多个以逗号分隔')
 
 
+# ---------------------------------------------------------------- 成果发表
+
+#: 一篇论文最多录多少位作者 / 机构 / 关键词。上限不是为了省空间，是为了让「解析出来的
+#: 一坨脏数据」在入库前就撞墙 —— PDF 解析偶尔会把参考文献整段当成作者名塞回来
+MAX_PUBLICATION_AUTHORS = 300
+MAX_PUBLICATION_AFFILIATIONS = 100
+MAX_PUBLICATION_KEYWORDS = 50
+#: 摘要上限。正式期刊摘要在 3000 字符内，给到 2 万是留给带结构化小标题的长摘要
+MAX_PUBLICATION_ABSTRACT_CHARS = 20000
+
+
+def _assert_http_url(value: str | None, field_label: str) -> str | None:
+    """
+    校验「会直接进 `<a href>` / `<img src>` / `<iframe src>` 的地址」只收 http(s) 绝对地址
+
+    与 `ResourceLinkModel.check_url` 同一个理由：这些值是后台文本框写进来、
+    原样吐给公开页面的，放开协议等于把 `javascript:` 的注入面留在后台。
+    站内相对路径也不放 —— 后台与官网是两个域，相对路径在后台预览时必然 404。
+
+    :param value: 待校验地址
+    :param field_label: 报错时显示的字段名
+    :return: 去掉首尾空白的地址
+    :raise ModelValidatorException: 不是 http(s) 绝对地址
+    """
+    if value is None or value.strip() == '':
+        return ''
+    url = value.strip()
+    if not re.match(r'^https?://\S+$', url):
+        raise ModelValidatorException(message=f'{field_label}必须是以 http:// 或 https:// 开头的完整地址')
+
+    return url
+
+
+class PublicationAuthorModel(ActionBaseModel):
+    """
+    一位作者
+
+    `affiliation_index` 是 `PublicationModel.affiliations` 的**下标**（0 开始），
+    前台按它渲染姓名右上角的机构角标。没标机构时为 None，不是 0 ——
+    0 是「第 1 个机构」，兜底成 0 会给每位作者凭空挂上第一家单位。
+    """
+
+    #: 与本模块其余模型不同，这一对额外开了 `populate_by_name`：这两个模型除了
+    #: 接 HTTP 入参，还要在服务层用 **snake_case 字段名**直接构造（解析层产出的字典、
+    #: 从库里 JSON 列读回来的字典）。pydantic v2 在只有 alias 时对多余的 snake_case 键
+    #: 是**静默忽略**而不是报错 —— 不开这个开关，`PublicationModel(**fields)`
+    #: 会安静地得到一个所有字段都是 None 的空模型，且没有任何异常提示。
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str = Field(default='', description='姓名（发表原文，逐字）')
+    affiliation_index: int | None = Field(default=None, description='所属机构在 affiliations 中的下标，未标注时为 None')
+
+
+class PublicationModel(ActionBaseModel):
+    """
+    官网成果发表（论文）
+
+    **没有 `*_zh`/`*_en` 双语列，这是有意的**：标题/作者/期刊/摘要是发表原文，
+    同时也是引用信息，译一遍就既检索不到也引用不了，中英两种界面显示的都是它。
+    页面上的栏目标题与按钮文字仍走 i18n + `action_site_text`。
+
+    `authors` / `affiliations` / `keywords` 在库里是 JSON 文本，
+    转换由 `PublicationService` 成对完成，本模型对外一律是结构化的列表。
+    """
+
+    #: 理由见 PublicationAuthorModel 上那段注释（服务层要用 snake_case 直接构造）
+    model_config = ConfigDict(populate_by_name=True)
+
+    publication_id: int | None = Field(default=None, description='成果id')
+    title: str | None = Field(default=None, description='论文标题（发表原文）')
+    authors: list[PublicationAuthorModel] | None = Field(default=None, description='作者列表，顺序即署名顺序')
+    affiliations: list[str] | None = Field(default=None, description='机构列表，下标对应作者的 affiliationIndex')
+    abstract: str | None = Field(default=None, description='摘要（纯文本）')
+    keywords: list[str] | None = Field(default=None, description='关键词列表')
+    journal: str | None = Field(default=None, description='期刊名称')
+    volume: str | None = Field(default=None, description='卷')
+    issue: str | None = Field(default=None, description='期')
+    pages: str | None = Field(default=None, description='页码')
+    publication_year: int | None = Field(default=None, description='发表年份')
+    doi: str | None = Field(default=None, description='DOI')
+    source_url: str | None = Field(default=None, description='出版社/期刊页面地址')
+    pdf_url: str | None = Field(default=None, description='PDF 全文地址')
+    cover_image_url: str | None = Field(default=None, description='配图/封面地址')
+    citation_text: str | None = Field(default=None, description='引用文本，留空则由后端自动生成')
+    sort_num: int | None = Field(default=None, description='同年内的显示顺序')
+    status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
+    create_by: str | None = Field(default=None, description='创建者')
+    create_time: datetime | None = Field(default=None, description='创建时间')
+    update_by: str | None = Field(default=None, description='更新者')
+    update_time: datetime | None = Field(default=None, description='更新时间')
+    remark: str | None = Field(default=None, description='备注')
+
+    @field_validator('doi')
+    @classmethod
+    def check_doi(cls, v: str | None) -> str | None:
+        """
+        DOI 收敛成裸标识符（`10.xxxx/yyyy`），不收整条 URL。
+
+        前台是 `https://doi.org/` + 本列拼出来的链接，存成 `https://doi.org/10.x/y`
+        会拼出 `https://doi.org/https://doi.org/10.x/y` 这种死链。后台粘整条链接是常态，
+        所以这里就地剥掉前缀，而不是报错让用户自己删。
+        """
+        if not v:
+            return v
+        doi = re.sub(r'^\s*(?:https?://)?(?:dx\.)?doi\.org/', '', v.strip(), flags=re.IGNORECASE)
+        doi = re.sub(r'^\s*doi:\s*', '', doi, flags=re.IGNORECASE).strip()
+
+        return doi
+
+    @field_validator('source_url')
+    @classmethod
+    def check_source_url(cls, v: str | None) -> str | None:
+        return _assert_http_url(v, '原文链接')
+
+    @field_validator('pdf_url')
+    @classmethod
+    def check_pdf_url(cls, v: str | None) -> str | None:
+        return _assert_http_url(v, 'PDF 全文地址')
+
+    @field_validator('cover_image_url')
+    @classmethod
+    def check_cover_image_url(cls, v: str | None) -> str | None:
+        return _assert_http_url(v, '配图地址')
+
+    @field_validator('authors')
+    @classmethod
+    def check_authors(cls, v: list[PublicationAuthorModel] | None) -> list[PublicationAuthorModel] | None:
+        """空姓名的行直接丢掉（后台点了「添加作者」又没填），并卡一道条数上限。"""
+        if v is None:
+            return v
+        rows = [a for a in v if (a.name or '').strip()]
+        if len(rows) > MAX_PUBLICATION_AUTHORS:
+            raise ModelValidatorException(message=f'作者不能超过 {MAX_PUBLICATION_AUTHORS} 位')
+        for author in rows:
+            author.name = author.name.strip()
+
+        return rows
+
+    @field_validator('affiliations', 'keywords')
+    @classmethod
+    def check_str_list(cls, v: list[str] | None) -> list[str] | None:
+        """同上：去空、去首尾空白。上限分别在下面的 validate_fields 里报得更具体。"""
+        if v is None:
+            return v
+
+        return [s.strip() for s in v if s and s.strip()]
+
+    @Xss(field_name='title', message='标题不能包含脚本字符')
+    @NotBlank(field_name='title', message='标题不能为空')
+    @Size(field_name='title', min_length=0, max_length=500, message='标题不能超过500个字符')
+    def get_title(self) -> str | None:
+        return self.title
+
+    @Size(field_name='journal', min_length=0, max_length=300, message='期刊名称不能超过300个字符')
+    def get_journal(self) -> str | None:
+        return self.journal
+
+    def validate_fields(self) -> None:
+        self.get_title()
+        self.get_journal()
+        if self.abstract and len(self.abstract) > MAX_PUBLICATION_ABSTRACT_CHARS:
+            raise ModelValidatorException(message=f'摘要不能超过 {MAX_PUBLICATION_ABSTRACT_CHARS} 个字符')
+        if self.affiliations and len(self.affiliations) > MAX_PUBLICATION_AFFILIATIONS:
+            raise ModelValidatorException(message=f'机构不能超过 {MAX_PUBLICATION_AFFILIATIONS} 个')
+        if self.keywords and len(self.keywords) > MAX_PUBLICATION_KEYWORDS:
+            raise ModelValidatorException(message=f'关键词不能超过 {MAX_PUBLICATION_KEYWORDS} 个')
+        # 机构下标越界 = 前台渲染出一个指不到任何机构的角标。后台是「删机构时重排下标」的，
+        # 但接口不能假定调用方做过这件事
+        limit = len(self.affiliations or [])
+        for author in self.authors or []:
+            if author.affiliation_index is not None and not 0 <= author.affiliation_index < limit:
+                raise ModelValidatorException(message=f'作者「{author.name}」挂的机构序号超出机构列表范围')
+
+
+class PublicationQueryModel(ActionBaseModel):
+    """
+    成果发表查询模型
+
+    **不继承 `PublicationModel`**（其余几张表的 QueryModel 都是那么写的）：这个模型
+    要以 `Annotated[..., Query()]` 的形式当查询参数用，而 FastAPI 的查询参数模型只支持
+    标量与标量数组 —— 继承过来的 `authors: list[PublicationAuthorModel]` 不是那样的东西。
+    查询能用到的本来也就这几个字段。
+    """
+
+    title: str | None = Field(default=None, description='按标题模糊搜索')
+    doi: str | None = Field(default=None, description='按 DOI 模糊搜索')
+    status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
+    keyword: str | None = Field(default=None, description='按标题/作者/期刊/关键词/DOI 模糊搜索')
+    year: int | None = Field(default=None, description='按发表年份过滤')
+
+
+class PublicationPageQueryModel(PublicationQueryModel):
+    """
+    成果发表分页查询模型
+    """
+
+    page_num: int = Field(default=1, description='当前页码')
+    page_size: int = Field(default=10, description='每页记录数')
+
+
+class PublicationYearModel(BaseModel):
+    """
+    年份词表的一行（官网列表页的年份下拉）
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    year: int | None = Field(default=None, description='发表年份，未标注年份的记录为 None')
+    count: int = Field(default=0, description='该年份下已发布的成果数')
+
+
+class PublicationParseModel(BaseModel):
+    """
+    「按 DOI 解析」的入参
+
+    只认 DOI 与 doi.org 链接，**不做任意 URL 抓网页**：那是让服务器去 GET 调用方给的
+    地址，等于把后台文本框变成 SSRF 入口（内网元数据服务、127.0.0.1 上的其它服务）。
+    Crossref 是固定的一个外部主机，且只吐结构化元数据，没有这层风险。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    source: str = Field(description='DOI 或包含 DOI 的链接（如 https://doi.org/10.1016/j.ctim.2024.103041）')
+
+
+class DeletePublicationModel(BaseModel):
+    """
+    删除成果发表模型
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    publication_ids: str = Field(description='需要删除的成果id，多个以逗号分隔')
+
+
 # ---------------------------------------------------------------- 站点文案
 
 

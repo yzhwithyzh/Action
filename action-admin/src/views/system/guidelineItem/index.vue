@@ -65,6 +65,7 @@
 
     <el-alert type="info" :closable="false" class="mb8" show-icon>
       条目是报告助手第二步（结构化模板）与第三步（逐条校验）共用的数据源，改动会直接影响官网前台。
+      「填写要求」决定第二步的必填角标与完成度分母，初始值由关键词（如适用 / if applicable）自动判定，错判请在此修正。
     </el-alert>
 
     <el-table v-loading="loading" :data="itemList" @selection-change="handleSelectionChange">
@@ -77,6 +78,13 @@
       <el-table-column label="领域" align="left" prop="domainZh" width="180" :show-overflow-tooltip="true" />
       <el-table-column label="条目内容（中文）" align="left" prop="contentZh" :show-overflow-tooltip="true" />
       <el-table-column label="扩展 / 对照" align="left" prop="extensionZh" width="220" :show-overflow-tooltip="true" />
+      <el-table-column label="填写要求" align="center" prop="requireLevel" width="96">
+        <template #default="scope">
+          <el-tag :type="scope.row.requireLevel === '1' ? 'info' : 'danger'" size="small">
+            {{ scope.row.requireLevel === '1' ? '选填' : '必填' }}
+          </el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="排序" align="center" prop="sortNum" width="70" />
       <el-table-column label="状态" align="center" prop="status" width="80">
         <template #default="scope">
@@ -195,6 +203,14 @@
           <el-col :span="24">
             <el-form-item label="扩展内容（英）" prop="extensionEn">
               <el-input v-model="form.extensionEn" type="textarea" :rows="2" placeholder="无扩展内容时填 — 或留空" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
+            <el-form-item label="填写要求" prop="requireLevel">
+              <el-radio-group v-model="form.requireLevel">
+                <el-radio value="0">必填</el-radio>
+                <el-radio value="1">选填（条件填写）</el-radio>
+              </el-radio-group>
             </el-form-item>
           </el-col>
           <el-col :span="12">
@@ -325,6 +341,8 @@ function reset() {
     extensionEn: undefined,
     // 新增时不传 sortNum，后端会自动排到该规范末尾
     sortNum: undefined,
+    // 报告规范的通例是条目默认都要应答，只有带「如适用」这类限定语的才是条件填写
+    requireLevel: "0",
     status: "0",
     remark: undefined
   };

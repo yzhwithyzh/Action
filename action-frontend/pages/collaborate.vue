@@ -13,7 +13,30 @@ useHead({
 const { locale } = useI18n()
 const api = useSiteRequest()
 
-const form = ref({ area: '方法学与设计', type: '', subject: '', question: '', name: '', email: '', org: '' })
+/**
+ * mailto 的 subject 跟着界面语言走（写法与 `pages/about.vue` 的 `mailto` 一致）。
+ * encodeURIComponent 不能省：主题里的空格与 `/` 不编码时部分邮件客户端会截断。
+ */
+const mailtoHref = computed(() =>
+  `mailto:action_acu@163.com?subject=${encodeURIComponent(t('collaborate.mailSubject'))}`)
+
+/**
+ * 「合作方向」词表，与左栏五张卡片（s005/s007/s009/s011/s013）一一对应 ——
+ * 左栏是这组 chip 的图例，两边条数或口径不一致时用户会在 chip 里找不到刚读到的那个方向。
+ *
+ * `v` 是**提交进后端 `content` 的固定中文值**，刻意不跟界面语言走：跟着走的话
+ * 后台同一字段会收到中英两套词面，同一个方向要按两个字符串统计。
+ * 展示用 `k` 指向 i18n 键，改词面改 i18n，改统计口径才动 `v`。
+ */
+const AREAS = [
+  { v: '报告规范共建', k: 'collaborate.s018' },
+  { v: '临床研究合作', k: 'collaborate.s019' },
+  { v: '实施科学转化', k: 'collaborate.s020' },
+  { v: '学术会议与论坛', k: 'collaborate.s021' },
+  { v: '其他', k: 'collaborate.s022' },
+] as const
+
+const form = ref({ area: AREAS[0].v as string, type: '', subject: '', question: '', name: '', email: '', org: '' })
 const submitting = ref(false)
 const msg = ref('')
 const msgOk = ref(true)
@@ -45,8 +68,8 @@ const submit = async () => {
 
   submitting.value = true
   try {
-    // 「咨询领域」与「研究类型」在提交模型里都没有对应字段，按带标签的行并入正文而不是丢掉。
-    // 用 data-v 的固定中文键与 option 的固定 value，避免后台同一字段收到中英两套词面。
+    // 「合作方向」与「研究类型」在提交模型里都没有对应字段，按带标签的行并入正文而不是丢掉。
+    // 用 AREAS 的固定中文 `v` 与 option 的固定 value，避免后台同一字段收到中英两套词面。
     const head = [
       `${t('collaborate.lblArea')}: ${form.value.area}`,
       form.value.type ? `${t('collaborate.lblStudyType')}: ${form.value.type}` : '',
@@ -54,7 +77,11 @@ const submit = async () => {
     const content = `${head}\n${form.value.question}`.slice(0, MAXLEN.content)
 
     const res = await api.post('/collaborate', {
-      requestType: 'consult',
+      // 这一段已从「专家咨询」改成「学术协作申请」，`request_type` 跟着走 ——
+      // 后端 Literal 本来就有 'collab' 这一档（`CollabRequestSubmitModel`），
+      // 服务层不按它分支，所以只影响后台看到的分类。改版前后的记录因此能分开数，
+      // 留着 'consult' 的话两批语义不同的申请会混成一堆再也拆不开。
+      requestType: 'collab',
       applicant: form.value.name.trim(),
       email: form.value.email.trim(),
       organization: form.value.org.trim() || null,
@@ -66,7 +93,7 @@ const submit = async () => {
     if (res?.code === 200) {
       msgOk.value = true
       msg.value = t('collaborate.submitOk')
-      form.value = { area: '方法学与设计', type: '', subject: '', question: '', name: '', email: '', org: '' }
+      form.value = { area: AREAS[0].v, type: '', subject: '', question: '', name: '', email: '', org: '' }
     } else {
       msgOk.value = false
       msg.value = res?.msg || t('collaborate.submitFail')
@@ -106,11 +133,14 @@ useReveal()
           <div class="reveal">
             <div class="subh">{{ t('collaborate.s004') }}</div>
             <div class="dom-list">
-              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h16M4 5v14M4 19h16" /><path d="M8 15l3-4 2 2 3-5" /></svg></span><span><b>{{ t('collaborate.s005') }}</b><span>{{ t('collaborate.s006') }}</span></span></div>
-              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2" /></svg></span><span><b>{{ t('collaborate.s007') }}</b><span>{{ t('collaborate.s008') }}</span></span></div>
-              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 2v20M12 2l3 3M12 2 9 5" /><circle cx="12" cy="14" r="3" /></svg></span><span><b>{{ t('collaborate.s009') }}</b><span>{{ t('collaborate.s010') }}</span></span></div>
-              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 3h7l4 4v14H7z" /><path d="M14 3v4h4" /><path d="M10 13h4M10 16h4" /></svg></span><span><b>{{ t('collaborate.s011') }}</b><span>{{ t('collaborate.s012') }}</span></span></div>
-              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8" /><path d="M12 4v8l5 3" /></svg></span><span><b>{{ t('collaborate.s013') }}</b><span>{{ t('collaborate.s014') }}</span></span></div>
+              <!-- 图标按「合作方向」重排过：规范共建=文档 / 临床研究=毫针 / 实施科学转化=趋势线
+                   / 学术会议=人群 / 其他=省略号。改这五条文案时图标要跟着换，
+                   否则会出现「针刺报告规范共建」配着一个折线图这种错配 -->
+              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M7 3h7l4 4v14H7z" /><path d="M14 3v4h4" /><path d="M10 13h4M10 16h4" /></svg></span><span><b>{{ t('collaborate.s005') }}</b><span>{{ t('collaborate.s006') }}</span></span></div>
+              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 2v20M12 2l3 3M12 2 9 5" /><circle cx="12" cy="14" r="3" /></svg></span><span><b>{{ t('collaborate.s007') }}</b><span>{{ t('collaborate.s008') }}</span></span></div>
+              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 5h16M4 5v14M4 19h16" /><path d="M8 15l3-4 2 2 3-5" /></svg></span><span><b>{{ t('collaborate.s009') }}</b><span>{{ t('collaborate.s010') }}</span></span></div>
+              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="9" cy="8" r="3" /><circle cx="17" cy="10" r="2.5" /><path d="M4 19c0-3 2.5-5 5-5s5 2 5 5M15 19c0-2 1.5-3.5 3-3.5" /></svg></span><span><b>{{ t('collaborate.s011') }}</b><span>{{ t('collaborate.s012') }}</span></span></div>
+              <div class="dom"><span class="di" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="8.5" /><path d="M8 12h.01M12 12h.01M16 12h.01" stroke-linecap="round" stroke-width="2.4" /></svg></span><span><b>{{ t('collaborate.s013') }}</b><span>{{ t('collaborate.s014') }}</span></span></div>
             </div>
             <p class="board-note" v-html="t('collaborate.s015')"></p>
           </div>
@@ -119,19 +149,19 @@ useReveal()
             <div class="subh">{{ t('collaborate.s016') }}</div>
             <div class="frow">
               <label v-html="t('collaborate.s017')"></label>
-              <div class="catchips" id="cat" role="group" aria-label="咨询领域">
-                <button type="button" :class="{ on: form.area === '方法学与设计' }" :aria-pressed="form.area === '方法学与设计'" data-v="方法学与设计" @click="form.area = '方法学与设计'">{{ t('collaborate.s018') }}</button>
-                <button type="button" :class="{ on: form.area === '统计分析' }" :aria-pressed="form.area === '统计分析'" data-v="统计分析" @click="form.area = '统计分析'">{{ t('collaborate.s019') }}</button>
-                <button type="button" :class="{ on: form.area === '针灸临床' }" :aria-pressed="form.area === '针灸临床'" data-v="针灸临床" @click="form.area = '针灸临床'">{{ t('collaborate.s020') }}</button>
-                <button type="button" :class="{ on: form.area === '报告规范' }" :aria-pressed="form.area === '报告规范'" data-v="报告规范" @click="form.area = '报告规范'">{{ t('collaborate.s021') }}</button>
-                <button type="button" :class="{ on: form.area === '实施科学' }" :aria-pressed="form.area === '实施科学'" data-v="实施科学" @click="form.area = '实施科学'">{{ t('collaborate.s022') }}</button>
-                <button type="button" :class="{ on: form.area === '其他' }" :aria-pressed="form.area === '其他'" data-v="其他" @click="form.area = '其他'">{{ t('collaborate.s023') }}</button>
+              <!-- 这一组的 aria-label 不能省：上面那个 <label> 指不了 role=group，
+                   没有它读屏器只会念出五个孤零零的按钮 -->
+              <div class="catchips" id="cat" role="group" :aria-label="t('collaborate.lblArea')">
+                <button v-for="a in AREAS" :key="a.v" type="button" :class="{ on: form.area === a.v }" :aria-pressed="form.area === a.v" :data-v="a.v" @click="form.area = a.v">{{ t(a.k) }}</button>
               </div>
             </div>
             <div class="frow two-col">
               <div>
                 <label for="cf-type">{{ t('collaborate.s024') }}</label>
-                <select v-model="form.type" class="sel" id="cf-type" aria-label="研究类型">
+                <!-- 下面每个控件都已有 <label for> 指着，不再挂 aria-label：
+                     aria-label 的优先级高于 <label>，挂上等于把可见标签替换掉
+                     （原先挂的还是写死的中文，英文界面下读屏器就会念中文） -->
+                <select v-model="form.type" class="sel" id="cf-type">
                   <option value="">{{ t('collaborate.s025') }}</option>
                   <option value="rct">{{ t('collaborate.s026') }}</option>
                   <option value="nrct">{{ t('collaborate.s027') }}</option>
@@ -143,18 +173,18 @@ useReveal()
               </div>
               <div>
                 <label for="cf-subject" v-html="t('collaborate.s032')"></label>
-                <input v-model="form.subject" class="inp" id="cf-subject" data-en-ph="e.g. How to report sham-needle parameters" placeholder="例如：假针参数应如何报告" aria-label="咨询主题" :maxlength="MAXLEN.topic" />
+                <input v-model="form.subject" class="inp" id="cf-subject" :placeholder="t('collaborate.subjectPh')" :maxlength="MAXLEN.topic" />
               </div>
             </div>
             <div class="frow">
               <label for="cf-q" v-html="t('collaborate.s033')"></label>
-              <textarea v-model="form.question" class="ta" id="cf-q" data-en-ph="Describe your study background and the specific question you need help with…" placeholder="请描述你的研究背景与需要协助的具体问题……" aria-label="详细描述" :maxlength="MAXLEN.content" required></textarea>
+              <textarea v-model="form.question" class="ta" id="cf-q" :placeholder="t('collaborate.questionPh')" :maxlength="MAXLEN.content" required></textarea>
             </div>
             <div class="frow two-col">
-              <div><label for="cf-name">{{ t('collaborate.s034') }}</label><input v-model="form.name" class="inp" id="cf-name" aria-label="姓名" required :maxlength="MAXLEN.applicant" /></div>
-              <div><label for="cf-email" v-html="t('collaborate.s035')"></label><input v-model="form.email" class="inp" id="cf-email" type="email" placeholder="you@example.com" aria-label="邮箱" required /></div>
+              <div><label for="cf-name">{{ t('collaborate.s034') }}</label><input v-model="form.name" class="inp" id="cf-name" required :maxlength="MAXLEN.applicant" /></div>
+              <div><label for="cf-email" v-html="t('collaborate.s035')"></label><input v-model="form.email" class="inp" id="cf-email" type="email" placeholder="you@example.com" required /></div>
             </div>
-            <div class="frow" style="margin-bottom:14px"><label for="cf-org">{{ t('collaborate.s036') }}</label><input v-model="form.org" class="inp" id="cf-org" aria-label="单位" :maxlength="MAXLEN.organization" /></div>
+            <div class="frow" style="margin-bottom:14px"><label for="cf-org">{{ t('collaborate.s036') }}</label><input v-model="form.org" class="inp" id="cf-org" :maxlength="MAXLEN.organization" /></div>
             <div class="cform-foot">
               <span class="fn">{{ t('collaborate.s037') }}</span>
               <button type="submit" class="btn btn-primary" :disabled="submitting" v-html="submitting ? t('collaborate.submitting') : t('collaborate.s038')"></button>
@@ -212,7 +242,7 @@ useReveal()
           <div class="way reveal"><span class="wi" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 21h18M5 21V9l7-5 7 5v12M9 21v-6h6v6" /></svg></span><b>{{ t('collaborate.s099') }}</b><p>{{ t('collaborate.s100') }}</p></div>
         </div>
         <div style="margin-top:clamp(26px,3.5vw,36px)">
-          <a href="mailto:action@gztcm-action.cn?subject=ACTION 机构合作 / 参与咨询" class="btn btn-primary btn-lg" v-html="t('collaborate.s101')"></a>
+          <a :href="mailtoHref" class="btn btn-primary btn-lg" v-html="t('collaborate.s101')"></a>
         </div>
       </div>
     </section>

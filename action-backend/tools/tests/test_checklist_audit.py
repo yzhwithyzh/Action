@@ -19,6 +19,7 @@ from tools.checklist_worker_tool.engine.audit import (
     ChecklistItem,
     ItemVerdict,
     audit,
+    line_map,
     number_lines,
     split_windows,
     summarize,
@@ -67,6 +68,29 @@ def test_number_lines_skips_blank_lines():
     assert count == 3
     assert numbered.splitlines()[0].endswith('| 甲')
     assert numbered.splitlines()[1] == ''
+
+
+def test_line_map_agrees_with_number_lines():
+    """`line_map` 与 `number_lines` 必须对同一行给出同一个号。
+
+    后端按判定里的 `lines` 从原稿还原段落时走的是 `line_map`，而模型看到的行号来自
+    `number_lines`。两者一旦漂移，回填进草稿的就是**不相干的段落**，且不会报任何错。
+    """
+    text = '甲\n\n乙\n  \n丙\n'
+    numbered, count = number_lines(text)
+    mapping = line_map(text)
+
+    assert len(mapping) == count
+    for no, line in mapping.items():
+        assert f'{no:>4} | {line}' in numbered
+
+
+def test_line_map_numbers_only_non_blank_lines():
+    """空行占位置但不占行号 —— 照物理行号取原文会整体错位，且错得很温和。"""
+    assert line_map('标题\n\n\n正文') == {1: '标题', 2: '正文'}
+    assert line_map('') == {}
+    # 只含空白的行同样不占号（引擎先 rstrip 再判 strip）
+    assert line_map('甲\n   \n乙') == {1: '甲', 2: '乙'}
 
 
 def test_split_windows_overlaps():

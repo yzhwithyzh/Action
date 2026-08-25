@@ -264,6 +264,8 @@ class ApiNamespace:
     ACTION_TEAM_AVATAR: 官网团队成员头像上传接口命名空间
     ACTION_GUIDELINE_FILE: 官网报告规范文档上传接口命名空间
     ACTION_RESOURCE_LOGO: 官网资源中心标识图上传接口命名空间
+    ACTION_PUBLICATION_FILE: 官网成果发表全文/配图上传接口命名空间
+    ACTION_PUBLICATION_PARSE: 官网成果发表元数据解析接口命名空间
     ACTION_SITE_REBUILD: 官网静态站重新生成接口命名空间
     """
 
@@ -385,6 +387,8 @@ class ApiNamespace:
     ACTION_TEAM_AVATAR = 'action:team:avatar'
     ACTION_GUIDELINE_FILE = 'action:guideline:file'
     ACTION_RESOURCE_LOGO = 'action:resource:logo'
+    ACTION_PUBLICATION_FILE = 'action:publication:file'
+    ACTION_PUBLICATION_PARSE = 'action:publication:parse'
     ACTION_SITE_REBUILD = 'action:site:rebuild'
 
 

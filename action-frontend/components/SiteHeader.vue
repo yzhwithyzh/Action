@@ -8,80 +8,31 @@ const route = useRoute()
 
 interface NavItem {
   key: string
-  to?: string
+  to: string
   /** 高亮匹配的路由 path；带 hash 的锚点链接需单独指定 */
-  match?: string
-  /** 有 children 时本项不是链接，而是顶栏上的一个下拉分组 */
-  children?: NavItem[]
+  match: string
 }
 
+// 顶栏一律平铺，没有下拉分组：三个 AI 工具页原先折在「智能工具」下拉里，
+// 现已提到一级 —— 少一次点击，且三页彼此没有从属关系。
+// 代价是英文标签一排放不下，见 chrome.css 里 .menu 的字号/间距与 ≤1180 断点。
 const NAV: NavItem[] = [
   // 标签是「首页」，落点就必须是首页顶部：仍指向 /#modules 的话，点「首页」会直接
   // 滚到平台模块区，跳过 Hero。首页里的「了解平台模块」按钮仍保留 #modules 锚点。
   { key: 'platform', to: '/', match: '/' },
   { key: 'guidelines', to: '/guidelines', match: '/guidelines' },
-  // 三个 AI 工具页合并成一个下拉：顶栏一级项从 8 个降到 6 个，且它们本就是同一类东西。
-  // 「报告规范」是首要 CTA，必须留在一级，不进这个组。
-  {
-    key: 'tools',
-    children: [
-      { key: 'assistant', to: '/assistant', match: '/assistant' },
-      { key: 'methodology', to: '/srd', match: '/srd' },
-      { key: 'implementation', to: '/implementation', match: '/implementation' },
-    ],
-  },
+  { key: 'assistant', to: '/assistant', match: '/assistant' },
+  { key: 'methodology', to: '/srd', match: '/srd' },
+  { key: 'implementation', to: '/implementation', match: '/implementation' },
   { key: 'collaborate', to: '/collaborate', match: '/collaborate' },
   { key: 'news', to: '/news', match: '/news' },
+  // 中文标签是「成果」不是「成果发表」：这是第 9 项，英文那版（Publications）本来就是
+  // 一排里最长的词，两个字与四个字在 ≤1180px 那一档差着一整行
+  { key: 'publications', to: '/publications', match: '/publications' },
   { key: 'about', to: '/about', match: '/about' },
 ]
 
 const isCurrent = (item: NavItem) => route.path === item.match
-/** 分组按钮的高亮：停在组内任一页面时点亮 */
-const isGroupCurrent = (item: NavItem) => (item.children ?? []).some(isCurrent)
-
-/* ---------- 顶栏下拉 ---------- */
-const openKey = ref<string | null>(null)
-let closeTimer: ReturnType<typeof setTimeout> | undefined
-
-const openGroup = (key: string) => {
-  clearTimeout(closeTimer)
-  openKey.value = key
-}
-// 延迟关闭：鼠标从按钮斜着划向面板时会短暂离开容器，立即关会点不中
-const scheduleClose = () => {
-  clearTimeout(closeTimer)
-  closeTimer = setTimeout(() => { openKey.value = null }, 160)
-}
-const closeGroup = () => {
-  clearTimeout(closeTimer)
-  openKey.value = null
-}
-const toggleGroup = (key: string) => {
-  if (openKey.value === key) closeGroup()
-  else openGroup(key)
-}
-// 焦点移出整个分组才关，Tab 在面板内部移动时保持展开
-const onGroupBlur = (event: FocusEvent, key: string) => {
-  const next = event.relatedTarget as Node | null
-  const root = event.currentTarget as HTMLElement
-  if (openKey.value === key && (!next || !root.contains(next))) closeGroup()
-}
-
-const onDocClick = (event: MouseEvent) => {
-  if (!(event.target as HTMLElement).closest('.menu-grp')) closeGroup()
-}
-const onKeydown = (event: KeyboardEvent) => {
-  if (event.key === 'Escape') closeGroup()
-}
-onMounted(() => {
-  document.addEventListener('click', onDocClick)
-  document.addEventListener('keydown', onKeydown)
-})
-onBeforeUnmount(() => {
-  clearTimeout(closeTimer)
-  document.removeEventListener('click', onDocClick)
-  document.removeEventListener('keydown', onKeydown)
-})
 
 const { guest, isLoggedIn, logout, fetchMe } = useAuth()
 
@@ -99,6 +50,25 @@ const authLink = (path: string) =>
 const loginLink = computed(() => authLink('/login'))
 const registerLink = computed(() => authLink('/register'))
 
+/**
+ * 顶栏英文版收窄项间距的类（`chrome.css` 的 `.menu.is-en`）。
+ *
+ * **不能直接绑 `locale !== 'zh'`。** 站点是构建期预渲染（`nitro.preset: 'static'`），
+ * 那份 HTML 按默认语言 zh 渲染，里面是 `class="menu"`；访客带着 `action_lang=en` 的 cookie
+ * 刷新时，客户端首次渲染算出来的是 `class="menu is-en"` —— 而 **Vue 的 hydration 只修文本、
+ * 不修 class**（`runtime-core` 的 `hydrateElement`：文本不一致就地 `el.textContent=` 改掉，
+ * props 不一致只记一条 mismatch 警告，真正 patchProp 的仅限事件、`.prop` 修饰符与
+ * `dynamicProps`，而 class 走 CLASS patchFlag，从不进 `dynamicProps`）。
+ * 结果是刷新后得到「英文文案 + 中文那档 20px 间距」，8 个英文全称排不下折成两行，
+ * 与点语言按钮切出来的样子对不上（那是普通响应式更新，class 打得上）。
+ *
+ * 挂个 hydrated 开关把首帧对齐：服务端与客户端首次渲染都不带这个类 → 无 mismatch →
+ * 挂载后置真，走正常的响应式 patch。两条路径由此收敛到同一个结果。
+ * 这个 patch 在挂载后的同一批微任务里 flush，早于浏览器绘制，看不到中间态。
+ */
+const hydrated = ref(false)
+const menuIsEn = computed(() => hydrated.value && locale.value !== 'zh')
+
 const menuOpen = ref(false)
 const toggleMenu = () => {
   menuOpen.value = !menuOpen.value
@@ -111,10 +81,9 @@ watchEffect(() => {
   }
 })
 
-// 路由切换后收起移动菜单与顶栏下拉
+// 路由切换后收起移动菜单
 watch(() => route.fullPath, () => {
   menuOpen.value = false
-  closeGroup()
 })
 
 const switchLang = () => {
@@ -124,6 +93,7 @@ const switchLang = () => {
 // 全站构建期预渲染（`nitro.preset: 'static'`），登录态只能在客户端判定：
 // 回填必须放 onMounted，且顶栏那块整体裹 <ClientOnly>，否则会被烤进静态 HTML。
 onMounted(() => {
+  hydrated.value = true
   void fetchMe()
 })
 
@@ -137,69 +107,31 @@ const onLogout = async () => {
 <template>
   <header id="top">
     <div class="wrap nav">
+      <!--
+        品牌标识用甲方给的正式 logo（图标 + ACTION 字标一体）。字标已经在图里，
+        旁边只留机构名，不再重复写一遍 ACTION。图片 alt 留空是因为链接自身有
+        aria-label（「ACTION 首页」），再给 alt 就会读成两遍。
+        width/height 写死只为让浏览器提前算出宽高比、首屏不抖，实际大小由 CSS 高度定。
+      -->
       <NuxtLink class="brand" to="/" :aria-label="t('brand.homeAria')">
-        <svg class="seal" viewBox="0 0 48 48" fill="none" aria-hidden="true">
-          <rect x="1.5" y="1.5" width="45" height="45" rx="11" fill="var(--indigo-700)" />
-          <rect x="1.5" y="1.5" width="45" height="45" rx="11" stroke="var(--indigo-500)" stroke-width="1" />
-          <circle cx="24" cy="24" r="10.5" stroke="var(--indigo-200)" stroke-width="1.4" />
-          <circle cx="24" cy="24" r="3" fill="var(--cinnabar)" />
-          <path d="M24 4v12M24 32v12" stroke="#fff" stroke-width="1.6" stroke-linecap="round" />
-          <circle
-            cx="24" cy="24" r="10.5" stroke="var(--cinnabar)" stroke-width="1.4"
-            stroke-dasharray="1.5 5" opacity=".7"
-          />
-        </svg>
-        <span class="brand-txt">
-          <b>{{ t('brand.name') }}</b>
-          <small>{{ t('brand.org') }}</small>
-        </span>
+        <img class="brand-logo" src="/assets/action-logo.png" alt="" width="760" height="181">
+        
       </NuxtLink>
 
-      <nav class="menu" :aria-label="t('nav.aria')">
-        <template v-for="item in NAV" :key="item.key">
-          <div
-            v-if="item.children"
-            class="menu-grp"
-            :class="{ open: openKey === item.key }"
-            @mouseenter="openGroup(item.key)"
-            @mouseleave="scheduleClose"
-            @focusin="openGroup(item.key)"
-            @focusout="onGroupBlur($event, item.key)"
-          >
-            <button
-              type="button"
-              class="grp-btn"
-              :class="{ cur: isGroupCurrent(item) }"
-              :aria-expanded="openKey === item.key"
-              aria-haspopup="true"
-              @click.stop="toggleGroup(item.key)"
-            >
-              <span>{{ t(`nav.${item.key}`) }}</span>
-              <svg
-                viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
-                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"
-              ><path d="m6 9 6 6 6-6" /></svg>
-            </button>
-            <div class="grp-panel">
-              <NuxtLink
-                v-for="sub in item.children"
-                :key="sub.key"
-                :to="sub.to"
-                :class="{ cur: isCurrent(sub) }"
-                :aria-current="isCurrent(sub) ? 'page' : undefined"
-              >
-                <span class="gi-t">{{ t(`nav.${sub.key}`) }}</span>
-                <span class="gi-d">{{ t(`nav.${sub.key}Desc`) }}</span>
-              </NuxtLink>
-            </div>
-          </div>
-          <NuxtLink
-            v-else
-            :to="item.to"
-            :class="{ cur: isCurrent(item) }"
-            :aria-current="isCurrent(item) ? 'page' : undefined"
-          >{{ t(`nav.${item.key}`) }}</NuxtLink>
-        </template>
+      <!--
+        英文标签是全称、还会折行，项间距要比中文那版更紧一档（见 chrome.css 的 .menu.is-en）。
+        这里用类而不是 CSS 的 `html[lang^="en"]`：`nuxt.config.ts` 把 htmlAttrs.lang 写死成
+        zh-CN，切语言时 <html lang> 并不跟着变，靠它选不中。
+        绑的是 `menuIsEn` 而不是 `locale !== 'zh'`，原因见 script 里那段注释（hydration 不修 class）。
+      -->
+      <nav class="menu" :class="{ 'is-en': menuIsEn }" :aria-label="t('nav.aria')">
+        <NuxtLink
+          v-for="item in NAV"
+          :key="item.key"
+          :to="item.to"
+          :class="{ cur: isCurrent(item) }"
+          :aria-current="isCurrent(item) ? 'page' : undefined"
+        >{{ t(`nav.${item.key}`) }}</NuxtLink>
       </nav>
 
       <div class="nav-actions">
@@ -238,26 +170,12 @@ const onLogout = async () => {
   </header>
 
   <nav class="mobile-menu" :aria-label="t('nav.ariaMobile')">
-    <!-- 移动端不做二级折叠：多一次点击换不来什么，直接把分组摊开成缩进的一段 -->
-    <template v-for="item in NAV" :key="item.key">
-      <div v-if="item.children" class="mm-grp">
-        <span class="mm-lbl">{{ t(`nav.${item.key}`) }}</span>
-        <div class="mm-sub">
-          <NuxtLink
-            v-for="sub in item.children"
-            :key="sub.key"
-            :to="sub.to"
-            :class="{ cur: isCurrent(sub) }"
-            :aria-current="isCurrent(sub) ? 'page' : undefined"
-          >{{ t(`nav.${sub.key}`) }}</NuxtLink>
-        </div>
-      </div>
-      <NuxtLink
-        v-else
-        :to="item.to"
-        :aria-current="isCurrent(item) ? 'page' : undefined"
-      >{{ t(`nav.${item.key}`) }}</NuxtLink>
-    </template>
+    <NuxtLink
+      v-for="item in NAV"
+      :key="item.key"
+      :to="item.to"
+      :aria-current="isCurrent(item) ? 'page' : undefined"
+    >{{ t(`nav.${item.key}`) }}</NuxtLink>
     <!-- 顶栏那份在 ≤600px 会被收起，移动菜单里必须有一份等价入口 -->
     <ClientOnly>
       <template v-if="isLoggedIn">

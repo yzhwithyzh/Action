@@ -30,6 +30,7 @@ create table action_guideline_item (
     ext_label_en  varchar(300) default '',
     extension_zh  text,
     extension_en  text,
+    require_level char(1)      default '0',
     sort_num      int          default 0,
     status        char(1)      default '0',
     del_flag      char(1)      default '0',
@@ -56,6 +57,7 @@ comment on column action_guideline_item.ext_label_zh is '扩展列列名（中�
 comment on column action_guideline_item.ext_label_en is '扩展列列名（英文）';
 comment on column action_guideline_item.extension_zh is '扩展/对照条目内容（中文）';
 comment on column action_guideline_item.extension_en is '扩展/对照条目内容（英文）';
+comment on column action_guideline_item.require_level is '填写要求（0必填 1条件填写/选填）';
 comment on column action_guideline_item.sort_num is '规范内显示顺序';
 comment on column action_guideline_item.status is '状态（0正常 1停用）';
 comment on column action_guideline_item.del_flag is '删除标志（0存在 2删除）';
@@ -66,14 +68,15 @@ create index idx_action_guideline_item_gid on action_guideline_item (guideline_i
 -- 导致规范页查不到、报告助手匹配到观察性研究时挂载不出规范。补上；本仓库暂无 STROBE 中英素材，
 -- 故 release_state 置 soon、不带 checklist 条目，拿到素材后再跑一次抽取脚本。
 delete from action_guideline where guideline_id = 7;
-insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en, version,
+insert into action_guideline (guideline_id, code, name_zh, name_en, study_type, summary_zh, summary_en,
+                              version_zh, version_en,
                               file_url_zh, file_url_en, external_url, logo_url, release_state, sort_num, status,
                               del_flag, create_by, create_time, update_by, update_time, remark)
 values (7, 'STROBE', 'STROBE（观察性研究报告规范）',
         'STROBE (Strengthening the Reporting of Observational Studies in Epidemiology)', 'obs',
         'STROBE 规范队列研究、病例对照研究与横断面研究的报告条目。针刺领域的真实世界研究与注册登记研究适用；本平台的针刺扩展条目待补。',
         'STROBE covers reporting for cohort, case-control and cross-sectional studies. It applies to real-world and registry studies of acupuncture; an acupuncture-specific extension is not yet available on this platform.',
-        '现行版', '', '', 'https://www.strobe-statement.org/', '', 'soon', 6, '0', '0', 'migration',
+        '现行版', 'Current version', '', '', 'https://www.strobe-statement.org/', '', 'soon', 6, '0', '0', 'migration',
         current_timestamp, '', null, '素材待补');
 
 
@@ -372,5 +375,28 @@ insert into action_guideline_item (item_id, guideline_id, part_no, part_zh, part
 insert into action_guideline_item (item_id, guideline_id, part_no, part_zh, part_en, domain_zh, domain_en, item_no_zh, item_no_en, content_zh, content_en, ext_label_zh, ext_label_en, extension_zh, extension_en, sort_num, status, del_flag, create_by, create_time) values (282, 6, 2, 'ARRIVE 建议条目集', 'The Recommended Set', '利益冲突声明', 'Declaration of interests', '21', '21', 'a. 声明任何潜在利益冲突，包括经济和非经济利益冲突；如无利益冲突，也应声明。b. 列出所有资助来源，包括课题编号，并说明资助方在研究设计、分析和报告中的作用。', 'a. Declare any potential conflicts of interest, including financial and non-financial. If none exist, this should be stated. b. List all funding sources, including grant identifier, and the role of the funder(s) in the design, analysis and reporting of the study.', '', '', '', '', 20, '0', '0', 'migration', current_timestamp);
 
 select setval('action_guideline_item_item_id_seq', 282);
+
+-- ----------------------------
+-- 填写要求回填（与增量文件 007 逐字同一段逻辑）
+--
+-- 抽取脚本产出的 insert 不带 require_level，全部落在默认值 '0'（必填）——报告规范的通例
+-- 就是条目默认都要应答。这里再把明确带「如适用 / if applicable」这类限定语的置成 '1'
+-- （条件填写）。两条路径（先跑全量后跑增量、或反过来）必须得到同一结果，改这段时
+-- 007 要一起改。启发式必然有错判，后台「规范条目管理」页可逐条修正；
+-- 回填只动 update_by 仍是 migration/空的行，绕开人工改过的。
+-- ----------------------------
+update action_guideline_item
+   set require_level = '1',
+       update_by = 'migration',
+       update_time = now()
+ where del_flag = '0'
+   and require_level = '0'
+   and coalesce(update_by, '') in ('', 'migration')
+   and (
+        coalesce(content_zh, '') || coalesce(extension_zh, '')
+            ~ '如适用|若适用|如有|若有|如相关|如涉及|如存在|适用时|如果适用|酌情'
+     or coalesce(content_en, '') || coalesce(extension_en, '')
+            ~* 'if applicable|where applicable|if relevant|where relevant|if any|if appropriate|as applicable'
+   );
 
 commit;

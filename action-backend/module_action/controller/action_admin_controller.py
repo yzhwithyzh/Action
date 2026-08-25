@@ -26,6 +26,9 @@ from module_action.entity.vo.action_vo import (
     GuidelinePageQueryModel,
     NewsModel,
     NewsPageQueryModel,
+    PublicationModel,
+    PublicationPageQueryModel,
+    PublicationParseModel,
     ResourceLinkModel,
     ResourceLinkPageQueryModel,
     SiteRebuildStateModel,
@@ -43,12 +46,14 @@ from module_action.service.action_service import (
     GuidelineItemService,
     GuidelineService,
     NewsService,
+    PublicationService,
     ResourceLinkService,
     SiteRebuildService,
     SiteTextService,
     StudyTypeService,
     TeamMemberService,
 )
+from module_action.service.publication_meta_service import PublicationMetaService
 from module_admin.entity.vo.common_vo import UploadResponseModel
 from module_admin.entity.vo.user_vo import CurrentUserModel
 from utils.log_util import logger
@@ -805,6 +810,234 @@ async def upload_admin_resource_link_logo(
             url=url,
         )
     )
+
+
+# ------------------------------------------------------------------ 成果发表
+
+
+@action_admin_controller.get(
+    '/publication/list',
+    summary='获取成果发表分页列表',
+    description='后台维护用，含已停用的成果。列表不返回摘要与引用文本（详情接口才有）',
+    response_model=PageResponseModel[PublicationModel],
+    dependencies=[UserInterfaceAuthDependency('action:publication:list')],
+)
+async def get_admin_publication_list(
+    request: Request,
+    publication_page_query: Annotated[PublicationPageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await PublicationService.get_publication_list_services(query_db, publication_page_query, is_page=True)
+    logger.info('获取成功')
+
+    return ResponseUtil.success(model_content=result)
+
+
+@action_admin_controller.get(
+    '/publication/{publication_id}',
+    summary='获取成果发表详情',
+    description='后台维护用',
+    response_model=DataResponseModel[PublicationModel],
+    dependencies=[UserInterfaceAuthDependency('action:publication:query')],
+)
+async def get_admin_publication_detail(
+    request: Request,
+    publication_id: Annotated[int, Path(description='成果id')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await PublicationService.publication_detail_services(query_db, publication_id)
+    logger.info(f'获取publication_id为{publication_id}的信息成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.post(
+    '/publication',
+    summary='新增成果发表',
+    description='后台维护用。引用文本留空时由后端按字段自动拼一条',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:publication:add')],
+)
+@ValidateFields(validate_model='add_publication')
+@Log(title='成果发表', business_type=BusinessType.INSERT)
+async def add_admin_publication(
+    request: Request,
+    add_publication: PublicationModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    add_publication.create_by = current_user.user.user_name
+    add_publication.create_time = datetime.now()
+    add_publication.update_by = current_user.user.user_name
+    add_publication.update_time = datetime.now()
+    result = await PublicationService.add_publication_services(query_db, add_publication)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.put(
+    '/publication',
+    summary='编辑成果发表',
+    description=(
+        '后台维护用。**作者 / 机构 / 关键词三项是整体覆盖**：带上什么就是什么，'
+        '不带这三个字段时保持原样（后台表单一律整份提交，所以实际总是覆盖）'
+    ),
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:publication:edit')],
+)
+@ValidateFields(validate_model='edit_publication')
+@Log(title='成果发表', business_type=BusinessType.UPDATE)
+async def edit_admin_publication(
+    request: Request,
+    edit_publication: PublicationModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    edit_publication.update_by = current_user.user.user_name
+    edit_publication.update_time = datetime.now()
+    result = await PublicationService.edit_publication_services(query_db, edit_publication)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.delete(
+    '/publication/{publication_ids}',
+    summary='删除成果发表',
+    description='后台维护用，逻辑删除',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:publication:remove')],
+)
+@Log(title='成果发表', business_type=BusinessType.DELETE)
+async def delete_admin_publication(
+    request: Request,
+    publication_ids: Annotated[str, Path(description='需要删除的成果id，多个以逗号分隔')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await PublicationService.delete_publication_services(query_db, publication_ids)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.post(
+    '/publication/file',
+    summary='上传成果全文 PDF',
+    description='后台维护用，PDF 直传阿里云 OSS，返回可直接写入 pdfUrl 的公网地址',
+    response_model=DynamicResponseModel[UploadResponseModel],
+    dependencies=[UserInterfaceAuthDependency('action:publication:edit')],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_PUBLICATION_FILE, preset=ApiRateLimitPreset.COMMON_UPLOAD)
+async def upload_admin_publication_file(
+    request: Request,
+    file: Annotated[UploadFile, File(...)],
+) -> Response:
+    # 与规范原文同理：不走 /common/upload（落后端本地磁盘），官网是 SSG 静态站。
+    # **这个桶是整桶公共读** —— 传上来的是匿名可下载的公网对象，
+    # 所以只该放已经公开发表、有权分发的全文，未发表稿件不能走这里
+    extension = OssUtil.normalize_document_extension(file.filename or '')
+    content = await file.read()
+    if not content:
+        raise ServiceException(message='上传的文档为空')
+    if len(content) > MAX_DOCUMENT_SIZE:
+        raise ServiceException(message=f'文档大小不能超过 {MAX_DOCUMENT_SIZE // 1024 // 1024}MB')
+
+    object_key = OssUtil.build_object_key('publication', extension)
+    url = await OssUtil.put_object(object_key, content, extension)
+    logger.info(f'成果全文上传成功：{object_key}')
+
+    return ResponseUtil.success(
+        model_content=UploadResponseModel(
+            fileName=url,
+            newFileName=object_key.rsplit('/', 1)[-1],
+            originalFilename=file.filename,
+            url=url,
+        )
+    )
+
+
+@action_admin_controller.post(
+    '/publication/cover',
+    summary='上传成果配图',
+    description='后台维护用，图片直传阿里云 OSS，返回可直接写入 coverImageUrl 的公网地址',
+    response_model=DynamicResponseModel[UploadResponseModel],
+    dependencies=[UserInterfaceAuthDependency('action:publication:edit')],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_PUBLICATION_FILE, preset=ApiRateLimitPreset.COMMON_UPLOAD)
+async def upload_admin_publication_cover(
+    request: Request,
+    file: Annotated[UploadFile, File(...)],
+) -> Response:
+    extension = OssUtil.normalize_extension(file.filename or '')
+    content = await file.read()
+    if not content:
+        raise ServiceException(message='上传的图片为空')
+    if len(content) > MAX_IMAGE_SIZE:
+        raise ServiceException(message=f'图片大小不能超过 {MAX_IMAGE_SIZE // 1024 // 1024}MB')
+
+    object_key = OssUtil.build_object_key('publication', extension)
+    url = await OssUtil.put_object(object_key, content, extension)
+    logger.info(f'成果配图上传成功：{object_key}')
+
+    return ResponseUtil.success(
+        model_content=UploadResponseModel(
+            fileName=url,
+            newFileName=object_key.rsplit('/', 1)[-1],
+            originalFilename=file.filename,
+            url=url,
+        )
+    )
+
+
+@action_admin_controller.post(
+    '/publication/parse-doi',
+    summary='按 DOI 解析成果元数据',
+    description=(
+        '后台维护用。从入参里抠出 DOI 后向 Crossref 查一次，**摘要与关键词由 PubMed 补**'
+        '（Crossref 没有作者关键词字段，摘要也要出版社存过才有）。返回**草稿**供管理员核对，'
+        '不写库。**只认 DOI 与 doi.org 链接，不抓任意网址** —— 让服务器去 GET 调用方给的'
+        '地址是 SSRF。没有 DOI 的成果请改用「上传 PDF 解析」或手动填写。'
+        '哪几项没拿到、关键词是不是 MeSH，都在 msg 里说明'
+    ),
+    response_model=DataResponseModel[PublicationModel],
+    dependencies=[UserInterfaceAuthDependency('action:publication:edit')],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_PUBLICATION_PARSE, preset=ApiRateLimitPreset.USER_RESOURCE_EXECUTION)
+async def parse_admin_publication_doi(
+    request: Request,
+    parse_publication: PublicationParseModel,
+) -> Response:
+    result, note = await PublicationMetaService.parse_doi_services(parse_publication.source)
+    logger.info(f'按 DOI 解析成果元数据成功：{note}')
+
+    return ResponseUtil.success(data=result, msg=note)
+
+
+@action_admin_controller.post(
+    '/publication/parse-pdf',
+    summary='解析 PDF 提取成果元数据',
+    description=(
+        '后台维护用。抽出 PDF 开头部分的文字交给 `ai_models` 模型池提取标题/作者/机构/摘要等，'
+        '返回**草稿**供管理员核对，不写库、也不把这份 PDF 存到任何地方。'
+        '有 DOI 的论文优先用「按 DOI 解析」——那是出版社登记的权威元数据，比抽取准'
+    ),
+    response_model=DataResponseModel[PublicationModel],
+    dependencies=[UserInterfaceAuthDependency('action:publication:edit')],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_PUBLICATION_PARSE, preset=ApiRateLimitPreset.USER_RESOURCE_EXECUTION)
+async def parse_admin_publication_pdf(
+    request: Request,
+    file: Annotated[UploadFile, File(...)],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    content = await file.read()
+    if not content:
+        raise ServiceException(message='上传的文件为空')
+    result = await PublicationMetaService.parse_pdf_services(query_db, file.filename or '', content)
+    logger.info('按 PDF 解析成果元数据成功')
+
+    return ResponseUtil.success(data=result, msg='解析成功，请逐项核对后保存')
 
 
 # ------------------------------------------------------------------ 站点文案

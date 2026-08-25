@@ -31,8 +31,8 @@ const { pick } = useBilingual()
 
 const id = computed(() => String(route.params.id ?? ''))
 
-// swr：详情页是否被预渲染取决于构建时列表页有没有爬到它，取不到时得靠客户端补
-const { data: res } = await useSiteObject<NewsRow>(`/news/${id.value}`, `news-detail:${id.value}`, { swr: true })
+// 详情页是否被预渲染取决于构建时列表页有没有爬到它，取不到时靠客户端那次重取补上
+const { data: res } = await useSiteObject<NewsRow>(`/news/${id.value}`, `news-detail:${id.value}`)
 const row = computed<NewsRow | null>(() => res.value?.data ?? null)
 
 const title = computed(() => pick(row.value, 'title'))
@@ -52,7 +52,7 @@ useReveal()
   <div class="page-news-detail">
     <section class="sec">
       <div class="wrap">
-        <nav class="crumb" aria-label="面包屑">
+        <nav class="crumb" :aria-label="t('newsDetail.crumbAria')">
           <NuxtLink to="/">{{ t('nav.platform') }}</NuxtLink>
           <span aria-hidden="true">/</span>
           <NuxtLink to="/news">{{ t('nav.news') }}</NuxtLink>

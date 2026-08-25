@@ -148,6 +148,49 @@ class ActionResourceLink(Base):
     remark = Column(String(500), nullable=True, comment='备注')
 
 
+class ActionPublication(Base):
+    """
+    官网-成果发表
+
+    「成果发表」页的论文列表与详情。**这张表刻意没有 `*_zh`/`*_en` 成对的双语列**：
+    标题、作者、期刊、摘要都是发表时的原文，同时也是引用信息，翻译一遍就既检索不到
+    也引用不了。页面上的栏目标题与按钮文字照旧走 i18n + `action_site_text`。
+
+    `authors` / `affiliations` / `keywords` 三列存的是 **JSON 文本**，读写在
+    `PublicationService` 里成对完成（`_load_json` / `_dump_json`）。用 text 而不是子表，
+    是因为作者顺序即署名顺序、且没有任何跨论文的按作者查询需求；不用 jsonb，
+    是因为这三列永远整体读写、从不在库内按字段查。
+    """
+
+    __tablename__ = 'action_publication'
+    __table_args__ = {'comment': '官网-成果发表'}
+
+    publication_id = Column(Integer, primary_key=True, autoincrement=True, comment='成果id')
+    title = Column(String(500), nullable=False, comment='论文标题（发表原文，逐字，不翻译）')
+    authors = Column(Text, nullable=True, comment='作者 JSON 数组，顺序即署名顺序')
+    affiliations = Column(Text, nullable=True, comment='机构 JSON 数组，下标对应 authors[].affiliationIndex')
+    abstract = Column(Text, nullable=True, comment='摘要（发表原文纯文本）')
+    keywords = Column(Text, nullable=True, comment='关键词 JSON 数组')
+    journal = Column(String(300), nullable=True, server_default=text("''"), comment='期刊名称')
+    volume = Column(String(50), nullable=True, server_default=text("''"), comment='卷')
+    issue = Column(String(50), nullable=True, server_default=text("''"), comment='期')
+    pages = Column(String(50), nullable=True, server_default=text("''"), comment='页码')
+    publication_year = Column(Integer, nullable=True, comment='发表年份，列表页按它分组')
+    doi = Column(String(200), nullable=True, server_default=text("''"), comment='DOI')
+    source_url = Column(String(500), nullable=True, server_default=text("''"), comment='出版社/期刊页面地址')
+    pdf_url = Column(String(500), nullable=True, server_default=text("''"), comment='PDF 全文地址（OSS 公网直链）')
+    cover_image_url = Column(String(300), nullable=True, server_default=text("''"), comment='配图/封面地址')
+    citation_text = Column(Text, nullable=True, comment='引用文本，留空时由后端按字段自动拼一条')
+    sort_num = Column(Integer, nullable=True, server_default='0', comment='同年内的显示顺序')
+    status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_by = Column(String(64), nullable=True, server_default=text("''"), comment='创建者')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_by = Column(String(64), nullable=True, server_default=text("''"), comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+    remark = Column(String(500), nullable=True, comment='备注')
+
+
 class ActionSiteText(Base):
     """
     官网-站点文案（i18n 词条的可编辑副本）

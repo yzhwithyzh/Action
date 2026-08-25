@@ -277,6 +277,26 @@
             </el-form-item>
           </el-col>
           <el-col :span="12">
+            <el-form-item label="结构化输出" prop="structuredMethod">
+              <el-select
+                v-model="form.structuredMethod"
+                placeholder="自动探测 (推荐)"
+                clearable
+              >
+                <el-option
+                  v-for="item in structuredMethodOptions"
+                  :key="item.value"
+                  :label="item.label"
+                  :value="item.value"
+                />
+              </el-select>
+              <div class="form-tip">
+                留空即可：报告助手等工具会自己试出这个模型支持哪种方式并记回来。
+                只有在它试错了、或想强制降级时才手动指定。
+              </div>
+            </el-form-item>
+          </el-col>
+          <el-col :span="12">
             <el-form-item label="状态" prop="status">
               <el-radio-group v-model="form.status">
                 <el-radio
@@ -324,6 +344,15 @@ const { ai_provider_type, sys_normal_disable, sys_yes_no } = proxy.useDict(
   "sys_normal_disable",
   "sys_yes_no",
 );
+
+// 结构化输出（让模型按给定 JSON 结构回话）的实现方式，由强到弱 —— 也是自动降级的顺序。
+// 不做成字典表：取值是引擎侧 METHOD_ORDER 的镜像，跟着代码走，不该让运维在字典里编出第五种
+const structuredMethodOptions = [
+  { value: "json_schema", label: "json_schema（最稳）" },
+  { value: "function_calling", label: "function_calling（兼容面最广）" },
+  { value: "json_mode", label: "json_mode（只保证是 JSON）" },
+  { value: "text", label: "字符串解析（兜底）" },
+];
 
 const modelList = ref([]);
 const open = ref(false);
@@ -390,6 +419,7 @@ function reset() {
     supportReasoning: "N",
     supportImages: "N",
     modelType: undefined,
+    structuredMethod: undefined,
     status: "0",
     remark: undefined,
   };
@@ -471,3 +501,12 @@ function handleDelete(row) {
 
 getList();
 </script>
+
+<style scoped>
+.form-tip {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #909399;
+}
+</style>

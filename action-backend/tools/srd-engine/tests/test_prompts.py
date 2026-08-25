@@ -50,25 +50,30 @@ def test_every_item_renders_a_judge_prompt(item):
 
 def test_judge_prompt_states_the_four_scoring_bands():
     system, _ = judge_batch_messages([ITEM_BY_CODE['2b']], ExtractDoc(), ExtractDoc(), {})
-    for band in ('"0" 完全相同', '"1" 部分相同', '"2" 部分不同', '"3" 完全不同', '"unclear"'):
+    for band in ('"3" 完全相同', '"2" 部分相同', '"1" 部分不同', '"0" 完全不同', '"unclear"'):
         assert band in system, f'提示词缺少档位定义：{band}'
-    # 「都明确说未做」= 一致（0 分），「都没写清楚」= 证据不足 —— 这条区分必须写进提示词
+    # 「都明确说未做」= 一致（3 分），「都没写清楚」= 证据不足 —— 这条区分必须写进提示词
     assert '未做某事' in system
     assert '逐字' in system
 
 
 def test_judge_prompt_states_the_direction_of_the_scale():
-    """分越低越重复。方向写反了会让全部结论反过来，必须钉死在测试里。"""
+    """分越高越重复。方向写反了会让全部结论反过来，必须钉死在测试里。
+
+    0.8.0 翻转了方向，所以这里连「不许出现旧措辞」一起断言 —— 只断言新措辞的话，
+    提示词里同时留着两句互相打架的方向说明也能过。
+    """
     system, _ = judge_batch_messages([ITEM_BY_CODE['2b']], ExtractDoc(), ExtractDoc(), {})
-    assert '分越低越重复' in system
+    assert '分越高越重复' in system
+    assert '分越低越重复' not in system
 
 
 def test_item_block_gives_both_anchors():
     _, human = judge_batch_messages([ITEM_BY_CODE['2b']], ExtractDoc(), ExtractDoc(), {})
-    assert '0 分（完全相同）当：' in human
-    assert '3 分（完全不同）当：' in human
+    assert '3 分（完全相同）当：' in human
+    assert '0 分（完全不同）当：' in human
     # 中间两档只在系统提示词里定义一次，条目块里不重复
-    assert '1 分（部分相同）当：' not in human
+    assert '2 分（部分相同）当：' not in human
 
 
 def test_explicit_absence_is_rendered_differently_from_missing():
@@ -101,7 +106,7 @@ def test_batch_prompt_warns_against_herding():
     group = DOMAINS[0].groups[1]  # 分组 2：2a–2f
     items = list(group.items)
     system, human = judge_batch_messages(items, _populated('A'), _populated('B'), {})
-    assert '不要因为前面的条目打了 0 分' in system
+    assert '不要因为前面的条目打了 3 分' in system
     for item in items:
         assert item.code in human
 

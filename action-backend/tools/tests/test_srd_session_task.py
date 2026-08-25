@@ -9,7 +9,7 @@ import pytest
 
 from tools.common.model_registry import LlmModelInfo
 from tools.common.resource_limiter import ResourceLimiter
-from tools.common.task_store import STATUS_COMPLETED, MemoryTaskStore
+from tools.common.task_store import STATUS_COMPLETED, STATUS_FAILED, MemoryTaskStore
 from tools.common.worker_config import WorkerConfig
 from tools.srd_worker_tool.worker_service import srd_session_task as mod
 from tools.srd_worker_tool.worker_service.srd_session_task import SrdSessionTask
@@ -17,27 +17,33 @@ from tools.srd_worker_tool.worker_service.srd_session_task import SrdSessionTask
 pytestmark = pytest.mark.filterwarnings('ignore::DeprecationWarning')
 
 
-def fake_result():
+def fake_result(**overrides):
     from srd_engine.schemas import AssessmentResult
 
-    return AssessmentResult(
-        review_a_title='综述A',
-        review_b_title='综述B',
-        doc_a_sha256='aaa',
-        doc_b_sha256='bbb',
-        overall_level='mod',
-        overall_pct=55,
-        overall_reason_zh='两篇在方法学上高度接近',
-        engine_version=mod.ENGINE_VERSION,
-        prompt_version=mod.PROMPT_VERSION,
-        criteria_version=mod.CRITERIA_VERSION,
-        model='fake-model',
-        llm_calls=12,
-        token_in=1000,
-        token_out=500,
-        unclear_count=3,
-        review_count=1,
-    )
+    fields = {
+        'review_a_title': '综述A',
+        'review_b_title': '综述B',
+        'doc_a_sha256': 'aaa',
+        'doc_b_sha256': 'bbb',
+        'overall_level': 'mod',
+        'overall_pct': 55,
+        # 评分三件套要和 overall_pct 自洽：得分 42/93 → 重复度 55%。
+        # 别把 score_max 留成 0 —— 那是「一条都没评出来」的信号，任务会被判失败
+        'overall_score_sum': 42,
+        'overall_score_max': 93,
+        'overall_score_max_full': 102,
+        'overall_reason_zh': '两篇在方法学上高度接近',
+        'engine_version': mod.ENGINE_VERSION,
+        'prompt_version': mod.PROMPT_VERSION,
+        'criteria_version': mod.CRITERIA_VERSION,
+        'model': 'fake-model',
+        'llm_calls': 12,
+        'token_in': 1000,
+        'token_out': 500,
+        'unclear_count': 3,
+        'review_count': 1,
+    }
+    return AssessmentResult(**{**fields, **overrides})
 
 
 @pytest.fixture
@@ -130,6 +136,27 @@ def test_full_run_writes_files_and_summary(env):
     assert state['status'] == STATUS_COMPLETED
     assert state['result']['overall_pct'] == 55
     assert state['progress_current'] == 100, '引擎回调要能把进度推到 100'
+
+
+def test_nothing_scorable_fails_the_task(env, monkeypatch):
+    """一条都没评出来 → 判失败，不许当成一份报告交出去。
+
+    踩过一次（session 04f9a90…）：判定输出被截断，34 条全 unclear，
+    结果以 `[success] 结论：无重复` 收尾 —— 前台看不出它和「两篇毫无重复」的区别。
+    """
+    async def empty_assess(*args, **kwargs):
+        return fake_result(overall_level=None, overall_pct=0, overall_score_sum=0,
+                           overall_score_max=0, unclear_count=34, review_count=34)
+
+    monkeypatch.setattr(mod, 'assess', empty_assess)
+    task, store = build(env)
+    asyncio.run(task.run())   # run() 自己把异常收进状态机，不往外抛
+
+    state = store.tasks['srd-1']
+    assert state['status'] == STATUS_FAILED
+    assert '无法评分' in state['error']
+    # 断点不能落：落了的话重跑会直接复用这份空报告，且再也不会重算
+    assert not (task.checkpoint.dir / f'{mod.CHECKPOINT_RESULT}.json').exists()
 
 
 def test_second_run_hits_checkpoint(env):

@@ -17,11 +17,10 @@ const { pick } = useBilingual()
 
 const id = computed(() => String(route.params.id ?? ''))
 
-// swr：详情页是否被预渲染取决于构建时 /about 有没有爬到它，取不到时得靠客户端补
+// 详情页是否被预渲染取决于构建时 /about 有没有爬到它，取不到时靠客户端那次重取补上
 const { data: res } = await useSiteObject<TeamMemberRow>(
   `/team-members/${id.value}`,
   `team-member:${id.value}`,
-  { swr: true },
 )
 const row = computed<TeamMemberRow | null>(() => res.value?.data ?? null)
 

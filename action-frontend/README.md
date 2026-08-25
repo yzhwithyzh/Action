@@ -89,13 +89,39 @@ curl "http://127.0.0.1:9098/action/site/news?pageNum=1&pageSize=3"   # 期望 20
 grep -l "Bad Gateway" .output/public/**/*.html   # 应无输出
 ```
 
-**2. 会变的内容要开 `{ swr: true }`。** 不开的话，后台发了新闻，官网要等下次构建才看得见。
-开了之后首屏依然是预渲染的静态 HTML（SEO 与首屏速度不受影响），hydration 后再跟后端对一次，
-有变化就换掉。当前开着的是新闻三处（首页动态 / `/news` 列表 / `/news/[id]` 详情）；
-规范库、CFIR/ERIC/RE-AIM 这类几乎不变的内容故意不开。
+**2. 后台改完，访客刷新即见 —— 这是默认行为，页面不用做任何事。**
+`useSiteList` / `useSiteObject` 会在 hydration 完成后再跟后端对一次，有变化就换掉。
+首屏依然是预渲染的静态 HTML（SEO 与首屏速度不受影响）。要关掉得显式传 `{ revalidate: false }`，
+正常不要关（原先是反过来的 `{ swr: true }` opt-in，见下）。
 
-`{ swr: true }` 不是万能：搜索引擎和分享卡片只看首屏 HTML，仍是构建期快照。
-要做到"后台一发布、爬虫立刻可见"，得改 `preset: 'node-server'` 实时 SSR，或给发布动作挂重建钩子。
+**改 `useSiteApi.ts` 时唯一不能碰的一行：那次重取必须挂在 `onNuxtReady`，不能是 `onMounted`。**
+Nuxt 的 `useAsyncData.execute()` 只要看到 `nuxtApp.isHydrating` 为真，就先问 `getCachedData()`，
+而默认实现在 hydration 期间**无视 `refresh:manual`**、直接返回 `nuxtApp.payload.data[key]`
+（静态站里就是 `_payload.json` 那份构建期快照）—— 于是 `refresh()` 用旧数据立刻 resolve，
+**一个请求都不发**。而 `isHydrating` 要到 `app:suspense:resolve` 才置 false，那在页面
+`onMounted` 之后。这个坑真踩过：`{ swr: true }` 开了整整一圈，线上「后台改完刷多少次都是旧的」，
+`plugins/site-texts.ts` 的文案却能刷出来 —— 差别只在它用的是 `onNuxtReady`。
+改动前后各构建一次、用无头浏览器对比过：`onMounted` 版拿不到新数据，`onNuxtReady` 版拿得到。
+
+**这一层管不了搜索引擎和微信分享卡片**：它们只看首屏 HTML，仍是构建期快照。
+要「后台一发布、爬虫立刻可见」，得改 `preset: 'node-server'` 实时 SSR，或给发布动作挂重建钩子
+——后者已经有了：后台「站点文案管理」页的「重新生成官网」按钮（见下一节）。
+
+**3. 接口数据换进来的节点会自动揭示，不用再写 `watch(rows, rescan)`。**
+`.reveal` 的观察者原本只在 `onMounted` 建一次，重取换掉的新节点没人观察就永远停在
+`opacity:0` —— 「数据对、行数对，但整块空白」，且和「后台还没填内容」长得一模一样。
+`useReveal` 现在挂了 MutationObserver 接管新增节点。**唯一顶不了的是 display 切换**
+（`/guidelines` 的筛选 chip 给卡片切 `.hide`，没有节点新增），那里仍需手动 `rescan()`。
+
+## 版面文案（i18n 的可编辑副本）
+
+`i18n/locales/{zh,en}.json` 那 934 条文案在后端 `action_site_text` 表里有一份可编辑副本，
+后台改完由 `plugins/site-texts.ts` 在 i18n 之上 merge 一层。**默认文案仍以这两份 JSON 为准**，
+改默认文案就改 JSON，然后在 action-backend 下重跑 `python -m tools.extract_site_texts` 同步。
+
+接口 `GET /action/site/texts` 只返回被改过的词条，没人改过时是空对象。插件里三处不能动的细节
+（扁平键必须先 unflatten、构建期取数进 payload 以避免 hydration 不匹配、切语言后要重新 merge）
+写在文件头注释里，改之前先读。整体说明见仓库根 `CLAUDE.md` 的「站点文案」一节。
 
 **3. `/news/[id]` 详情页靠爬取生成。** `crawlLinks` 从 `/news` 列表页的 `<NuxtLink>` 发现它们，
 而只有**没配 `linkUrl`** 的条目才会指向站内详情页。构建后新增的这类新闻不会有对应的静态文件，

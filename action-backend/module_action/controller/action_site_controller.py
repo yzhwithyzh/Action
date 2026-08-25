@@ -37,6 +37,9 @@ from module_action.entity.vo.action_vo import (
     GuidelinePageQueryModel,
     NewsModel,
     NewsPageQueryModel,
+    PublicationModel,
+    PublicationPageQueryModel,
+    PublicationYearModel,
     ReaimDimensionModel,
     ReportDraftComposeModel,
     ReportDraftCreateModel,
@@ -64,6 +67,7 @@ from module_action.service.action_service import (
     GuidelineService,
     ImplementationService,
     NewsService,
+    PublicationService,
     ReportDraftService,
     ReportReviewService,
     ReportTrailService,
@@ -189,6 +193,69 @@ async def get_site_resource_links(
         query_db, ResourceLinkPageQueryModel(), only_published=True
     )
     logger.info('获取资源中心链接成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/publications',
+    summary='获取成果发表列表',
+    description=(
+        '官网公开接口，返回已发布的论文分页列表，已按「年份倒序 → 年内 sortNum」排好，'
+        '前台按年份分组渲染。**列表不含摘要与引用文本** —— 官网是预渲染站，'
+        '把每篇的摘要烤进 HTML 只是白压 payload，详情接口才返回。'
+        '支持 `keyword`（标题/期刊/作者/关键词/DOI 模糊）与 `year` 过滤。'
+    ),
+    response_model=PageResponseModel[PublicationModel],
+)
+async def get_site_publication_list(
+    request: Request,
+    publication_page_query: Annotated[PublicationPageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await PublicationService.get_publication_list_services(
+        query_db, publication_page_query, is_page=True, only_published=True
+    )
+    logger.info('获取成果发表列表成功')
+
+    return ResponseUtil.success(model_content=result)
+
+
+@action_site_controller.get(
+    '/publication-years',
+    summary='获取成果发表年份词表',
+    description=(
+        '官网公开接口，返回各年份下已发布的成果数，供列表页的年份下拉使用。'
+        '**路径不是 `/publications/years`**：那会与 `/publications/{id}` 撞在一起，'
+        'FastAPI 按声明顺序匹配，改动顺序就会静默换掉命中的那个口。'
+        '统计口径与列表接口一致，但**忽略 `year` 自身** —— 否则选完一个年份就切不回别的年份。'
+    ),
+    response_model=DataResponseModel[list[PublicationYearModel]],
+)
+async def get_site_publication_years(
+    request: Request,
+    publication_page_query: Annotated[PublicationPageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await PublicationService.get_year_list_services(query_db, publication_page_query)
+    logger.info('获取成果发表年份词表成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/publications/{publication_id}',
+    summary='获取成果发表详情',
+    description='官网公开接口，返回单篇论文的完整信息（含摘要、作者机构对应关系与引用文本）',
+    response_model=DataResponseModel[PublicationModel],
+)
+async def get_site_publication_detail(
+    request: Request,
+    publication_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await PublicationService.publication_detail_services(query_db, publication_id)
+    logger.info(f'获取成果{publication_id}详情成功')
 
     return ResponseUtil.success(data=result)
 

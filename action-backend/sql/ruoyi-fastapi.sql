@@ -790,6 +790,7 @@ create table ai_models (
   api_key           varchar(255)    default null               comment 'API Key',
   base_url          varchar(255)    default null               comment 'Base URL',
   model_type        varchar(50)     default null               comment '模型类型',
+  structured_method varchar(32)     default null               comment '结构化输出方式(空=自动探测 json_schema function_calling json_mode text)',
   max_tokens        int(11)         default null               comment '最大输出token',
   temperature       float           default null               comment '默认温度',
   support_reasoning char(1)         default 'N'                comment '是否支持推理',

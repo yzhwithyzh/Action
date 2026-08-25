@@ -15,13 +15,27 @@ useHead({
   meta: [{ name: 'description', content: t('about._desc') }],
 })
 
-useReveal()
+/**
+ * mailto 的 subject 也要跟着界面语言走 —— 原先是写死在 href 里的中文，
+ * 英文访客点「Support ACTION」弹出的邮件里主题行是一串中文。
+ * 必须 encodeURIComponent：空格与 `/` 在 query 里有语义，不编码时部分邮件客户端会截断主题。
+ *
+ * @param key 主题文案的 i18n 键
+ * @return 完整的 mailto 地址
+ */
+const mailto = (key: string) => `mailto:action_acu@163.com?subject=${encodeURIComponent(t(key))}`
+
+/**
+ * `revealNow` 供子栏目 Tab 用：切过来的那一段是从 display:none 变可见的，
+ * IntersectionObserver 虽然也会补触发，但那样内容会先空一帧再淡入。原站是直接落位。
+ */
+const { revealNow } = useReveal()
 
 /**
  * 团队名单改为从 `action_team_member` 表取，后台「团队成员管理」页可增删改。
- * swr：名单是后台可随时改的内容，不开这个开关就要等下一次 `npm run generate` 才生效。
+ * 后台改完访客刷新即见：`useSiteApi` 默认在 hydration 后重取一次，页面不用做任何事。
  */
-const { data: teamRes } = await useSiteObject<TeamMemberRow[]>('/team-members', 'site-team-members', { swr: true })
+const { data: teamRes } = await useSiteObject<TeamMemberRow[]>('/team-members', 'site-team-members')
 const members = computed<TeamMemberRow[]>(() => teamRes.value?.data ?? [])
 
 /**
@@ -66,15 +80,6 @@ const isTab = (v: string): v is Tab => (TABS as readonly string[]).includes(v)
 
 /** SSR 预渲染时固定输出第一段，与原站首屏一致；带 hash 进来的情况在 onMounted 里纠正 */
 const activeTab = ref<Tab>('about')
-
-/**
- * 切过来的这段是从 display:none 变可见的，IntersectionObserver 虽然也会补触发，
- * 但那样内容会先空一帧再淡入。原站是直接落位，这里保持同样的即时感。
- */
-function revealNow(id: Tab) {
-  for (const el of document.getElementById(id)?.querySelectorAll('.reveal') ?? [])
-    el.classList.add('is-visible')
-}
 
 function goTab(id: Tab) {
   activeTab.value = id
@@ -211,7 +216,7 @@ onMounted(() => {
           <div class="supcard reveal"><span class="si" aria-hidden="true"><svg viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 21C6 17 3 13 3 8.5A4.5 4.5 0 0 1 12 6a4.5 4.5 0 0 1 9 2.5C21 13 18 17 12 21Z" /></svg></span><b>{{ t('about.s056') }}</b><p>{{ t('about.s057') }}</p></div>
         </div>
         <div style="margin-top:clamp(24px,3vw,32px)">
-          <a href="mailto:action@gztcm-action.cn?subject=支持 / 参与 ACTION" class="btn btn-primary" v-html="t('about.s058')"></a>
+          <a :href="mailto('about.mailSubjectSupport')" class="btn btn-primary" v-html="t('about.s058')"></a>
         </div>
       </div>
     </section>
@@ -226,10 +231,10 @@ onMounted(() => {
         <div class="contact" style="margin-top:clamp(22px,3vw,30px)">
           <div class="cbig reveal">
             <div class="cmk">{{ t('about.s061') }}</div>
-            <a class="cmail" href="mailto:action@gztcm-action.cn"><svg viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m3 7 9 6 9-6" /></svg>action@gztcm-action.cn</a>
+            <a class="cmail" href="mailto:action_acu@163.com"><svg viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" /><path d="m3 7 9 6 9-6" /></svg>action_acu@163.com</a>
             <p class="cnote">{{ t('about.s062') }}</p>
             <div class="cbtns">
-              <a href="mailto:action@gztcm-action.cn?subject=ACTION 咨询" class="btn btn-primary btn-sm">{{ t('about.s063') }}</a>
+              <a :href="mailto('about.mailSubjectContact')" class="btn btn-primary btn-sm">{{ t('about.s063') }}</a>
               <NuxtLink to="/collaborate" class="btn btn-onDark btn-sm">{{ t('about.s064') }}</NuxtLink>
             </div>
           </div>
@@ -237,7 +242,7 @@ onMounted(() => {
             <div class="crow reveal"><span class="ci" aria-hidden="true"><svg viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 21h18M5 21V9l7-5 7 5v12M9 21v-6h6v6" /></svg></span><span><b>{{ t('about.s065') }}</b><span>{{ t('about.s066') }}</span></span></div>
             <div class="crow reveal"><span class="ci" aria-hidden="true"><svg viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M12 21s7-6.5 7-11a7 7 0 1 0-14 0c0 4.5 7 11 7 11Z" /><circle cx="12" cy="10" r="2.5" /></svg></span><span><b>{{ t('about.s067') }}</b><span>{{ t('about.s068') }}</span></span></div>
             <div class="crow reveal"><span class="ci" aria-hidden="true"><svg viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><circle cx="12" cy="12" r="9" /><path d="M12 7v5l4 2" /></svg></span><span><b>{{ t('about.s069') }}</b><span>{{ t('about.s070') }}</span></span></div>
-            <div class="crow reveal"><span class="ci" aria-hidden="true"><svg viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 4h16v16H4z" /><path d="m4 7 8 6 8-6" /></svg></span><span><b>{{ t('about.s071') }}</b><span>gztcm-action.cn</span></span></div>
+            <div class="crow reveal"><span class="ci" aria-hidden="true"><svg viewbox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M4 4h16v16H4z" /><path d="m4 7 8 6 8-6" /></svg></span><span><b>{{ t('about.s071') }}</b><span>action-acu.cn</span></span></div>
           </div>
         </div>
       </div>

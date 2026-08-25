@@ -33,6 +33,27 @@ _CONTENT_TYPES = {
 MAX_IMAGE_SIZE = 5 * 1024 * 1024
 # 规范原文动辄几十页、含插图或扫描件，按图片的 5MB 卡会大面积传不上去
 MAX_DOCUMENT_SIZE = 30 * 1024 * 1024
+# 上传单独给一档更长的超时：读写小对象与「把 30MB 发上去再等 OSS 回响应头」不是一个量级，
+# 而 OSS_TIMEOUT_SECONDS（默认 30）是按后者之外的场景定的
+UPLOAD_TIMEOUT_SECONDS = 120
+
+
+def _client(timeout: float) -> httpx.AsyncClient:
+    """
+    造一个**不走系统代理**的 httpx 客户端
+
+    `trust_env=False` 是这里的重点：httpx 默认会读 `HTTP_PROXY` / `HTTPS_PROXY`
+    环境变量，于是「往自家阿里云桶传一个 PDF」会先绕道那个代理 —— 慢、易断，
+    30 秒等不到响应头就是 ReadTimeout。踩过一次（开发机上配了翻墙代理）。
+    这个桶是国内节点、又是本项目自己的存储，**任何情况下都不该经代理**。
+
+    注意：真部署在「所有出站流量必须经代理」的内网里时，这一行要改回 True
+    并给 OSS 单独配一个代理地址 —— 那种环境下直连是出不去的。
+
+    :param timeout: 超时秒数
+    :return: httpx 异步客户端
+    """
+    return httpx.AsyncClient(timeout=timeout, trust_env=False)
 
 
 class OssUtil:
@@ -166,8 +187,16 @@ class OssUtil:
         if OssConfig.oss_object_acl:
             headers['x-oss-object-acl'] = OssConfig.oss_object_acl
 
-        async with httpx.AsyncClient(timeout=OssConfig.oss_timeout_seconds) as client:
-            response = await client.put(url, content=content, headers=headers)
+        try:
+            async with _client(UPLOAD_TIMEOUT_SECONDS) as client:
+                response = await client.put(url, content=content, headers=headers)
+        except httpx.HTTPError as e:
+            # 不接住的话，httpx 的超时会一路冒到兜底 handler，用户拿到的是一句
+            # 不知所云的英文异常 + 日志里一屏 traceback，看不出是「连不上对象存储」
+            logger.error(f'OSS 上传网络失败（{type(e).__name__}）：{url}')
+            raise ServiceException(
+                message=f'上传对象存储失败（{type(e).__name__}），请检查服务器到阿里云 OSS 的网络后重试'
+            ) from e
 
         if response.status_code != HTTP_200_OK:
             # OSS 的错误体是 XML，直接透传给前端没意义，落日志便于排查签名/权限问题
@@ -194,7 +223,7 @@ class OssUtil:
         :param url: 对象公网地址
         :return: 匿名可读为 True
         """
-        async with httpx.AsyncClient(timeout=OssConfig.oss_timeout_seconds) as client:
+        async with _client(OssConfig.oss_timeout_seconds) as client:
             response = await client.get(url)
 
         return response.status_code == HTTP_200_OK
@@ -231,8 +260,9 @@ class OssUtil:
         :param url: 对象公网地址
         :return: 文件字节
         """
-        async with httpx.AsyncClient(timeout=OssConfig.oss_timeout_seconds, follow_redirects=True) as client:
-            response = await client.get(url)
+        async with _client(OssConfig.oss_timeout_seconds) as client:
+            # follow_redirects 只有这一处需要（OSS 偶尔会把请求重定向到同桶的另一个地址）
+            response = await client.get(url, follow_redirects=True)
 
         if response.status_code != HTTP_200_OK:
             logger.error(f'OSS 读取失败 {response.status_code}: {url}')
@@ -255,5 +285,5 @@ class OssUtil:
             'Authorization': f'OSS {OssConfig.oss_access_key_id}:{cls._signature("DELETE", object_key, "", date)}',
         }
 
-        async with httpx.AsyncClient(timeout=OssConfig.oss_timeout_seconds) as client:
+        async with _client(OssConfig.oss_timeout_seconds) as client:
             await client.delete(url, headers=headers)

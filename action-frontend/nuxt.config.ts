@@ -15,6 +15,9 @@ export default defineNuxtConfig({
       // 显式写出来是因为这层依赖不写下来看不出：列表页不渲染某条新闻，它的详情页就不会被生成。
       crawlLinks: true,
       routes: ['/'],
+      // 规范原文页上有指向后端接口的 <a>（PDF 内嵌预览地址），爬虫会挨个去请求，
+      // 结果是每次构建白等十几秒、还在后端刷出一串没用的下载。接口不是页面，不参与预渲染。
+      ignore: ['/dev-api', '/prod-api'],
     },
   },
 
@@ -61,6 +64,10 @@ export default defineNuxtConfig({
         { name: 'viewport', content: 'width=device-width, initial-scale=1.0' },
       ],
       link: [
+        // 站点图标：logo 的图标部分放在 --paper 圆角底上（由 make_logo_assets.py 生成），
+        // 配色与顶栏主 logo 一致。刻意不做透明底 —— 深色标签栏里那支深绿会整个消失。
+        { rel: 'icon', type: 'image/png', href: '/favicon.png' },
+        { rel: 'apple-touch-icon', href: '/favicon.png' },
         { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
         { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' },
         {

@@ -153,7 +153,7 @@ useReveal()
         </div>
         <p class="lead reveal">{{ t('implementation.s003') }}</p>
 
-        <div class="modes" role="tablist" aria-label="CFIR 使用模式">
+        <div class="modes" role="tablist" :aria-label="t('implementation.modesAria')">
           <button type="button" class="on" data-mode="lib" role="tab"><span class="mn">1</span><span>{{ t('implementation.s004') }}</span></button>
           <button type="button" data-mode="ai" role="tab"><span class="mn">2</span><span>{{ t('implementation.s005') }}</span></button>
         </div>
@@ -196,8 +196,8 @@ useReveal()
         <div class="mode-panel is-hidden" id="mAi">
           <p class="mode-desc">{{ t('implementation.s011') }}</p>
           <div class="ai-in">
-            <label class="src-lab vh" for="aiTa">情境描述</label>
-            <textarea class="ai-ta" id="aiTa" placeholder="例如：我科室想在门诊常规开展针刺镇痛，但年轻医生操作不规范、缺乏标准化培训；西医科室转诊意愿低；医院对针刺项目没有绩效激励；患者对针具有顾虑、依从性差……"></textarea>
+            <label class="src-lab vh" for="aiTa">{{ t('implementation.lblContext') }}</label>
+            <textarea class="ai-ta" id="aiTa" :placeholder="t('implementation.contextPh')"></textarea>
             <div class="ai-foot">
               <button type="button" class="ai-sample" id="aiSample">{{ t('implementation.s012') }}</button>
               <button type="button" class="btn btn-primary" id="genAi" v-html="t('implementation.s013')"></button>
@@ -279,7 +279,7 @@ useReveal()
           </div>
         </div>
         <p class="lead reveal">{{ t('implementation.s018') }}</p>
-        <div class="filt" id="ericFilt" role="group" aria-label="按类别筛选策略">
+        <div class="filt" id="ericFilt" role="group" :aria-label="t('implementation.ericFilterAria')">
           <button
             v-for="c in ericCats"
             :key="c.catKey"

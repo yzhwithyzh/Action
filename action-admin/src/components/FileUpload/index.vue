@@ -30,7 +30,7 @@
     <transition-group ref="uploadFileList" class="upload-file-list el-upload-list el-upload-list--text" name="el-fade-in-linear" tag="ul">
       <li :key="file.uid" class="el-upload-list__item ele-upload-list__item-content" v-for="(file, index) in fileList">
         <el-link
-          :href="`${baseUrl}${file.url}`"
+          :href="fileHref(file)"
           :underline="false"
           target="_blank"
           @click="handleFileDownload($event, file)"
@@ -47,6 +47,7 @@
 
 <script setup>
 import { getToken } from "@/utils/auth";
+import { isExternal } from "@/utils/validate";
 import Sortable from 'sortablejs';
 
 const props = defineProps({
@@ -207,6 +208,13 @@ function uploadedSuccessfully() {
     emit("update:modelValue", listToString(fileList.value));
     proxy.$modal.closeLoading();
   }
+}
+
+// 文件列表里那条链接的 href
+// 存的值可能是本地相对路径（/common/upload 通道），也可能是 OSS 公网直链
+// （官网内容那几个上传口）。后者再拼 baseUrl 会得到 /dev-api/https://… 这种打不开的地址。
+function fileHref(file) {
+  return isExternal(file.url) ? file.url : `${baseUrl}${file.url}`;
 }
 
 // 获取文件名称

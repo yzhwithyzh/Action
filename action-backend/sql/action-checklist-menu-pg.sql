@@ -26,12 +26,11 @@ values (1079, '条目查询', 1078, 1, '', '', '', '', 1, 0, 'F', '0', '0', 'act
        (1081, '条目修改', 1078, 3, '', '', '', '', 1, 0, 'F', '0', '0', 'action:guidelineItem:edit',   '#', 'admin', current_timestamp, ''),
        (1082, '条目删除', 1078, 4, '', '', '', '', 1, 0, 'F', '0', '0', 'action:guidelineItem:remove', '#', 'admin', current_timestamp, '');
 
--- 条目管理页的「所属规范」下拉走 action:guideline:list 接口。该权限此前只在 controller 里声明、
--- sys_menu 无记录，超管以外的角色授不了权，下拉会空。这里补一条隐藏的按钮权限（visible = '1'），
--- 规范目录本身尚无管理页面，故不建目录型菜单。
-delete from sys_role_menu where menu_id in (select menu_id from sys_menu where perms = 'action:guideline:list');
-delete from sys_menu where perms = 'action:guideline:list';
-insert into sys_menu (menu_id, menu_name, parent_id, order_num, path, component, query, route_name, is_frame, is_cache, menu_type, visible, status, perms, icon, create_by, create_time, remark)
-values (1083, '规范目录查询', 1078, 5, '', '', '', '', 1, 0, 'F', '1', '0', 'action:guideline:list', '#', 'admin', current_timestamp, '条目管理页的规范下拉依赖此权限');
+-- 条目管理页的「所属规范」下拉走 action:guideline:list 接口。该权限原先只在 controller 里声明、
+-- sys_menu 无记录，超管以外的角色授不了权，下拉会空，故本文件曾在 menu_id 1083 补过一条隐藏按钮。
+-- 规范目录现在有自己的管理页了（sql/action-guideline-menu-pg.sql，menu_id 1089 起），
+-- 整个 action:guideline:* 命名空间由那个文件接管，1083 已随之删除 —— 若留在这里，
+-- 「先跑 guideline-menu、后跑本文件」的顺序会让这里的 delete 把新菜单的 list 权限清掉。
+-- 给角色授权时请一并勾上「规范目录管理」，否则本页的规范下拉仍会空。
 
 commit;

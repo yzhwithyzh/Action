@@ -61,8 +61,7 @@ const query = computed(() => {
   }
 })
 
-// swr：同首页，列表要跟着后台的发布走，不能是构建期快照
-const { data: res, status, error, refresh } = await useSiteList<NewsRow>('/news', query, 'news-page', { swr: true })
+const { data: res, status, error, refresh } = await useSiteList<NewsRow>('/news', query, 'news-page')
 const rows = computed<NewsRow[]>(() => res.value?.rows ?? [])
 const total = computed(() => res.value?.total ?? 0)
 const totalPages = computed(() => Math.max(1, Math.ceil(total.value / PAGE_SIZE)))
@@ -110,13 +109,8 @@ const pageItems = computed(() => {
 /** `2026-07-01` → `2026-07`；原页面 <time> 精度到年月 */
 const ym = (d: string | null) => (d ? d.slice(0, 7) : '')
 
-const { rescan } = useReveal()
-
-/**
- * 列表换内容后要重新登记揭示动画：新行是全新 DOM，不带 .is-visible，
- * 而观察者只在 onMounted 建过一次。不调 rescan 就会「行数对但一片空白」。
- */
-watch(rows, () => void rescan())
+// 筛选/翻页换出来的新行由 useReveal 的 MutationObserver 自动登记，不用手动 rescan
+useReveal()
 
 /** 翻页后把视线拉回列表顶部，否则点了「下一页」还停在旧页脚位置 */
 watch(pageNum, async () => {
@@ -137,7 +131,7 @@ watch(pageNum, async () => {
           </div>
         </div>
 
-        <div class="filt reveal" id="filter" role="group" aria-label="按标签筛选新闻">
+        <div class="filt reveal" id="filter" role="group" :aria-label="t('news.filterAria')">
           <button type="button" class="fchip" :class="{ on: activeCat === 'all' }" :aria-pressed="activeCat === 'all'" data-cat="all" @click="selectCat('all')">{{ t('news.s004') }}</button>
           <button type="button" class="fchip" :class="{ on: activeCat === 'team' }" :aria-pressed="activeCat === 'team'" data-cat="team" @click="selectCat('team')">{{ t('news.s005') }}</button>
           <button type="button" class="fchip" :class="{ on: activeCat === 'field' }" :aria-pressed="activeCat === 'field'" data-cat="field" @click="selectCat('field')">{{ t('news.s006') }}</button>

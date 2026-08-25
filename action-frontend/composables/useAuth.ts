@@ -85,6 +85,9 @@ const TOKEN_MAX_AGE = 86400
  */
 const REQUEST_TIMEOUT = 15000
 
+/** 下载类请求的上限：要等后端现拼一份 xlsx，比普通接口松一档 */
+const DOWNLOAD_TIMEOUT = 60000
+
 /**
  * 匿名接口：**不能**带 `Authorization`。
  *
@@ -198,7 +201,7 @@ export function useAuth() {
    *  2. 只有「这条响应对应的 token 仍是当前 token」才清——顶栏 `fetchMe` 挂 60 秒
    *     期间用户已重新登录拿到新 token，迟到的 401 不许把新会话删掉。
    */
-  const call = async (path: string, method: 'GET' | 'POST', body?: unknown): Promise<AuthOutcome> => {
+  const call = async (path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: unknown): Promise<AuthOutcome> => {
     // 发出前捕获当时的 token，401 回来时用它判断这条响应是不是「过期的过期」
     const sentToken = token.value
     const headers = buildHeaders(path, sentToken)
@@ -248,6 +251,58 @@ export function useAuth() {
       // 后端准备好的中文提示不能丢：把「请求过于频繁」退化成「网络异常」，用户会立刻
       // 重试、把滑动窗口继续顶满，永远出不来。
       if (backendMsg) return { ok: false, message: translate(backendMsg) }
+      if (isTimeoutError(err)) return { ok: false, message: t('auth.err.timeout') }
+
+      return { ok: false, message: t('auth.err.network') }
+    }
+  }
+
+  /**
+   * 带登录态下载二进制（导出 xlsx 用）。
+   *
+   * 不能复用 `call`：那条路把响应当 JSON 信封解析，xlsx 的字节到了 `$fetch` 手里会被
+   * 直接 `JSON.parse` 抛掉。反过来，**失败时后端仍回 JSON 信封**（HTTP 200 + code≠200，
+   * 全站信封风格），所以拿到 blob 还得看一眼 `type`：不是文件就把它当错误信封读出来，
+   * 否则用户会下载到一个 200 字节、打不开的「xlsx」，还以为是 Excel 坏了。
+   *
+   * 401 的两条例外与 `call` 同源，所以复用同一套判断，别在这里另写一份。
+   */
+  const authedBlob = async (path: string): Promise<AuthOutcome & { blob?: Blob }> => {
+    const sentToken = token.value
+    const headers = buildHeaders(path, sentToken)
+
+    try {
+      const blob = await $fetch<Blob>(`${apiBase}/action/site${path}`, {
+        method: 'GET',
+        headers,
+        timeout: DOWNLOAD_TIMEOUT,
+        responseType: 'blob',
+      })
+      if (!blob?.size) return { ok: false, message: t('auth.err.unknown') }
+      if (!blob.type.includes('json')) return { ok: true, message: '', blob }
+
+      const envelope = JSON.parse(await blob.text()) as AuthEnvelope
+      if (envelope?.code === UNAUTHORIZED) {
+        if ((envelope.msg ?? '').trim() === SERVICE_UNAVAILABLE_MSG) {
+          return { ok: false, message: translate(envelope.msg) }
+        }
+        if (token.value === sentToken) clearAuth()
+
+        return { ok: false, message: t('auth.err.sessionExpired') }
+      }
+
+      return { ok: false, message: translate(envelope?.msg) }
+    } catch (err: unknown) {
+      // 走到这里的是真 HTTP 错误（限流 429、网关 5xx、超时）。错误体不是二进制，
+      // `call` 那份解析逻辑照样适用 —— 但它会重发一次请求，所以只借它的文案不借它的调用
+      const status = (err as { status?: number })?.status
+      const backendMsg = (err as { data?: { msg?: unknown } })?.data?.msg
+      if (status === UNAUTHORIZED) {
+        if (token.value === sentToken) clearAuth()
+
+        return { ok: false, message: t('auth.err.sessionExpired') }
+      }
+      if (typeof backendMsg === 'string' && backendMsg.trim()) return { ok: false, message: translate(backendMsg) }
       if (isTimeoutError(err)) return { ok: false, message: t('auth.err.timeout') }
 
       return { ok: false, message: t('auth.err.network') }
@@ -321,5 +376,5 @@ export function useAuth() {
    * 暴露 `call` 是给报告助手这类「需要访客身份的业务接口」用的（如第三步的 checklist 校验）：
    * 401 清理、限流提示、FastAPI 422 字段错误、超时文案这几件事只该有一份实现。
    */
-  return { guest, isLoggedIn, sendCode, register, login, logout, fetchMe, authedCall: call }
+  return { guest, isLoggedIn, sendCode, register, login, logout, fetchMe, authedCall: call, authedBlob }
 }
