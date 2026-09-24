@@ -205,6 +205,9 @@ create table action_guideline_item (
     ext_label_en  varchar(300) default '',
     extension_zh  text,
     extension_en  text,
+    example_zh    text,
+    example_en    text,
+    require_level char(1)      default '0',
     sort_num      int          default 0,
     status        char(1)      default '0',
     del_flag      char(1)      default '0',
@@ -231,6 +234,9 @@ comment on column action_guideline_item.ext_label_zh is '扩展列列名（中�
 comment on column action_guideline_item.ext_label_en is '扩展列列名（英文）';
 comment on column action_guideline_item.extension_zh is '扩展/对照条目内容（中文）';
 comment on column action_guideline_item.extension_en is '扩展/对照条目内容（英文）';
+comment on column action_guideline_item.example_zh is '条目示例/范例（中文，后台录入，为空即暂无示例）';
+comment on column action_guideline_item.example_en is '条目示例/范例（英文）';
+comment on column action_guideline_item.require_level is '填写要求（0必填 1条件填写/选填）';
 comment on column action_guideline_item.sort_num is '规范内显示顺序';
 comment on column action_guideline_item.status is '状态（0正常 1停用）';
 comment on column action_guideline_item.del_flag is '删除标志（0存在 2删除）';

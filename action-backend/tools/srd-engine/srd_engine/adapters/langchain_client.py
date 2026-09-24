@@ -260,7 +260,11 @@ class ModelUsage:
     calls: int = 0
     errors: int = 0
     token_in: int = 0
+    #: token_in 里命中厂商前缀缓存的部分（已含在 token_in 内，不是另加的）
+    token_cached: int = 0
     token_out: int = 0
+    #: token_out 里的思考（reasoning）部分，同样已含在 token_out 内
+    token_reasoning: int = 0
     freezes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -269,9 +273,51 @@ class ModelUsage:
             'calls': self.calls,
             'errors': self.errors,
             'token_in': self.token_in,
+            'token_cached': self.token_cached,
             'token_out': self.token_out,
+            'token_reasoning': self.token_reasoning,
             'freezes': self.freezes[:5],
         }
+
+
+def cached_tokens(message: object) -> int:
+    """一次响应的输入 token 里，有多少命中了厂商的前缀缓存（命中部分按折扣价计费）。
+
+    各家报法不一，按以下顺序取第一个非零的：
+
+    - LangChain 归一化后的 `usage_metadata.input_token_details.cache_read`
+      （OpenAI / 百炼等 OpenAI 兼容端点的 `prompt_tokens_details.cached_tokens`、
+      Anthropic 的 `cache_read_input_tokens` 都会被映射到这里）；
+    - 原始 `token_usage.prompt_tokens_details.cached_tokens`（个别版本不做上面那层映射）；
+    - DeepSeek 自己的字段 `token_usage.prompt_cache_hit_tokens`，LangChain 不认它。
+
+    取不到就是 0 —— 分不清「没命中」和「厂商不报」，看数字时要知道这一点。
+    """
+    usage = getattr(message, 'usage_metadata', None) or {}
+    details = usage.get('input_token_details') or {}
+    hit = int(details.get('cache_read') or 0)
+    if hit:
+        return hit
+    raw = (getattr(message, 'response_metadata', None) or {}).get('token_usage') or {}
+    hit = int((raw.get('prompt_tokens_details') or {}).get('cached_tokens') or 0)
+
+    return hit or int(raw.get('prompt_cache_hit_tokens') or 0)
+
+
+def reasoning_tokens(message: object) -> int:
+    """一次响应的输出 token 里，有多少是思考模式的推理过程（按输出价计费，但不进正文）。
+
+    火山方舟上的 deepseek 默认开思考，一批 8 条的判定输出几千 token，大头在这里。
+    取法同 `cached_tokens`：先读 LangChain 归一化的 `output_token_details.reasoning`，
+    再读原始 `completion_tokens_details.reasoning_tokens`；都没有就是 0。
+    """
+    usage = getattr(message, 'usage_metadata', None) or {}
+    hit = int((usage.get('output_token_details') or {}).get('reasoning') or 0)
+    if hit:
+        return hit
+    raw = (getattr(message, 'response_metadata', None) or {}).get('token_usage') or {}
+
+    return int((raw.get('completion_tokens_details') or {}).get('reasoning_tokens') or 0)
 
 
 def make_chat_model(cfg: ModelConfig, temperature: float | None = None) -> BaseChatModel:
@@ -317,6 +363,21 @@ def make_chat_model(cfg: ModelConfig, temperature: float | None = None) -> BaseC
     )
 
 
+#: 输出被长度上限截断的特征（openai SDK 的 LengthFinishReasonError 及其消息）
+_TRUNCATION_MARKERS = ('lengthfinishreasonerror', 'length limit was reached')
+
+
+def is_truncation_error(text: str) -> bool:
+    """这条报错是不是「输出被截断」。调用方据此把请求拆小重发（见 srd `pipeline.judge_all`）。
+
+    `ai_models` 的「最大输出」留空时不下发 max_tokens，由厂商用默认上限 —— 火山方舟的
+    deepseek 关掉思考后默认只有 4096，一次判 34 条就撞上。
+    """
+    low = (text or '').lower()
+
+    return any(m in low for m in _TRUNCATION_MARKERS)
+
+
 def classify_error(exc: BaseException) -> str:
     """把一次调用失败归成四类之一，决定「重试 / 换模型 / 直接判错」。
 
@@ -329,6 +390,10 @@ def classify_error(exc: BaseException) -> str:
     # （综述正文里出现「限流」「敏感」都不奇怪），扫关键词会把它错判成换模型或直接判死。
     if isinstance(exc, StructuredParseError):
         return RETRY
+    # 输出撞上长度上限：temperature=0 下原样重发必然原样截断，而把模型冻结 5 分钟更是罚错了人
+    # （实测单模型池里这样一次就让 SRD 判定干等了 9 分钟）。判错交给调用方拆小了再发
+    if is_truncation_error(f'{type(exc).__name__}: {exc}'):
+        return FATAL
 
     text = f'{type(exc).__name__}: {exc}'.lower()
     if any(k in text for k in _FATAL_KEYWORDS):
@@ -421,7 +486,11 @@ class LlmRunner:
         self._reloaded_at = 0.0
 
         self.token_in = 0
+        #: token_in 里命中前缀缓存的部分，见 `cached_tokens`
+        self.token_cached = 0
         self.token_out = 0
+        #: token_out 里的思考部分，见 `reasoning_tokens`
+        self.token_reasoning = 0
         self.calls = 0
 
     # ---------------------------------------------------------------- 只读视图
@@ -510,12 +579,18 @@ class LlmRunner:
             meta = (getattr(message, 'response_metadata', None) or {}).get('token_usage') or {}
             token_in = int(meta.get('prompt_tokens') or 0)
             token_out = int(meta.get('completion_tokens') or 0)
+        token_cached = cached_tokens(message)
+        token_reasoning = reasoning_tokens(message)
         self.token_in += token_in
+        self.token_cached += token_cached
         self.token_out += token_out
+        self.token_reasoning += token_reasoning
         record = self.usage.get((cfg or self.cfg).identity)
         if record is not None:
             record.token_in += token_in
+            record.token_cached += token_cached
             record.token_out += token_out
+            record.token_reasoning += token_reasoning
 
     @staticmethod
     def _messages(system: str, human: str) -> list[tuple[str, str]]:

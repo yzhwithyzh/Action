@@ -13,12 +13,12 @@ from typing import TYPE_CHECKING
 
 from srd_engine import cache
 from srd_engine import pdf as pdf_util
-from srd_engine.adapters.langchain_client import LlmRunner
+from srd_engine.adapters.langchain_client import LlmRunner, is_truncation_error
 from srd_engine.aggregate import aggregate, build_skeleton
 from srd_engine.checklist import ALL_ITEMS, DOMAINS
 from srd_engine.config import CRITERIA_VERSION, ENGINE_VERSION, PROMPT_VERSION, EngineConfig, ModelConfig
 from srd_engine.extract import extract_doc
-from srd_engine.judge import judge_batch
+from srd_engine.judge import NOT_RETURNED_NOTE, judge_batch
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -58,9 +58,8 @@ async def prepare_extract(
     on_progress: ProgressFn,
     label: str,
 ) -> tuple[ExtractDoc, list[str]]:
-    variant = cache.cache_variant(cfg.extract_scope)
     if cache_dir:
-        cached = cache.load(cache_dir, doc, runner.cfg.model, variant)
+        cached = cache.load(cache_dir, doc, runner.cfg.model)
         if cached is not None and cached.failed_batches:
             # 上一轮把残缺的 facet 存下来了（0.7.0 之前会这么干）。复用它等于把一次
             # 抽取失败永久固化：这篇参与的每一对配对都会从空壳里读，整批判 unclear。
@@ -76,11 +75,47 @@ async def prepare_extract(
     if cache_dir and not extract.failed_batches:
         # 只缓存完整的 facet。抽取是「一篇抽一次、34 条判定都吃这一份」，
         # 残缺的一份存下来，代价是后面每一对配对都跟着错，而且再也不会重抽。
-        cache.save(cache_dir, doc, runner.cfg.model, extract, variant)
+        cache.save(cache_dir, doc, runner.cfg.model, extract)
     elif cache_dir:
         warnings.append(f'批次 {"、".join(extract.failed_batches)} 未抽出，本篇不写缓存（下次重跑会重抽）')
     on_progress('extract', 1, 1, f'{label} 抽取完成')
     return extract, warnings
+
+
+async def _rejudge_truncated(
+    runner: LlmRunner,
+    results: list[ItemResult],
+    ea: ExtractDoc,
+    eb: ExtractDoc,
+    cfg: EngineConfig,
+    on_progress: ProgressFn,
+) -> list[ItemResult]:
+    """一次判完 34 条时输出被截断 → 把没拿到判定的条目按分组拆开重判。
+
+    `ai_models` 的「最大输出」留空时由厂商用默认上限：火山方舟的 deepseek 关掉思考后只有 4096，
+    34 条约需 1.7 万（见上方注释），必然撞上。截断的表现是整次调用报 `LengthFinishReasonError`
+    （34 条全没有），或者模型少返几条 —— 两种都会被 `judge_batch` 补成 unclear，
+    不拆开重判的话就是一份「全部证据不足」的报告，和「两篇都没写」长得一模一样。
+
+    只在确实像截断时才重判：模型答了但缺条目（`NOT_RETURNED_NOTE`，function calling 下截断
+    常常就长这样 —— 不报错、回一份空列表，实测过），或报错本身就是截断。
+    整池冻结、鉴权失败这类「调用本身失败」拆成 12 次也一样失败，徒增等待。
+    没拿到判定的条目 `votes` 为空（`judge_batch` 只给判出来的条目记票）。
+    """
+    missing = {r.code for r in results if not r.votes}
+    if not missing:
+        return results
+    notes = [r.review_note for r in results if r.code in missing]
+    if not any(n == NOT_RETURNED_NOTE or is_truncation_error(n) for n in notes):
+        return results
+
+    groups = [g for d in DOMAINS for g in d.groups if any(it.code in missing for it in g.items)]
+    on_progress('judge', len(results) - len(missing), len(ALL_ITEMS), f'输出被截断，{len(missing)} 条按分组重判')
+    batches = await runner.gather(
+        [judge_batch(runner, [it for it in g.items if it.code in missing], ea, eb, cfg) for g in groups]
+    )
+    redone = {r.code: r for batch in batches for r in batch}
+    return [redone.get(r.code, r) for r in results]
 
 
 async def judge_all(
@@ -96,7 +131,7 @@ async def judge_all(
         # 模型截断时 GroupVerdicts 会少返条目，由 judge_batch 补成 unclear + needs_review。
         results = await judge_batch(runner, ALL_ITEMS, ea, eb, cfg)
         on_progress('judge', len(results), len(ALL_ITEMS), '一次全给')
-        return results
+        return await _rejudge_truncated(runner, results, ea, eb, cfg, on_progress)
 
     if cfg.judge_granularity == 'per_group':
         groups = [g for d in DOMAINS for g in d.groups]
@@ -109,13 +144,7 @@ async def judge_all(
             on_progress('judge', done, len(ALL_ITEMS), '')
         return results
 
-    # per_item：每条一次调用，同样走 judge_batch（只是每次只给一条），不再有独立实现
-    total = len(ALL_ITEMS)
-    batches = await runner.gather([judge_batch(runner, [it], ea, eb, cfg) for it in ALL_ITEMS])
-    results = [r for batch in batches for r in batch]
-    for finished, result in enumerate(results, start=1):
-        on_progress('judge', finished, total, result.code)
-    return results
+    raise ValueError(f'未知的判定粒度：{cfg.judge_granularity!r}（应为 all / per_group）')
 
 
 async def assess_from_extracts(

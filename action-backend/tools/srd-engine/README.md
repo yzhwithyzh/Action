@@ -111,8 +111,7 @@ srd assess a.facet.json b.facet.json -o result.json    # 用已抽好的 facet�
 
 # 常用开关
 srd assess a.pdf b.pdf --cache .srd-cache        # 开抽取缓存（「一篇 vs 库里 N 篇」场景必开）
-srd assess a.pdf b.pdf --granularity per_group   # 12 次调用；per_item 则 34 次。都不推荐，见下
-srd assess a.pdf b.pdf --extract-scope sections  # 只喂命中的章节（不推荐，见下）
+srd assess a.pdf b.pdf --granularity per_group   # 12 次调用（一次判完被截断时引擎也会自动按它拆）
 ```
 
 `srd aggregate` 的输入就是一份 `{"1a": "0", "1b": "3", ...}`（也照收 0.6.0 的
@@ -158,17 +157,18 @@ from srd_engine import pdf; d = pdf.parse('$f'); print(len(d.full_text), d.sha25
 
    **两种模式的自一致率完全相同**，即 76 次调用没有换来更稳的输出；跨模式那 5 个百分点
    与同配置重跑的抖动无法区分。代价却是 76 倍调用、6 倍 token。故可靠性阶梯整体删除。
-   `--granularity per_group|per_item` 作为选项保留，不推荐。
+   0.8.1 删了 `per_item`；`per_group` 保留，因为一次判完 34 条被输出上限截断时，
+   引擎要按分组把没拿到判定的条目拆开重判（`pipeline._rejudge_truncated`）。
 
 2. **分数只由代码算**。`aggregate.py` 是唯一决定最终结论的地方，零 LLM。
    领域百分比 = 判为 `dup` 的条目数 ÷ (`dup` + `diff`)，`unclear` 剔出分母。
    表 3 的 16 格在 `tests/test_aggregate.py` 逐格断言。
 
-3. **抽取默认喂整篇原文**（`extract_scope='full'`）。
+3. **抽取一律喂整篇原文**。
    这是实测唯一被量化验证有效的改动：按章节关键词挑正文喂给模型时，只要标题识别不准
    就会静默丢掉关键段落（实测 2B 的 method 批次只喂进 602 字符，而全文里
    PubMed/Embase/CNKI 都写着）。三轮对照：分章节 70% 字段填充率 vs 全文 87%，
-   unclear 从 187 降到 128。`--extract-scope sections` 保留但不推荐。
+   unclear 从 187 降到 128。按章节喂的 `extract_scope='sections'` 开关 0.8.1 已删。
 
 4. **`present='no'` 与 `present='unclear'` 不可混同**。
    两篇都明确写了「未做敏感性分析」是**方法一致**（判 `dup`）；

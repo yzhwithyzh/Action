@@ -24,6 +24,11 @@ from module_action.entity.vo.action_vo import (
     GuidelineItemPageQueryModel,
     GuidelineModel,
     GuidelinePageQueryModel,
+    LiteratureModel,
+    LiteraturePageQueryModel,
+    LiteratureReviewModel,
+    LiteratureStatsModel,
+    LiteratureTextModel,
     NewsModel,
     NewsPageQueryModel,
     PublicationModel,
@@ -45,6 +50,7 @@ from module_action.service.action_service import (
     GuidelineCategoryService,
     GuidelineItemService,
     GuidelineService,
+    LiteratureService,
     NewsService,
     PublicationService,
     ResourceLinkService,
@@ -1311,9 +1317,9 @@ async def get_admin_study_type_list(
     '/study-type',
     summary='新增研究类型',
     description=(
-        '**入库只是一半**：前台第一步的选项写在 `composables/wizardQuery.ts` 的 TYPE_OPTS 里，'
-        '文案键是 `assistant.typeOpt.<typeKey>`，不同步的话这个类型在官网上选不出来。'
-        '接口会把这句话放进返回消息里'
+        '前台第一步的按钮直接取自本表（按 `sortNum` 排、文案取 `nameZh`/`nameEn`），'
+        '**入库即生效，不需要改前端**。访客刷新即见；要让搜索引擎与分享卡片也看到，'
+        '需在「站点文案管理」页点一次「重新生成官网」'
     ),
     response_model=ResponseBaseModel,
     dependencies=[UserInterfaceAuthDependency('action:studyType:add')],
@@ -1362,6 +1368,159 @@ async def delete_admin_study_type(
     query_db: Annotated[AsyncSession, DBSessionDependency()],
 ) -> Response:
     result = await StudyTypeService.delete_study_type_services(query_db, type_ids)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+# ------------------------------------------------------------------ 针灸文献知识库
+
+
+@action_admin_controller.get(
+    '/literature/stats',
+    summary='获取文献库统计',
+    description='后台概览卡片与语料构成披露的数据源',
+    response_model=DataResponseModel[LiteratureStatsModel],
+    dependencies=[UserInterfaceAuthDependency('action:literature:list')],
+)
+async def get_admin_literature_stats(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await LiteratureService.stats_services(query_db)
+    logger.info('获取成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.get(
+    '/literature/condition-groups',
+    summary='获取病种类目词表',
+    description='筛选下拉用，按语料中的篇数降序',
+    response_model=DynamicResponseModel,
+    dependencies=[UserInterfaceAuthDependency('action:literature:list')],
+)
+async def get_admin_literature_condition_groups(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await LiteratureService.condition_group_services(query_db)
+    logger.info('获取成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.get(
+    '/literature/list',
+    summary='获取文献分页列表',
+    description='后台复核用，含已停用；可按病种类目、研究设计、效应方向、质量标记过滤',
+    response_model=PageResponseModel[LiteratureModel],
+    dependencies=[UserInterfaceAuthDependency('action:literature:list')],
+)
+async def get_admin_literature_list(
+    request: Request,
+    literature_page_query: Annotated[LiteraturePageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await LiteratureService.get_literature_list_services(query_db, literature_page_query, is_page=True)
+    logger.info('获取成功')
+
+    return ResponseUtil.success(model_content=result)
+
+
+@action_admin_controller.get(
+    '/literature/{lit_id}/text',
+    summary='获取文献全文',
+    description='点开「查看原文」时才拉；单篇正文中位 1.8 万字符，不并进详情接口',
+    response_model=DataResponseModel[LiteratureTextModel],
+    dependencies=[UserInterfaceAuthDependency('action:literature:query')],
+)
+async def get_admin_literature_text(
+    request: Request,
+    lit_id: Annotated[int, Path(description='文献id')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await LiteratureService.literature_text_services(query_db, lit_id)
+    logger.info(f'获取lit_id为{lit_id}的全文成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.get(
+    '/literature/{lit_id}',
+    summary='获取文献详情',
+    description='后台复核用',
+    response_model=DataResponseModel[LiteratureModel],
+    dependencies=[UserInterfaceAuthDependency('action:literature:query')],
+)
+async def get_admin_literature_detail(
+    request: Request,
+    lit_id: Annotated[int, Path(description='文献id')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await LiteratureService.literature_detail_services(query_db, lit_id)
+    logger.info(f'获取lit_id为{lit_id}的信息成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.put(
+    '/literature',
+    summary='编辑文献',
+    description='后台复核用。语料编号、文件名与抽取审计信息不接受修改',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:literature:edit')],
+)
+@ValidateFields(validate_model='edit_literature')
+@Log(title='参考文献', business_type=BusinessType.UPDATE)
+async def edit_admin_literature(
+    request: Request,
+    edit_literature: LiteratureModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    edit_literature.update_by = current_user.user.user_name
+    edit_literature.update_time = datetime.now()
+    result = await LiteratureService.edit_literature_services(query_db, edit_literature)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.put(
+    '/literature/review',
+    summary='批量置复核状态',
+    description='复核是这张表的主要人工工作；判为剔除时同步停用，不再进检索',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:literature:edit')],
+)
+@Log(title='参考文献', business_type=BusinessType.UPDATE)
+async def review_admin_literature(
+    request: Request,
+    review: LiteratureReviewModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    result = await LiteratureService.review_literature_services(query_db, review, current_user.user.user_name)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.delete(
+    '/literature/{lit_ids}',
+    summary='删除文献',
+    description='逻辑删除元数据，同时物理删除全文',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:literature:remove')],
+)
+@Log(title='参考文献', business_type=BusinessType.DELETE)
+async def delete_admin_literature(
+    request: Request,
+    lit_ids: Annotated[str, Path(description='需要删除的文献id，多个以逗号分隔')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    result = await LiteratureService.delete_literature_services(query_db, lit_ids, current_user.user.user_name)
     logger.info(result.message)
 
     return ResponseUtil.success(msg=result.message)

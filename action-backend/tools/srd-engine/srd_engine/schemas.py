@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 Presence = Literal['yes', 'no', 'unclear']
 Verdict = Literal['dup', 'diff', 'unclear']
@@ -125,7 +125,26 @@ class ParsedDoc(BaseModel):
 # 因为部分厂商的 json_schema 结构化输出对 anyOf/泛型支持很差，会静默降级或报错。
 
 
-class TextFacet(BaseModel):
+def _all_required(schema: dict, _cls: type) -> None:
+    schema['required'] = list(schema.get('properties', {}))
+
+
+class LlmSchema(BaseModel):
+    """模型要填的结构的基类：**发给模型的 JSON Schema 里每个字段都是 required**，Python 侧仍保留默认值。
+
+    走 function calling 的厂商会把 Schema 里的可选字段整个省掉 —— 实测火山方舟上的
+    deepseek-v4-flash（2026-09-24）抽取 37 个字段**一个都不填**，只回了 `present`，
+    于是 34 条判定全 unclear；同一篇换 json_mode 能填 32–33 个。checklist 那边踩过同一个坑
+    （`audit._ItemJudgement` 的 docstring）。
+
+    只改 Schema 不改校验：默认值留着，模型仍漏回某个字段时照常解析成空值（与改动前一样），
+    旧的抽取缓存也照常读得回来。`model_config` 会被子类继承，嵌套的结构各自生效。
+    """
+
+    model_config = ConfigDict(json_schema_extra=_all_required)
+
+
+class TextFacet(LlmSchema):
     value: str = Field(default='', description='抽取到的内容；原文未提及则留空')
     quote: str = Field(default='', description='原文逐字引用（保持原语言，不要翻译、不要改写）')
     quote_zh: str = Field(default='', description='上述引用的中文翻译；原文即中文则照抄')
@@ -133,7 +152,7 @@ class TextFacet(BaseModel):
     present: Presence = Field(default='unclear', description='yes=明确报告 no=明确说明未做 unclear=未提及/含糊')
 
 
-class ListFacet(BaseModel):
+class ListFacet(LlmSchema):
     value: list[str] = Field(default_factory=list, description='抽取到的条目列表；原文未提及则留空数组')
     quote: str = Field(default='', description='原文逐字引用（保持原语言，不要翻译、不要改写）')
     quote_zh: str = Field(default='', description='上述引用的中文翻译；原文即中文则照抄')
@@ -141,7 +160,7 @@ class ListFacet(BaseModel):
     present: Presence = Field(default='unclear', description='yes=明确报告 no=明确说明未做 unclear=未提及/含糊')
 
 
-class IncludedStudy(BaseModel):
+class IncludedStudy(LlmSchema):
     """纳入研究。`evidence.py` 做跨篇比对时的归一优先级：registry_id > doi > (first_author, year)。"""
 
     first_author: str = Field(default='', description='第一作者姓氏')
@@ -151,7 +170,7 @@ class IncludedStudy(BaseModel):
     label: str = Field(default='', description='原文中的引用标签，如 "Zhang 2019"')
 
 
-class PooledResult(BaseModel):
+class PooledResult(LlmSchema):
     outcome: str = Field(default='', description='结局名称，如 VAS 疼痛评分')
     measure: str = Field(default='', description='效应指标：MD/SMD/RR/OR/HR/RD')
     point: float | None = Field(default=None, description='合并效应点估计')
@@ -163,13 +182,13 @@ class PooledResult(BaseModel):
     model: str = Field(default='', description='fixed / random，若原文说明')
 
 
-class GradeRating(BaseModel):
+class GradeRating(LlmSchema):
     outcome: str = ''
     rating: str = Field(default='', description='high / moderate / low / very low')
     downgrade_reasons: list[str] = Field(default_factory=list)
 
 
-class TopicFacets(BaseModel):
+class TopicFacets(LlmSchema):
     """批次 B1：研究主题（服务条目 1a–2f）。"""
 
     objective: TextFacet = Field(default_factory=TextFacet, description='综述的研究目标')
@@ -185,7 +204,7 @@ class TopicFacets(BaseModel):
     scope: TextFacet = Field(default_factory=TextFacet, description='范围限制：地域/年限/语言/医疗场景')
 
 
-class MethodFacets(BaseModel):
+class MethodFacets(LlmSchema):
     """批次 B2：研究方法（服务条目 3a–5b）。"""
 
     databases: ListFacet = Field(default_factory=ListFacet, description='检索的电子数据库')
@@ -204,7 +223,7 @@ class MethodFacets(BaseModel):
     data_types: ListFacet = Field(default_factory=ListFacet, description='结局的数据类型：二分类/连续/计数/生存/等级')
 
 
-class ResultFacets(BaseModel):
+class ResultFacets(LlmSchema):
     """批次 B3：研究结果（服务条目 6a–8e）。"""
 
     included_studies: list[IncludedStudy] = Field(default_factory=list, description='全部纳入研究，尽量完整')
@@ -237,7 +256,7 @@ class ResultFacets(BaseModel):
     future_research: TextFacet = Field(default_factory=TextFacet, description='实践建议与未来研究建议')
 
 
-class QualityFacets(BaseModel):
+class QualityFacets(LlmSchema):
     """批次 B4：研究质量（服务条目 9–12b）。"""
 
     coi_disclosure: TextFacet = Field(default_factory=TextFacet, description='本综述作者的利益冲突声明')
@@ -302,7 +321,7 @@ class ExtractDoc(BaseModel):
 # --------------------------------------------------------------------------- 3. 判定层
 
 
-class ItemVerdict(BaseModel):
+class ItemVerdict(LlmSchema):
     """单条目判定结果 —— 这就是 LLM 被要求填的结构。"""
 
     rating: Rating = Field(

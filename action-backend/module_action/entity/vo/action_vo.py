@@ -840,6 +840,8 @@ class GuidelineItemModel(ActionBaseModel):
     ext_label_en: str | None = Field(default=None, description='扩展列列名（英文）')
     extension_zh: str | None = Field(default=None, description='扩展/对照条目内容（中文）')
     extension_en: str | None = Field(default=None, description='扩展/对照条目内容（英文）')
+    example_zh: str | None = Field(default=None, description='条目示例/范例（中文）')
+    example_en: str | None = Field(default=None, description='条目示例/范例（英文）')
     require_level: Literal['0', '1'] | None = Field(default=None, description='填写要求（0必填 1条件填写/选填）')
     sort_num: int | None = Field(default=None, description='规范内显示顺序')
     status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用）')
@@ -1108,6 +1110,9 @@ class ReviewVerdictModel(BaseModel):
     reason: str = Field(default='', max_length=2000, description='判定说明（模型的判断，不是稿件摘抄）')
     evidence: str = Field(default='', max_length=500, description='判定引用的稿件原文片段')
     lines: str = Field(default='', max_length=200, description='报告于第几行，逗号分隔')
+    located: str = Field(
+        default='', max_length=8, description='引文回原文核对：yes / partial / no / 空（no 时前台提示人工核对）'
+    )
 
 
 class ReportReviewModel(ActionBaseModel):
@@ -1140,6 +1145,9 @@ class ReportReviewModel(ActionBaseModel):
     #: 全稿一致性结果原样透传（库里存的就是引擎那份 JSON）。**不在这里定死结构** ——
     #: 它的形状跟着 `engine/consistency.py` 的规则表走，写成 Model 就要跟着引擎版本改一遍
     consistency: dict | None = Field(default=None, description='全稿一致性判定结果')
+    errors: list[str] = Field(
+        default_factory=list, description='部分判定未完成的说明；非空时前台提示「部分判定未完成，建议重新校验」'
+    )
     verdicts: list[ReviewVerdictModel] = Field(default_factory=list, description='逐条判定')
     create_time: datetime | None = Field(default=None, description='提交时间')
     finish_time: datetime | None = Field(default=None, description='完成时间')
@@ -1335,10 +1343,11 @@ class StudyTypeSaveModel(BaseModel):
 
     ## 三个字段各有各的下游，改错了症状完全不同
 
-    - **`type_key` 是问卷词表的键**。前台第一步的选项写在 `pages/assistant.vue` 的
-      `composables/wizardQuery.ts::TYPE_OPTS` 里，文案键是 `assistant.typeOpt.<type_key>`。
-      **后台加一个类型，前台不同步就选不出来**（数组里没有它），改一个已有的键则会让那个选项
-      的文案退化成键名本身。所以新增/改键时接口会把这件事明说出来，页面上也有提示。
+    - **`type_key` 是问卷词表的键**。前台第一步的按钮直接来自本表
+      （`GET /action/site/study-types`，按 `sort_num` 排、文案取 `name_zh`/`name_en`），
+      **加一个类型入库即生效，不需要改前端**。唯一的例外是 `rct`/`nrct`：页面上把这两行
+      合成一个「临床试验」按钮，再由问题 2（是否随机化）落到具体哪一个（见 `assistant.vue`
+      的 `TRIAL_KEYS`）。另外这个键会进 URL（`/assistant?type=<key>`），改键会让老链接失效。
     - **`hot_guideline` 决定第二步展开哪份 checklist**，必须指向 `action_guideline.code`
       且那份规范真有条目 —— 指错了前台第二步展不开，用户只会看到一片空白。这条是硬闸。
     - **`guidelines` 只是展示标签**，不是外键。库里现有「针灸专属条目」「针刺检索策略」
@@ -1854,3 +1863,309 @@ class GuestTokenModel(BaseModel):
 
     token: str = Field(description='访客令牌')
     guest: GuestPublicInfoModel = Field(description='访客信息')
+
+# ---------------------------------------------------------------- 针灸文献知识库
+
+#: 研究设计取值。**protocol 是研究方案、没有结果数据，不得作疗效证据**——
+#: 实测模型会把它判成 rct，入库时由 `tools/lit_ingest._norm_design` 按标题兜底改判
+StudyDesign = Literal['rct', 'nrct', 'animal', 'sr_meta', 'case_series', 'protocol', 'other']
+#: 效应方向。**按主要结局判，不按摘要结论句判** —— 中文文献摘要常写「疗效显著」
+#: 而数据是终点组间无差异（P>0.05），跟着摘要走会让不一致检测整个失效
+EffectDirection = Literal['positive', 'negative', 'no_difference', 'unclear']
+#: 人工复核状态。语料是机器抽取的，复核是这张表的主要人工工作
+ReviewStatus = Literal['pending', 'ok', 'fixed', 'rejected']
+
+
+class LiteratureModel(ActionBaseModel):
+    """
+    针灸文献知识库条目
+
+    **这些记录是机器从 PDF 抽取的产物，不是人工录入的。** 后台页面的主要工作是
+    「复核与修正」而非「新增」——一条记录必须对应一个真实的 PDF（`corpus_no` 唯一），
+    手工凭空建一条会得到一份没有原文可核的元数据，所以写接口只开编辑不开新增。
+
+    列表接口刻意不返回 `abstract` / `finding_summary` / `year_evidence`
+    （`LiteratureService._LIST_OMIT`）：一页 20 条摘要就是几万字没人看的文本，
+    详情接口才给全。
+
+    `authors` / `condition` / `comparator` 等在库里是 JSON 文本，转换收在
+    `LiteratureService._encode` / `_decode`，DAO 与控制器都不认识这件事。
+    """
+
+    #: 额外开 `populate_by_name`，同 `PublicationModel`：这几个模型除了接 HTTP 入参，
+    #: 还要在服务层与 tools/ 脚本里用 **snake_case 字段名**直接构造。pydantic v2 在只有
+    #: alias 时对 snake_case 键是**静默忽略**而不是报错 —— 不开这个开关，
+    #: `LiteratureStatsModel(no_difference=92)` 会安静地得到 0，
+    #: `LiteraturePageQueryModel(condition_group='失眠')` 会安静地不筛选（实测两处都中招）。
+    model_config = ConfigDict(populate_by_name=True)
+
+
+    lit_id: int | None = Field(default=None, description='文献id')
+    corpus_no: int | None = Field(default=None, description='语料编号（对应 PDF 文件，唯一）')
+    file_name: str | None = Field(default=None, description='PDF 文件名')
+    title: str | None = Field(default=None, description='原文题名（原语言照录），引用输出用它')
+    title_en: str | None = Field(default=None, description='英文题名，取自目录.xlsx；英文文献与 title 同值')
+
+    year: int | None = Field(default=None, description='出版年')
+    year_evidence: str | None = Field(default=None, description='判定出版年所依据的原文片段')
+    year_confidence: Literal['high', 'low'] | None = Field(default=None, description='年份可信度')
+    authors: list[str] | None = Field(default=None, description='作者，顺序即署名顺序')
+    journal: str | None = Field(default=None, description='期刊名')
+    country: str | None = Field(default=None, description='国家')
+    lang: Literal['zh', 'en'] | None = Field(default=None, description='文献语言')
+
+    abstract: str | None = Field(default=None, description='摘要')
+    population: str | None = Field(default=None, description='研究对象')
+    condition: list[str] | None = Field(default=None, description='病种（归一化中文标签）')
+    condition_norm: list[str] | None = Field(default=None, description='规范病种名')
+    condition_group: list[str] | None = Field(default=None, description='上位病种类目，覆盖度按它算')
+    intervention: list[str] | None = Field(default=None, description='干预措施')
+    comparator: list[str] | None = Field(default=None, description='对照措施（短标签）')
+    outcomes: list[str] | None = Field(default=None, description='结局指标')
+    tcm_syndrome: list[str] | None = Field(default=None, description='中医证候')
+
+    study_design: StudyDesign | None = Field(default=None, description='研究设计')
+    sample_size: int | None = Field(default=None, description='总样本量')
+    effect_direction: EffectDirection | None = Field(default=None, description='效应方向，按主要结局判')
+    finding_summary: str | None = Field(default=None, description='主要结果概括')
+
+    acu_points: list[str] | None = Field(default=None, description='穴位，国际代码优先')
+    acu_meridian: list[str] | None = Field(default=None, description='经络')
+    acu_method: str | None = Field(default=None, description='针法')
+    acu_frequency: str | None = Field(default=None, description='电针频率')
+    acu_deqi: Literal['0', '1'] | None = Field(default=None, description='是否报告得气')
+    acu_retention_min: int | None = Field(default=None, description='留针分钟数')
+    acu_sessions: int | None = Field(default=None, description='总治疗次数')
+    acu_course_weeks: int | None = Field(default=None, description='疗程周数')
+
+    contamination: Literal['0', '1'] | None = Field(default=None, description='PDF 是否夹带其他论文内容')
+    contamination_note: str | None = Field(default=None, description='夹带说明')
+    contam_kind: str | None = Field(default=None, description='夹带形态')
+    clean_status: str | None = Field(default=None, description='切除结果')
+    clean_ratio: int | None = Field(default=None, description='切除后保留百分比')
+    intruders: list[str] | None = Field(default=None, description='混入的其他论文标题')
+    truncated: Literal['0', '1'] | None = Field(default=None, description='本文后半截不在本 PDF 里')
+    review_status: ReviewStatus | None = Field(default=None, description='人工复核状态')
+    review_by: str | None = Field(default=None, description='复核人')
+    review_time: datetime | None = Field(default=None, description='复核时间')
+
+    extract_model: str | None = Field(default=None, description='抽取所用模型')
+    extract_status: str | None = Field(default=None, description='抽取状态')
+    extract_error: str | None = Field(default=None, description='抽取失败原因')
+    extract_time: datetime | None = Field(default=None, description='抽取时间')
+    pages: int | None = Field(default=None, description='PDF 页数')
+    text_chars: int | None = Field(default=None, description='正文字符数')
+
+    status: Literal['0', '1'] | None = Field(default=None, description='状态（0正常 1停用，停用即不进检索）')
+    create_by: str | None = Field(default=None, description='创建者')
+    create_time: datetime | None = Field(default=None, description='创建时间')
+    update_by: str | None = Field(default=None, description='更新者')
+    update_time: datetime | None = Field(default=None, description='更新时间')
+    remark: str | None = Field(default=None, description='备注')
+
+    @Size(field_name='title', min_length=0, max_length=1000, message='标题不能超过1000个字符')
+    def get_title(self) -> str | None:
+        return self.title
+
+    @field_validator('year')
+    @classmethod
+    def check_year(cls, v: int | None) -> int | None:
+        """出版年落在合理区间。手工改到 1800 或 2999 只可能是笔误"""
+        if v is not None and not (1900 <= v <= datetime.now().year + 1):
+            raise ModelValidatorException(message=f'出版年应在 1900-{datetime.now().year + 1} 之间')
+        return v
+
+    def validate_fields(self) -> None:
+        self.get_title()
+
+
+class LiteratureTextModel(ActionBaseModel):
+    """
+    文献全文。**只在详情页按需拉取**，不进列表接口 —— 单篇中位 1.8 万字符
+    """
+
+    #: 理由见 LiteratureModel 上那段注释
+    model_config = ConfigDict(populate_by_name=True)
+
+
+    lit_id: int | None = Field(default=None, description='文献id')
+    corpus_no: int | None = Field(default=None, description='语料编号')
+    full_text: str | None = Field(default=None, description='PDF 原始正文')
+    clean_text: str | None = Field(default=None, description='切除夹带后的正文；为空表示无须切除')
+
+
+class LiteratureQueryModel(ActionBaseModel):
+    """
+    文献查询模型
+
+    `quality` 是几个质量标记的合并筛选项，专为「复核」这条主线设计：
+    contaminated 夹带未处理 / truncated 正文截断 / lowYear 年份存疑 /
+    needReview 待复核（以上任一 + review_status=pending）
+    """
+
+    #: 理由见 LiteratureModel 上那段注释
+    model_config = ConfigDict(populate_by_name=True)
+
+
+    keyword: str | None = Field(default=None, description='标题/期刊/作者/摘要关键词')
+    corpus_no: int | None = Field(default=None, description='语料编号')
+    condition_group: str | None = Field(default=None, description='病种上位类目')
+    study_design: str | None = Field(default=None, description='研究设计')
+    effect_direction: str | None = Field(default=None, description='效应方向')
+    lang: str | None = Field(default=None, description='文献语言')
+    review_status: str | None = Field(default=None, description='复核状态')
+    quality: str | None = Field(default=None, description='质量标记筛选')
+    year_begin: int | None = Field(default=None, description='出版年起')
+    year_end: int | None = Field(default=None, description='出版年止')
+    status: str | None = Field(default=None, description='状态')
+
+
+class LiteraturePageQueryModel(LiteratureQueryModel):
+    """
+    文献分页查询模型
+    """
+
+    page_num: int = Field(default=1, description='当前页码')
+    page_size: int = Field(default=20, description='每页记录数')
+
+
+class LiteratureReviewModel(BaseModel):
+    """
+    复核操作模型
+
+    复核是这张表的主要人工工作，**单开一个窄接口而不是复用编辑接口**：
+    编辑接口收整个 `LiteratureModel`，前端漏传一个字段就会把它清空；
+    而复核只改三个值，收窄入参等于把这类事故挡在门外。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    lit_ids: str = Field(description='文献id，多个以逗号分隔')
+    review_status: ReviewStatus = Field(description='复核结果')
+    remark: str | None = Field(default=None, description='复核备注')
+
+
+class LiteratureStatsModel(ActionBaseModel):
+    """
+    语料统计。后台页面顶部的概览卡片，也是「语料构成披露」的数据来源
+    """
+
+    #: 理由见 LiteratureModel 上那段注释
+    model_config = ConfigDict(populate_by_name=True)
+
+
+    total: int = Field(default=0, description='文献总数')
+    usable: int = Field(default=0, description='启用中')
+    zh: int = Field(default=0, description='中文文献')
+    en: int = Field(default=0, description='英文文献')
+    recent5: int = Field(default=0, description='近5年')
+    positive: int = Field(default=0, description='阳性结果')
+    no_difference: int = Field(default=0, description='无差异')
+    negative: int = Field(default=0, description='阴性结果')
+    unclear: int = Field(default=0, description='方向无法判定')
+    contaminated: int = Field(default=0, description='PDF 夹带其他论文内容')
+    truncated: int = Field(default=0, description='正文截断')
+    low_year: int = Field(default=0, description='年份存疑')
+    pending: int = Field(default=0, description='待复核')
+    designs: list[dict[str, Any]] = Field(default_factory=list, description='研究设计分布')
+    groups: list[dict[str, Any]] = Field(default_factory=list, description='病种类目 Top')
+
+
+class DeleteLiteratureModel(BaseModel):
+    """
+    删除文献模型
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    lit_ids: str = Field(description='需要删除的文献id，多个以逗号分隔')
+
+
+# ---------------------------------------------------------------- 背景与讨论智能生成
+
+#: 研究方向的长度。太短检索不出东西，太长是把整段摘要粘进来了
+MIN_BG_TOPIC_CHARS = 4
+MAX_BG_TOPIC_CHARS = 200
+
+BgRunStatus = Literal['pending', 'running', 'completed', 'failed', 'stopped']
+
+
+class BackgroundSubmitModel(BaseModel):
+    """
+    提交一次背景生成
+
+    **只收研究方向与两个可选提示，不收任何「按 id 去库里捞」的入参** ——
+    同 `AssistRequestModel` 的安全边界：前端能指定 id 就意味着能拿别人的东西当 prompt。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    topic: str = Field(min_length=MIN_BG_TOPIC_CHARS, max_length=MAX_BG_TOPIC_CHARS, description='研究方向')
+    guideline_code: str = Field(default='', max_length=64, description='按哪份规范写，取自第一步')
+    condition_group: str = Field(default='', max_length=200, description='指定病种类目；留空由系统推断')
+    locale: Literal['zh', 'en'] = Field(default='zh', description='生成语言')
+
+
+class BackgroundSubmitResultModel(ActionBaseModel):
+    """提交结果。**runId 要存下来**：刷新页面后靠它从历史里找回这次生成"""
+
+    #: 这三个出参模型都额外开 `populate_by_name`：它们除了接 HTTP 入参，还要在服务层
+    #: 用 snake_case 字段名直接构造。pydantic v2 在只有 alias 时对多余的 snake_case 键是
+    #: **静默忽略**而不是报错 —— 不开这个开关会安静地得到一个字段全是默认值的空模型
+    #: （同 `PublicationModel` 的理由，那次是 `LiteratureStatsModel(no_difference=92)` → 0）
+    model_config = ConfigDict(alias_generator=to_camel, from_attributes=True, populate_by_name=True)
+
+    run_id: int = Field(description='任务记录id')
+    session_id: str = Field(description='worker 任务id，轮询用')
+
+
+class BackgroundStateModel(ActionBaseModel):
+    """
+    一次生成的状态与结果
+
+    `result` 只在 `completed` 时有值。**`retrieve_mode` 必须一路传到前端**：
+    `bm25` 表示向量检索不可用、已降级（实测 P@5 由 0.94 掉到 0.73），
+    这是质的变化而用户完全看不出来，不报出来就是欺骗。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, from_attributes=True, populate_by_name=True)
+
+    run_id: int = Field(description='任务记录id')
+    session_id: str = Field(description='worker 任务id')
+    topic: str = Field(description='研究方向')
+    run_status: BgRunStatus = Field(description='任务状态')
+    progress: int = Field(default=0, description='进度百分比')
+    phase: str = Field(default='', description='当前阶段 pico/search/write/verify')
+    error_msg: str = Field(default='', description='失败原因')
+    retrieve_mode: str = Field(default='', description='检索模式；bm25 表示已降级')
+    model_label: str = Field(default='', description='出结果的模型')
+    slot_total: int = Field(default=0, description='段落总数')
+    slot_blocked: int = Field(default=0, description='覆盖不足未生成的段落数')
+    ref_count: int = Field(default=0, description='参考文献条数')
+    partial_count: int = Field(default=0, description='引证核验待复核处数')
+    create_time: datetime | None = Field(default=None, description='提交时间')
+    finish_time: datetime | None = Field(default=None, description='结束时间')
+    result: dict[str, Any] | None = Field(default=None, description='完整结果，仅 completed 时有值')
+
+
+class BackgroundHistoryModel(ActionBaseModel):
+    """
+    历史列表项。**不带 result** —— 一次结果几千字，列表页一个字都用不上
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, from_attributes=True, populate_by_name=True)
+
+    run_id: int = Field(description='任务记录id')
+    session_id: str = Field(description='worker 任务id')
+    topic: str = Field(description='研究方向')
+    condition_group: str = Field(default='', description='命中的病种类目')
+    run_status: BgRunStatus = Field(description='任务状态')
+    progress: int = Field(default=0, description='进度百分比')
+    error_msg: str = Field(default='', description='失败原因')
+    slot_total: int = Field(default=0, description='段落总数')
+    slot_blocked: int = Field(default=0, description='覆盖不足未生成的段落数')
+    ref_count: int = Field(default=0, description='参考文献条数')
+    partial_count: int = Field(default=0, description='引证核验待复核处数')
+    retrieve_mode: str = Field(default='', description='检索模式')
+    create_time: datetime | None = Field(default=None, description='提交时间')
+    finish_time: datetime | None = Field(default=None, description='结束时间')

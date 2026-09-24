@@ -34,7 +34,6 @@ def _progress(stage: str, done: int, total: int, detail: str) -> None:
 
 def _engine_cfg(args: argparse.Namespace) -> EngineConfig:
     return EngineConfig(
-        extract_scope=args.extract_scope,
         judge_granularity=args.granularity,
         max_concurrency=args.concurrency,
     )
@@ -172,10 +171,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument('--provider', default='', help='OpenAI / DeepSeek / Anthropic / Google …')
         sp.add_argument('--model', default='', help='模型名，覆盖 SRD_MODEL')
         sp.add_argument('--concurrency', type=int, default=8)
-        sp.add_argument('--extract-scope', choices=['full', 'sections'], default='full',
-                        help='抽取时喂全篇（默认）还是只喂命中的章节')
-        sp.add_argument('--granularity', choices=['all', 'per_group', 'per_item'], default='all',
-                        help='all=34 条一次调用（默认）/ per_group=12 次 / per_item=34 次')
+        sp.add_argument('--granularity', choices=['all', 'per_group'], default='all',
+                        help='all=34 条一次调用（默认）/ per_group=12 次')
 
     sp = sub.add_parser('checklist', help='查看 34 条目清单')
     sp.set_defaults(func=cmd_checklist)

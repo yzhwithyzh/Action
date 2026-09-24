@@ -16,14 +16,10 @@ pip install -r tools/srd_worker_tool/requirements.txt
 pip install -e tools/srd-engine        # 可选；不装也能跑（会自动把引擎目录加进 sys.path）
 
 export SRD_WORKER_REDIS_HOST=127.0.0.1
-# 模型默认从 ai_models 表读（见 §3），以下两个只是数据库里一个可用模型都没有时的兜底
-export SRD_API_KEY=sk-xxx
-export SRD_MODEL=deepseek-chat
+# 模型只从 ai_models 表读（见 §3），worker 不认 SRD_* 模型环境变量
 
 python -m tools.srd_worker_tool
 ```
-
-Windows PowerShell：`$env:SRD_API_KEY='sk-xxx'; python -m tools.srd_worker_tool`
 
 ## 2. 提交任务
 
@@ -69,8 +65,7 @@ async with TaskClient(CONFIG) as client:
 | `session_id` | 由 `submit()` 自动生成 | 全链路唯一标识 |
 | `review_a` / `review_b` | ✅ | `{'url': ...}` 或 `{'path': ...}`，可带 `title`；也可直接传字符串，或用 `files: [a, b]` |
 | `model_ids` | 否 | 只用 `ai_models` 里这几个模型（不传＝全部启用中的） |
-| `model` | 否 | 带 `api_key` 时＝一次性临时模型（不查库、不轮换）；只给 `temperature`/`max_tokens`/`timeout` 时＝套到池内每个模型上。空串视为「不覆盖」 |
-| `engine` | 否 | `extract_scope` / `judge_granularity` / `max_concurrency` / `evidence_sufficient_ratio` |
+| `engine` | 否 | `judge_granularity`（`all` / `per_group`）/ `max_concurrency` / `evidence_sufficient_ratio` |
 | `options.force` | 否 | `true` 时忽略断点强制重跑 |
 
 `max_concurrency` 会被裁到 `max_concurrent_llm / max_concurrent_sessions`（默认 16/2 = 8），
@@ -83,11 +78,13 @@ async with TaskClient(CONFIG) as client:
 
 筛选规则：`status='0'`（启用）+ 配了 `api_key`，按 `model_sort` 升序 —— **这个顺序就是轮询顺序**。
 
-优先级：
+**这是唯一来源**（可用 `payload.model_ids` 缩小范围）：库里一个可用模型都没有、或库连不上时任务如实失败。
+0.8.1 前还有两条旁路 —— payload 里直接带 `api_key` 的临时模型、回落 `SRD_*` 环境变量 ——
+后端从不走，而它们让「这次评估到底用的哪个模型」多了两个答案，已删。与 checklist worker 同口径。
+引擎自己的离线工具（`srd` CLI、`run_batch.py` 不带 `--from-db` 时）仍读 `SRD_*` 环境变量。
 
-1. `payload.model` 里带 `api_key` → 一次性临时模型，不查库也不轮换；
-2. `ai_models` 表（可用 `payload.model_ids` 缩小范围）；
-3. `SRD_PROVIDER / SRD_MODEL / SRD_API_KEY / SRD_BASE_URL` 环境变量 —— 库里一个都没有时的兜底。
+**关思考的模型要在后台填「最大输出」**：留空时不下发 `max_tokens`，火山方舟 deepseek
+非思考模式默认只有 4096，抽取「结果」批次与一次判 34 条都放不下。实测填 32768 即可。
 
 ### 结构化输出方式（`ai_models.structured_method`）
 
@@ -145,7 +142,7 @@ async with TaskClient(CONFIG) as client:
   "ratings": {"1a": "0", "1b": "1", "2a": "3", "...": "unclear"},
   "score_distribution": {"0": 11, "1": 8, "2": 6, "3": 6, "unclear": 3},
   "llm_calls": 41, "token_in": 128000, "token_out": 19000, "seconds": 214.6,
-  "model": "deepseek-chat", "model_pool_source": "db",
+  "model": "deepseek-chat",
   "model_pool": ["DeepSeek/deepseek-chat#ai_models:3", "Moonshot/kimi-k2#ai_models:7"],
   "models_used": ["DeepSeek/deepseek-chat#ai_models:3"], "model_switches": [],
   "engine_version": "srd-engine/0.7.0", "prompt_version": "prompt/2026-08-05",
@@ -212,7 +209,6 @@ tools/srd_worker_tool/
 | `SRD_WORKER_MODEL_ALL_FROZEN_WAIT` | 600 | 全池冻结时最多等多久（秒） |
 | `SRD_WORKER_MODEL_MAX_ROUNDS` | 2 | 单次调用最多把池子轮几遍 |
 | `SRD_WORKER_MODEL_TYPES` | 空 | 只用这些 `model_type`（逗号分隔，空＝不过滤） |
-| `SRD_PROVIDER / SRD_MODEL / SRD_API_KEY / SRD_BASE_URL` | — | `ai_models` 里一个可用模型都没有时的兜底 |
 
 模型池还需要 worker 能连上后端那套数据库（`config/.env` 里的 `DB_*`）与解密密钥（`JwtConfig.jwt_secret_key`）——
 和后端进程用同一份配置即可，systemd 的 `EnvironmentFile` 指向同一个 `.env` 最省事。

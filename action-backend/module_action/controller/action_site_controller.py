@@ -16,6 +16,10 @@ from module_action.entity.vo.action_vo import (
     AssistApplyModel,
     AssistRequestModel,
     AssistResultModel,
+    BackgroundHistoryModel,
+    BackgroundStateModel,
+    BackgroundSubmitModel,
+    BackgroundSubmitResultModel,
     CfirDomainModel,
     ChecklistReviewStateModel,
     ChecklistReviewSubmitModel,
@@ -60,6 +64,7 @@ from module_action.entity.vo.action_vo import (
     TrailModel,
 )
 from module_action.service.action_service import (
+    BackgroundGenService,
     ChecklistReviewService,
     CollabRequestService,
     GuidelineCategoryService,
@@ -783,6 +788,128 @@ async def stop_site_checklist_review(
 ) -> Response:
     result = await ChecklistReviewService.stop_review_services(query_db, session_id, current_guest.user_id)
     logger.info(f'已请求停止 checklist 校验任务 {session_id}')
+
+    return ResponseUtil.success(msg=result.message)
+
+
+# ---------------------------------------------------------------- 报告助手第四步：研究背景智能生成
+#
+# 另外三个工具（续写/润色/翻译）走 `/report-assist` 那条**同步**路 —— 它们是秒级的单次
+# 模型调用。这一个不是：PICO 解析 + 4 个槽位检索 + 4 段写作 + 4 次引证核验 ≈ 9 次模型调用，
+# 实测 5 分钟上下，同步跑必然超时。所以照抄第三步那套 worker 形态：提交 → 轮询 → 落库。
+#
+# 路径形状同 checklist：`/background-runs`（复数）是历史与详情，`/background-run/{sessionId}`
+# （单数）是轮询与停止。改名时别把复数改没了 —— 那会让详情把轮询的路径吃掉。
+
+
+@action_site_controller.post(
+    '/background-run',
+    summary='提交一次研究背景智能生成',
+    description=(
+        '报告助手第四步的「背景生成」工具。输入研究方向，检索内置针灸文献库并生成研究背景初稿'
+        '与推荐参考文献。提交后立即返回 sessionId 与 runId，结果通过状态接口轮询获取'
+    ),
+    response_model=DataResponseModel[BackgroundSubmitResultModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_BACKGROUND_GEN, preset=ApiRateLimitPreset.USER_RESOURCE_EXECUTION)
+async def submit_site_background_run(
+    request: Request,
+    submit: BackgroundSubmitModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await BackgroundGenService.submit_services(query_db, submit, current_guest.user_id)
+    logger.info(f'背景生成任务已提交：{result.session_id}（记录 {result.run_id}）')
+
+    return ResponseUtil.success(data=result, msg='已提交，正在生成')
+
+
+@action_site_controller.get(
+    '/background-runs',
+    summary='我的背景生成历史',
+    description=(
+        '只返回本人的记录，不带生成结果（一次结果几千字，列表页用不上）。'
+        '顺带对账：用户关掉页面后没人再轮询，这里对未终结的记录补查一次 worker 状态'
+    ),
+    response_model=DataResponseModel[list[BackgroundHistoryModel]],
+)
+async def get_site_background_history(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await BackgroundGenService.list_history_services(query_db, current_guest.user_id)
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/background-runs/{run_id}',
+    summary='取一次背景生成的完整结果',
+    description='历史回看。带各段正文、参考文献表、引证核验结论与当时的语料构成快照',
+    response_model=DataResponseModel[BackgroundStateModel],
+)
+async def get_site_background_detail(
+    request: Request,
+    run_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await BackgroundGenService.detail_services(query_db, run_id, current_guest.user_id)
+    logger.info(f'获取背景生成记录 {run_id} 成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.delete(
+    '/background-runs/{run_id}',
+    summary='删除一条背景生成历史',
+    description='记录逻辑删，**研究方向与生成结果物理删** —— 用户点删除时期待的是「那次生成没了」',
+    response_model=ResponseBaseModel,
+)
+async def delete_site_background_run(
+    request: Request,
+    run_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await BackgroundGenService.delete_services(query_db, run_id, current_guest.user_id)
+    logger.info(f'删除背景生成记录 {run_id} 成功')
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_site_controller.get(
+    '/background-run/{session_id}',
+    summary='查询背景生成任务状态',
+    description='轮询接口。完成后 result 里带各段正文与参考文献表，并顺手把结果落库',
+    response_model=DataResponseModel[BackgroundStateModel],
+)
+async def get_site_background_run(
+    request: Request,
+    session_id: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await BackgroundGenService.poll_services(query_db, session_id, current_guest.user_id)
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.post(
+    '/background-run/{session_id}/stop',
+    summary='停止背景生成任务',
+    description='中止按钮。只能停自己的任务；worker 在下一个检查点才真正退出',
+    response_model=ResponseBaseModel,
+)
+async def stop_site_background_run(
+    request: Request,
+    session_id: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await BackgroundGenService.stop_services(query_db, session_id, current_guest.user_id)
+    logger.info(f'已请求停止背景生成任务 {session_id}')
 
     return ResponseUtil.success(msg=result.message)
 

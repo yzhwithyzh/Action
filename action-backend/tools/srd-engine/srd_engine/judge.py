@@ -19,16 +19,22 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, Field
+from pydantic import Field
 
 from srd_engine.evidence import build_evidence_card
 from srd_engine.prompts import judge_batch_messages
-from srd_engine.schemas import ExtractDoc, ItemResult, ItemVerdict, VoteRecord
+from srd_engine.schemas import ExtractDoc, ItemResult, ItemVerdict, LlmSchema, VoteRecord
 
 if TYPE_CHECKING:
     from srd_engine.adapters.langchain_client import LlmRunner
     from srd_engine.checklist import Item
     from srd_engine.config import EngineConfig
+
+
+#: 模型答了、但这一条没在答案里（调用本身没报错）。多半是输出被截断 ——
+#: function calling 下截断未必报 LengthFinishReasonError，可能直接回一份残缺或空的列表。
+#: `pipeline._rejudge_truncated` 认这句话，别改措辞时漏了那边
+NOT_RETURNED_NOTE = '批量判定未返回该条目（多半是输出被截断）'
 
 
 class CodedVerdict(ItemVerdict):
@@ -37,7 +43,7 @@ class CodedVerdict(ItemVerdict):
     code: str = Field(description='条目编号，如 2a')
 
 
-class BatchVerdicts(BaseModel):
+class BatchVerdicts(LlmSchema):
     verdicts: list[CodedVerdict] = Field(description='每个条目各一条评分，顺序与题目一致')
 
 
@@ -95,7 +101,7 @@ async def judge_batch(
         if got is None:
             result.rating = 'unclear'
             result.needs_review = True
-            result.review_note = err or '批量判定未返回该条目（多半是输出被截断）'
+            result.review_note = err or NOT_RETURNED_NOTE
             result.confidence = 'low'
         else:
             _apply(result, got)

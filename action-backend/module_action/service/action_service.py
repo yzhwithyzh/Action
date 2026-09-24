@@ -18,11 +18,13 @@ from common.vo import CrudResponseModel, PageModel
 from config.env import SiteBuildConfig, UploadConfig
 from exceptions.exception import ServiceException
 from module_action.dao.action_dao import (
+    BackgroundRunDao,
     CollabRequestDao,
     GuidelineCategoryDao,
     GuidelineDao,
     GuidelineItemDao,
     ImplementationDao,
+    LiteratureDao,
     NewsDao,
     PublicationDao,
     ReportDraftDao,
@@ -35,18 +37,28 @@ from module_action.dao.action_dao import (
     TeamMemberDao,
 )
 from module_action.entity.do.action_do import (
+    ActionBackgroundRun,
     ActionReportReview,
     ActionReportTrail,
     ActionSrdAssessment,
     ActionStudyType,
 )
 from module_action.entity.vo.action_vo import (
+    LiteratureModel,
+    LiteraturePageQueryModel,
+    LiteratureReviewModel,
+    LiteratureStatsModel,
+    LiteratureTextModel,
     MAX_ASSIST_INPUT_CHARS,
     MAX_TRAIL_ROWS,
     MIN_MANUSCRIPT_CHARS,
     AssistApplyModel,
     AssistRequestModel,
     AssistResultModel,
+    BackgroundHistoryModel,
+    BackgroundStateModel,
+    BackgroundSubmitModel,
+    BackgroundSubmitResultModel,
     CfirConstructModel,
     CfirDomainModel,
     CfirStrategyModel,
@@ -1792,12 +1804,15 @@ class ChecklistReviewService:
                     'evidence': str(v.get('evidence') or '')[:500],
                     # 库里存逗号分隔的字符串，引擎给的是数字数组
                     'lines': ','.join(str(int(n)) for n in lines if isinstance(n, (int, float)))[:200],
+                    'located': str(v.get('located') or '')[:8],
                 }
             )
 
         counts = Counter(r['status'] for r in rows)
         consistency = result.get('consistency') if isinstance(result.get('consistency'), dict) else None
         models = result.get('models') if isinstance(result.get('models'), list) else []
+        # 「部分没判成」的说明（worker 已截过长度）。只落前 10 条：它是给前台一个信号，不是排障日志
+        warnings = [str(e)[:200] for e in result.get('errors') or [] if str(e).strip()][:10]
 
         # 条目总数与完整度**按实际落库的行重算**，不照抄 worker 摘要里的 total/completeness。
         # 上面那道过滤可能丢掉几条（后台在任务跑着的时候停用了条目），照抄的话历史行会显示
@@ -1819,6 +1834,7 @@ class ChecklistReviewService:
             'truncated': '1' if result.get('truncated') else '0',
             'models': ' / '.join(str(m) for m in models)[:200],
             'consistency': json.dumps(consistency, ensure_ascii=False) if consistency else None,
+            'run_warnings': json.dumps(warnings, ensure_ascii=False) if warnings else None,
             'finish_time': datetime.now(),
         }
         try:
@@ -1857,6 +1873,12 @@ class ChecklistReviewService:
         已经有内容的条目一律跳过。导入那一刻草稿是全新的、框都是空的，这道判断是为
         「同一份草稿被重复导入」之类的意外兜底 —— 覆盖用户已有的字是不能接受的。
 
+        ## 只用「判了有、且引文在原文里找到了」的判定
+
+        行号是 worker 拿引文去原文里查出来的（模型不报行号）。「未报告」本来就没有该填的原文；
+        引文没找到（`located` 不是 yes/partial）的判定没有可信的位置。这两类要是带着行号，
+        填进去的就是一段不相干的原文 —— 第二步看起来像「已经写了」，第三步复查还可能被判成已报告。
+
         :param query_db: orm对象
         :param run: 运行态快照
         :param rows: 已落库的逐条判定
@@ -1874,6 +1896,8 @@ class ChecklistReviewService:
         for r in rows:
             item_id = int(r['item_id'])
             if contents.get(item_id, '').strip():
+                continue
+            if r.get('status') == 'missing' or r.get('located') not in ('yes', 'partial'):
                 continue
             nums = [int(n) for n in str(r.get('lines') or '').split(',') if n.strip().isdigit()]
             text = '\n'.join(lines[n] for n in sorted(set(nums)) if n in lines)
@@ -1964,6 +1988,14 @@ class ChecklistReviewService:
                 # 存进去的是引擎给的 JSON，解不动说明这一行坏了。整份详情不该因此打不开，
                 # 一致性那一段空着就是了（前台本来就按「worker 没跑这段」处理）
                 logger.warning(f'校验记录 {record.review_id} 的一致性结果解析失败')
+        warnings: list[str] = []
+        if record.run_warnings:
+            try:
+                parsed = json.loads(record.run_warnings)
+                warnings = [str(e) for e in parsed] if isinstance(parsed, list) else []
+            except ValueError:
+                # 解不动也要让前台知道「有一部分没判成」—— 给一条占位，而不是当作没有
+                warnings = ['部分判定未完成']
 
         return ReportReviewModel(
             reviewId=record.review_id,
@@ -1986,6 +2018,7 @@ class ChecklistReviewService:
             truncated=(record.truncated or '0') == '1',
             manuscript=record.manuscript or '',
             consistency=consistency,
+            errors=warnings,
             verdicts=[
                 ReviewVerdictModel(
                     itemId=r.item_id,
@@ -1993,6 +2026,7 @@ class ChecklistReviewService:
                     reason=r.reason or '',
                     evidence=r.evidence or '',
                     lines=r.lines or '',
+                    located=r.evidence_located or '',
                 )
                 for r in rows
             ],
@@ -2186,12 +2220,12 @@ class StudyTypeService:
             await query_db.rollback()
             raise e
 
-        # 前台选项是写死的数组 + i18n 键，光入库还看不见 —— 这句话必须让操作者当场读到
+        # 前台第一步的选项直接来自本表（`GET /action/site/study-types`），入库即生效，
+        # 不再需要开发同步任何前端常量。剩下的只有「访客要等官网那次重取」这一条时效说明
         return CrudResponseModel(
             is_success=True,
-            message=f'新增成功。注意：前台第一步的选项还需开发同步 '
-            f'`composables/wizardQuery.ts` 的 TYPE_OPTS 与文案键 assistant.typeOpt.{save.type_key}，'
-            f'否则这个类型在官网上选不出来',
+            message='新增成功。官网第一步的选项直接取自本表，访客刷新即可看到；'
+            '要让搜索引擎与分享卡片也看到，请到「站点文案管理」页点一次「重新生成官网」',
         )
 
     @classmethod
@@ -2241,11 +2275,11 @@ class StudyTypeService:
             raise e
 
         if save.type_key != old_key:
-            # 改键 = 前台那个选项的文案退化成键名本身，且老键的 i18n 词条成了孤儿
+            # 标识进 URL（`/assistant?type=<key>`），改了之后老链接就还原不到这一项了
             return CrudResponseModel(
                 is_success=True,
                 message=f'更新成功。注意：类型标识由 {old_key} 改为 {save.type_key}，'
-                f'前台的 TYPE_OPTS 与文案键 assistant.typeOpt.* 需同步改，否则该选项会显示成键名',
+                f'带着 ?type={old_key} 的旧链接将无法还原到这个选项',
             )
 
         return CrudResponseModel(is_success=True, message='更新成功')
@@ -2266,10 +2300,7 @@ class StudyTypeService:
             await StudyTypeDao.delete_study_types_dao(query_db, id_list)
             await query_db.commit()
 
-            return CrudResponseModel(
-                is_success=True,
-                message='删除成功。若前台 TYPE_OPTS 里还留着这个标识，那个选项会匹配不到规范，请一并清理',
-            )
+            return CrudResponseModel(is_success=True, message='删除成功，官网第一步的选项会同步减少')
         except Exception as e:
             await query_db.rollback()
             raise e
@@ -3916,6 +3947,7 @@ class ReportReviewService:
                     reason=r.reason or '',
                     evidence=r.evidence or '',
                     lines=r.lines or '',
+                    located=r.evidence_located or '',
                 )
                 for r in rows
             ],
@@ -4247,3 +4279,707 @@ class ReportTrailService:
             note=row.note or '',
             createTime=row.create_time,
         )
+
+class LiteratureService:
+    """
+    针灸文献知识库服务层
+
+    **这张表的记录是机器从 PDF 抽取的产物，不是人工录入的**（`tools/lit_ingest.py`）。
+    后台页面的主要工作是「复核与修正」而非「新增」——一条记录必须对应一个真实的 PDF
+    文件（`corpus_no` 唯一约束是这条纪律的落点），手工凭空建一条会得到一份没有原文
+    可核的元数据。所以这里**只开编辑，不开新增**。
+
+    删除是逻辑删（`del_flag='2'`），但**全文物理删**：正文脱离元数据没有用途，
+    留着只占空间。同 `action_report_review` 那边「删除时真删正文、留下台账」的取舍。
+    """
+
+    #: 列表接口刻意省掉的重字段。一页 20 条摘要就是几万字没人看的文本，
+    #: 而列表页一个字都用不上。详情接口才给全。同 `PublicationService._LIST_OMIT`
+    _LIST_OMIT = ('abstract', 'findingSummary', 'yearEvidence', 'population', 'extractError')
+    #: 库里存 JSON 文本、出参是数组的列。转换收在本层，DAO 与控制器都不认识这件事。
+    #: 两份键名不是重复：DAO 出参已经过 `CamelCaseUtil`，是驼峰；
+    #: 而 `model_dump()` 出来的是下划线，写库走的是后者
+    _JSON_CAMEL = (
+        'authors', 'condition', 'conditionNorm', 'conditionGroup', 'intervention',
+        'comparator', 'outcomes', 'tcmSyndrome', 'acuPoints', 'acuMeridian', 'intruders',
+    )
+    _JSON_SNAKE = (
+        'authors', 'condition', 'condition_norm', 'condition_group', 'intervention',
+        'comparator', 'outcomes', 'tcm_syndrome', 'acu_points', 'acu_meridian', 'intruders',
+    )
+
+    @classmethod
+    def _load_json(cls, raw: Any) -> list[Any]:
+        """
+        库里的 JSON 文本 → 列表
+
+        坏数据不抛异常：这几列人可以直接改库，一条脏数据不该让整页列表 500。
+
+        :param raw: 库里的值
+        :return: 列表，解析不了时为空
+        """
+        if isinstance(raw, list):
+            return raw
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            return []
+
+        return parsed if isinstance(parsed, list) else []
+
+    @classmethod
+    def _decode(cls, row: dict[str, Any]) -> dict[str, Any]:
+        """
+        一行出参：把 11 个 JSON 列换成数组
+
+        :param row: DAO 出参（已是驼峰键的字典）
+        :return: 可直接进 LiteratureModel 的字典
+        """
+        for key in cls._JSON_CAMEL:
+            row[key] = cls._load_json(row.get(key))
+
+        return row
+
+    @classmethod
+    def _encode(cls, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        一行入参：把数组转成库里的 JSON 文本
+
+        **必须守住 `exclude_unset`**（由调用方保证）：无脑把没传的字段写成 `[]`，
+        会把「这次只想改标题」变成「顺手清空了作者和病种」。
+        `ensure_ascii=False` 同 `PublicationService._dump_json` —— 存成 `\\u9488`
+        的话中文关键词一条都搜不到。
+
+        :param payload: `model_dump(exclude_unset=True)` 的产物
+        :return: 可直接写库的字段字典
+        """
+        for key in cls._JSON_SNAKE:
+            if key in payload and isinstance(payload[key], list):
+                payload[key] = json.dumps(payload[key] or [], ensure_ascii=False)
+
+        return payload
+
+    @classmethod
+    async def get_literature_list_services(
+        cls,
+        query_db: AsyncSession,
+        query_object: LiteraturePageQueryModel,
+        is_page: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        获取文献列表
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :return: 文献列表
+        """
+        result = await LiteratureDao.get_literature_list(query_db, query_object, is_page)
+        rows = result.rows if isinstance(result, PageModel) else result
+        for row in rows:
+            cls._decode(row)
+            for omit in cls._LIST_OMIT:
+                row.pop(omit, None)
+
+        return result
+
+    @classmethod
+    async def literature_detail_services(cls, query_db: AsyncSession, lit_id: int) -> LiteratureModel:
+        """
+        获取文献详情
+
+        :param query_db: orm对象
+        :param lit_id: 文献id
+        :return: 文献详情
+        """
+        literature = await LiteratureDao.get_literature_detail_by_id(query_db, lit_id)
+        if not literature:
+            raise ServiceException(message='文献不存在')
+
+        return LiteratureModel(**cls._decode(CamelCaseUtil.transform_result(literature)))
+
+    @classmethod
+    async def literature_text_services(cls, query_db: AsyncSession, lit_id: int) -> LiteratureTextModel:
+        """
+        获取文献全文
+
+        **单独一个接口**，不并进详情：单篇正文中位 1.8 万字符，只有点开「查看原文」
+        时才需要，跟着详情一起返回等于每次打开编辑框都白传一遍。
+
+        :param query_db: orm对象
+        :param lit_id: 文献id
+        :return: 全文
+        """
+        if not await LiteratureDao.get_literature_detail_by_id(query_db, lit_id):
+            raise ServiceException(message='文献不存在')
+        text = await LiteratureDao.get_literature_text(query_db, lit_id)
+        if not text:
+            raise ServiceException(message='该文献没有存全文')
+
+        return LiteratureTextModel(**CamelCaseUtil.transform_result(text))
+
+    #: 参与向量计算的字段（与 `tools/lit_vector.embed_text` 严格对应，改那边要同步改这里）。
+    #: 这几项一旦被人工改动，库里那条向量就过期了 —— 而**过期的表现是「这篇检索排位
+    #: 莫名其妙」，没有任何报错**，不主动标记就永远发现不了。
+    _EMBED_FIELDS = frozenset({
+        'title', 'condition', 'condition_group', 'intervention', 'outcomes',
+        'abstract', 'finding_summary',
+    })
+
+    @classmethod
+    async def edit_literature_services(
+        cls, query_db: AsyncSession, page_object: LiteratureModel
+    ) -> CrudResponseModel:
+        """
+        编辑文献
+
+        `corpus_no` / `file_name` / `extract_*` **不接受修改**：前者是与 PDF 文件的
+        对应关系（改了就再也核不回原文），后者是抽取审计信息（人工改了就不再是审计）。
+
+        改到参与向量计算的字段时，**只把 `embed_hash` 置空、不当场重算**，
+        由定时任务 `module_task.literature_task.refresh_stale_embeddings` 补算。
+        取舍：这个库是低频更新的，一条文献晚几分钟进检索没有实际影响；而
+        「因为一个外部 embedding 端点不通，导致管理员改不了文献」是明显更糟的失败模式。
+        保存必须永远快、永远不失败。
+
+        :param query_db: orm对象
+        :param page_object: 文献对象
+        :return: 编辑结果
+        """
+        if not page_object.lit_id:
+            raise ServiceException(message='修改失败，未指定文献')
+        if not await LiteratureDao.get_literature_detail_by_id(query_db, page_object.lit_id):
+            raise ServiceException(message='文献不存在')
+        payload = page_object.model_dump(
+            exclude_unset=True,
+            exclude={'corpus_no', 'file_name', 'extract_model', 'extract_status', 'extract_error',
+                     'extract_time', 'pages', 'text_chars', 'contam_kind', 'clean_status',
+                     'clean_ratio', 'review_time', 'review_by', 'create_by', 'create_time',
+                     'embed_hash', 'embed_model', 'embed_dim'},
+        )
+        stale = bool(cls._EMBED_FIELDS & payload.keys())
+        if stale:
+            # 置空即「已过期」。不写 None 写空串：`embed_hash` 有 default ''，
+            # 两种空值混在库里会让补算脚本的 `<> hash` 判断出现 NULL 三值逻辑的坑
+            payload['embed_hash'] = ''
+        try:
+            await LiteratureDao.edit_literature_dao(query_db, cls._encode(payload))
+            await query_db.commit()
+
+            return CrudResponseModel(
+                is_success=True,
+                message='更新成功，检索向量将在下次定时补算时更新' if stale else '更新成功',
+            )
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def review_literature_services(
+        cls, query_db: AsyncSession, review: LiteratureReviewModel, operator: str
+    ) -> CrudResponseModel:
+        """
+        批量置复核状态
+
+        `rejected` 的记录同时停用（`status='1'`）：判为剔除却还留在检索池里，
+        等于复核没有生效 —— 而这类记录恰恰是元数据张冠李戴的那批（如目录标题
+        与 PDF 内容完全不符的 #414-#420），留在池里会产出「引文与数据对不上号」
+        的事故。反过来，从 rejected 改回 ok 时要把它放回池子。
+
+        :param query_db: orm对象
+        :param review: 复核参数
+        :param operator: 操作人
+        :return: 复核结果
+        """
+        lit_ids = [int(x) for x in review.lit_ids.split(',') if x.strip().isdigit()]
+        if not lit_ids:
+            raise ServiceException(message='未选择文献')
+        payload: dict[str, Any] = {
+            'review_status': review.review_status,
+            'review_by': operator,
+            'review_time': datetime.now(),
+            'update_by': operator,
+            'update_time': datetime.now(),
+        }
+        if review.review_status == 'rejected':
+            payload['status'] = '1'
+        elif review.review_status in ('ok', 'fixed'):
+            payload['status'] = '0'
+        if review.remark is not None:
+            payload['remark'] = review.remark
+        try:
+            await LiteratureDao.review_literature_dao(query_db, lit_ids, payload)
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message=f'已标记 {len(lit_ids)} 条')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def delete_literature_services(
+        cls, query_db: AsyncSession, lit_ids: str, operator: str
+    ) -> CrudResponseModel:
+        """
+        逻辑删除文献，同时物理删除全文
+
+        :param query_db: orm对象
+        :param lit_ids: 文献id串
+        :param operator: 操作人
+        :return: 删除结果
+        """
+        ids = [int(x) for x in lit_ids.split(',') if x.strip().isdigit()]
+        if not ids:
+            raise ServiceException(message='传入文献id为空')
+        try:
+            await LiteratureDao.soft_delete_literature_dao(
+                query_db, ids, {'del_flag': '2', 'update_by': operator, 'update_time': datetime.now()}
+            )
+            await query_db.commit()
+
+            return CrudResponseModel(is_success=True, message='删除成功')
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+    @classmethod
+    async def condition_group_services(cls, query_db: AsyncSession) -> list[dict[str, Any]]:
+        """
+        获取病种上位类目词表（筛选下拉用）
+
+        :param query_db: orm对象
+        :return: [{name, hits}]
+        """
+        rows = await LiteratureDao.get_condition_groups(query_db)
+
+        return [{'name': name, 'hits': int(hits or 0)} for name, hits in rows if name]
+
+    @classmethod
+    async def stats_services(cls, query_db: AsyncSession) -> LiteratureStatsModel:
+        """
+        语料统计。后台顶部概览卡片 + 语料构成披露的数据源
+
+        :param query_db: orm对象
+        :return: 统计结果
+        """
+        data = await LiteratureDao.get_stats(query_db)
+        groups = await cls.condition_group_services(query_db)
+        data['groups'] = [{'name': g['name'], 'value': g['hits']} for g in groups[:12]]
+
+        return LiteratureStatsModel(**data)
+
+@dataclass(frozen=True)
+class _BgRun:
+    """
+    一次背景生成的运行态快照（普通值，不是 ORM 对象）
+
+    同 `_ReviewRun` / `_SrdRun`：投递 → 轮询 → 落库要连着提交好几次事务，而会话是
+    `expire_on_commit=True`，commit 之后读任何 ORM 属性都会触发懒加载，
+    在 async 会话里直接抛 `MissingGreenlet`。**踩过一次**：`submit_review_services`
+    曾在 commit 之后才去取 `guideline.code` 拼入队 payload，表现是
+    「历史里多了一条 pending，页面却报错」。
+    """
+
+    run_id: int
+    session_id: str
+    user_id: int
+    topic: str
+    run_status: str
+    progress: int
+    phase: str
+    error_msg: str
+
+
+class BackgroundGenService:
+    """
+    背景与讨论智能生成服务层（报告助手第四步的第四个工具）
+
+    算法由 `tools/background_worker_tool` 常驻 worker 干：后端把研究方向 rpush 进
+    Redis 队列，worker 检索 `action_literature`、调模型、写状态。两个进程互不依赖。
+
+    ## 为什么不复用 `/report-assist`
+
+    另外三个工具（续写/润色/翻译）是**秒级**单次模型调用，`ai_assist_service` 那条
+    同步路 45 秒超时够用。这一个是 PICO + 4 槽检索 + 4 槽写作 + 引证核验，
+    实测**约 5 分钟**，同步跑必然超时。
+
+    ## 落库在轮询里做，不在 worker 里
+
+    同 `SrdService` / `ChecklistReviewService`：worker 只认 Redis 不认业务库，
+    让它写业务表就是把两个系统焊死。代价是「用户关掉页面就没人来落库」，
+    由 `list_history_services` 顺带对账兜底。
+    """
+
+    #: 一个访客最多留几条历史。每行挂着一整份结果快照
+    KEEP_HISTORY = 20
+    HISTORY_LIMIT = 20
+    #: 同时在跑的上限。一次生成 ≈ 9 次模型调用 + 若干次 embedding，跑满 5 分钟，
+    #: 不设闸等于把账单交给公网
+    MAX_RUNNING_PER_USER = 1
+
+    @classmethod
+    def _client(cls) -> Any:
+        """延迟导入 worker 配置：tools 包依赖 redis 等库，不该拖累未用到该功能的进程启动。"""
+        from tools.background_worker_tool.config.worker_config import CONFIG  # noqa: PLC0415
+        from tools.common.task_client import TaskClient  # noqa: PLC0415
+
+        return TaskClient(CONFIG)
+
+    @classmethod
+    def _snapshot(cls, record: ActionBackgroundRun) -> _BgRun:
+        """把这条链路要用的几个字段抄成普通值（理由见 `_BgRun`）"""
+        return _BgRun(
+            run_id=int(record.run_id),
+            session_id=str(record.session_id),
+            user_id=int(record.user_id),
+            topic=str(record.topic or ''),
+            run_status=str(record.run_status or 'pending'),
+            progress=int(record.progress or 0),
+            phase=str(record.phase or ''),
+            error_msg=str(record.error_msg or ''),
+        )
+
+    @classmethod
+    async def _reconcile_pending(cls, query_db: AsyncSession, user_id: int) -> int:
+        """
+        对账：把未终结记录的状态补查一次，返回真正还在跑的条数。
+
+        **并发闸数的是 pending/running 的行，而那种行未必真在跑** —— 入队失败、
+        worker 崩了、Redis 状态过了 TTL 都会留下永远等不到终态的孤儿，照样占着名额。
+        只数不对账的话一个孤儿就把账号**永久**锁死，而用户只看得到一句
+        「你已有 1 个生成在进行中」且怎么等都不消失。
+
+        :param query_db: orm对象
+        :param user_id: 访客id
+        :return: 对账后仍在跑的条数
+        """
+        rows = await BackgroundRunDao.list_pending_dao(query_db, user_id)
+        # 快照要在发起任何 Redis 往返之前取完：下面每同步一条就 commit 一次，
+        # 而 commit 会让还没读过的 ORM 行过期，再读属性就是 MissingGreenlet
+        runs = [cls._snapshot(r) for r in rows]
+        if not runs:
+            return 0
+
+        states: dict[str, dict[str, Any] | None] = {}
+        try:
+            # 一次连接查完所有未终结任务：每条各开一个 TaskClient 会把对账变成 N 次建连
+            async with cls._client() as client:
+                for run in runs:
+                    try:
+                        states[run.session_id] = await client.status(run.session_id)
+                    except Exception:  # noqa: BLE001, PERF203
+                        # **查不动 ≠ 查到「没有」**：只有确实返回 None 才算孤儿。
+                        # 不留这个位就会把一次网络抖动写成「任务状态已丢失」，
+                        # 而 worker 那边照跑不误，用户看到的是任务凭空失败
+                        pass
+        except Exception:  # noqa: BLE001
+            # Redis 整个连不上：这次对账放弃，按库里的状态算（宁可暂时占着名额，
+            # 也不能因为一次故障把用户还在跑的任务全标成失败）
+            return len(runs)
+
+        alive = 0
+        for run in runs:
+            if run.session_id not in states:
+                alive += 1
+                continue
+            state = states[run.session_id]
+            if not state:
+                # Redis 里查无此任务：入队失败或状态已过期。标失败而不是继续挂着
+                await cls._mark_failed(query_db, run, '任务状态已丢失（worker 未处理或状态已过期）')
+                continue
+            updated = await cls._sync_run(query_db, run, state)
+            if updated.run_status in ('pending', 'running'):
+                alive += 1
+
+        return alive
+
+    @classmethod
+    async def submit_services(
+        cls, query_db: AsyncSession, submit: BackgroundSubmitModel, user_id: int
+    ) -> BackgroundSubmitResultModel:
+        """
+        提交一次背景生成
+
+        :param query_db: orm对象
+        :param submit: 提交参数
+        :param user_id: 访客id
+        :return: 任务id
+        """
+        running = await BackgroundRunDao.count_running_dao(query_db, user_id)
+        if running >= cls.MAX_RUNNING_PER_USER:
+            # 撞上限时先对账再判 —— 孤儿记录不该把账号锁死
+            running = await cls._reconcile_pending(query_db, user_id)
+        if running >= cls.MAX_RUNNING_PER_USER:
+            raise ServiceException(message=f'你已有 {running} 个生成任务在进行中，请等它跑完再提交')
+
+        topic = submit.topic.strip()
+        session_id = uuid.uuid4().hex
+        record = ActionBackgroundRun(
+            user_id=user_id,
+            session_id=session_id,
+            topic=topic,
+            guideline_code=submit.guideline_code or '',
+            locale=submit.locale,
+            condition_group=submit.condition_group or '',
+            run_status='pending',
+            progress=0,
+            phase='pico',
+            del_flag='0',
+            create_time=datetime.now(),
+        )
+        try:
+            await BackgroundRunDao.add_run_dao(query_db, record)
+            # flush 之后主键才有值，而 commit 之后就读不到了（expire_on_commit）
+            run_id = record.run_id
+            await BackgroundRunDao.trim_user_runs_dao(query_db, user_id, cls.KEEP_HISTORY)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        payload = {
+            'topic': topic,
+            'locale': submit.locale,
+            'condition_group': submit.condition_group or '',
+            'guideline_code': submit.guideline_code or '',
+            'user_id': user_id,
+        }
+        try:
+            async with cls._client() as client:
+                await client.submit(payload, session_id=session_id)
+        except Exception as e:
+            # 台账留着并标记失败：用户在历史里看得见「这次没提交上去」，运维也查得到。
+            # 静默回滚等于把这次故障抹掉
+            with contextlib.suppress(Exception):
+                await BackgroundRunDao.edit_run_dao(
+                    query_db, run_id,
+                    {'run_status': 'failed', 'error_msg': f'任务入队失败：{type(e).__name__}'[:500],
+                     'finish_time': datetime.now()},
+                )
+                await query_db.commit()
+            raise ServiceException(message='任务提交失败，请稍后再试') from e
+
+        return BackgroundSubmitResultModel(run_id=run_id, session_id=session_id)
+
+    @classmethod
+    async def _commit_values(cls, query_db: AsyncSession, run: _BgRun, values: dict[str, Any]) -> _BgRun:
+        """更新记录并返回改过的快照"""
+        try:
+            await BackgroundRunDao.edit_run_dao(query_db, run.run_id, values)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return replace(
+            run,
+            run_status=str(values.get('run_status', run.run_status)),
+            progress=int(values.get('progress', run.progress)),
+            phase=str(values.get('phase', run.phase)),
+            error_msg=str(values.get('error_msg', run.error_msg)),
+        )
+
+    @classmethod
+    async def _mark_failed(cls, query_db: AsyncSession, run: _BgRun, error: str) -> _BgRun:
+        """标记失败"""
+        return await cls._commit_values(
+            query_db, run,
+            {'run_status': 'failed', 'error_msg': error[:500], 'finish_time': datetime.now()},
+        )
+
+    @classmethod
+    async def _sync_run(cls, query_db: AsyncSession, run: _BgRun, state: dict[str, Any]) -> _BgRun:
+        """
+        把 worker 的状态同步进库；首次看到 completed 时把结果写进来。
+
+        已经是 completed 的记录直接跳过 —— 前端会一直轮询到拿着结果离开页面，
+        没有这道闸就会每 2 秒重写一次几千字的结果。
+        """
+        if run.run_status == 'completed':
+            return run
+
+        status = str(state.get('status') or 'pending')
+        current = int(state.get('progress_current') or 0)
+        total = int(state.get('progress_total') or 100) or 100
+        progress = min(100, round(current / total * 100))
+        phase = str(state.get('stage') or run.phase or '')
+
+        if status == 'completed':
+            result = state.get('result') if isinstance(state.get('result'), dict) else {}
+
+            return await cls._persist_result(query_db, run, result or {})
+
+        values: dict[str, Any] = {'run_status': status, 'progress': progress, 'phase': phase}
+        if status in ('failed', 'stopped'):
+            values['error_msg'] = (
+                str(state.get('error') or '') or ('已停止' if status == 'stopped' else '生成失败')
+            )[:500]
+            values['finish_time'] = datetime.now()
+
+        return await cls._commit_values(query_db, run, values)
+
+    @classmethod
+    async def _persist_result(cls, query_db: AsyncSession, run: _BgRun, result: dict[str, Any]) -> _BgRun:
+        """
+        把 worker 的结果写进业务表。
+
+        **`corpus_snapshot` 单独存一列**：语料构成（「阴性 0 篇」那组数字）是这次生成的
+        证据基础，而文献库会持续补录 —— 三个月后回看时现算会得到与当时不同的数字，
+        而用户当初正是基于那组数字判断该不该信这段背景的。
+        """
+        slots = result.get('slots') if isinstance(result.get('slots'), list) else []
+        refs = result.get('refs') if isinstance(result.get('refs'), list) else []
+        verdicts = result.get('verdicts') if isinstance(result.get('verdicts'), list) else []
+        corpus = result.get('corpus') if isinstance(result.get('corpus'), dict) else {}
+        values = {
+            'run_status': 'completed',
+            'progress': 100,
+            'phase': 'done',
+            'error_msg': '',
+            'condition_group': str(result.get('group') or '')[:200],
+            'slot_total': len(slots),
+            'slot_blocked': sum(1 for s in slots if s.get('blocked')),
+            'ref_count': len(refs),
+            'partial_count': len(verdicts),
+            'retrieve_mode': str(result.get('retrieveMode') or '')[:30],
+            'model_label': str(result.get('model') or '')[:200],
+            'result_json': json.dumps(result, ensure_ascii=False),
+            'corpus_snapshot': json.dumps(corpus, ensure_ascii=False),
+            'finish_time': datetime.now(),
+        }
+
+        return await cls._commit_values(query_db, run, values)
+
+    @classmethod
+    def _to_state(cls, record: ActionBackgroundRun, with_result: bool) -> BackgroundStateModel:
+        """ORM 记录 → 出参。`with_result` 为假时不带结果（轮询中途没必要反复传几千字）"""
+        result = None
+        if with_result and record.result_json:
+            try:
+                result = json.loads(record.result_json)
+            except (json.JSONDecodeError, TypeError):
+                result = None
+
+        return BackgroundStateModel(
+            run_id=int(record.run_id), session_id=str(record.session_id), topic=str(record.topic or ''),
+            run_status=str(record.run_status or 'pending'), progress=int(record.progress or 0),
+            phase=str(record.phase or ''), error_msg=str(record.error_msg or ''),
+            retrieve_mode=str(record.retrieve_mode or ''), model_label=str(record.model_label or ''),
+            slot_total=int(record.slot_total or 0), slot_blocked=int(record.slot_blocked or 0),
+            ref_count=int(record.ref_count or 0), partial_count=int(record.partial_count or 0),
+            create_time=record.create_time, finish_time=record.finish_time, result=result,
+        )
+
+    @classmethod
+    async def poll_services(cls, query_db: AsyncSession, session_id: str, user_id: int) -> BackgroundStateModel:
+        """
+        轮询一次任务状态；终态那一刻顺带落库
+
+        :param query_db: orm对象
+        :param session_id: worker 任务id
+        :param user_id: 访客id
+        :return: 状态与结果
+        """
+        record = await BackgroundRunDao.get_run_by_session(query_db, session_id, user_id)
+        if not record:
+            raise ServiceException(message='任务不存在')
+        run = cls._snapshot(record)
+
+        if run.run_status not in ('completed', 'failed', 'stopped'):
+            try:
+                async with cls._client() as client:
+                    state = await client.status(session_id)
+            except Exception:  # noqa: BLE001
+                state = None
+            if state:
+                await cls._sync_run(query_db, run, state)
+            # 记录已被上面的 commit 置为过期，重新查一次拿最新值
+            record = await BackgroundRunDao.get_run_by_session(query_db, session_id, user_id)
+            if not record:
+                raise ServiceException(message='任务不存在')
+
+        return cls._to_state(record, with_result=str(record.run_status) == 'completed')
+
+    @classmethod
+    async def detail_services(cls, query_db: AsyncSession, run_id: int, user_id: int) -> BackgroundStateModel:
+        """
+        按记录id 取历史详情（含完整结果）
+
+        :param query_db: orm对象
+        :param run_id: 任务记录id
+        :param user_id: 访客id
+        :return: 状态与结果
+        """
+        record = await BackgroundRunDao.get_run_by_id(query_db, run_id, user_id)
+        if not record:
+            raise ServiceException(message='记录不存在')
+
+        return cls._to_state(record, with_result=True)
+
+    @classmethod
+    async def list_history_services(cls, query_db: AsyncSession, user_id: int) -> list[BackgroundHistoryModel]:
+        """
+        历史列表，顺带对账。
+
+        对账放在这里而不是另开一个口：用户关掉页面后没人再轮询，那条记录会永远停在
+        pending。回到页面时列表一定会被拉一次，正好是补查状态的时机。
+
+        :param query_db: orm对象
+        :param user_id: 访客id
+        :return: 历史列表
+        """
+        with contextlib.suppress(Exception):
+            await cls._reconcile_pending(query_db, user_id)
+        rows = await BackgroundRunDao.list_history_dao(query_db, user_id, cls.HISTORY_LIMIT)
+
+        return [BackgroundHistoryModel(**CamelCaseUtil.transform_result(row)) for row in rows]
+
+    @classmethod
+    async def delete_services(cls, query_db: AsyncSession, run_id: int, user_id: int) -> CrudResponseModel:
+        """
+        删除一条记录。**同时物理清空研究方向与结果** —— 用户点删除期待的是
+        「那次生成没了」，不是「列表里看不见了」
+
+        :param query_db: orm对象
+        :param run_id: 任务记录id
+        :param user_id: 访客id
+        :return: 删除结果
+        """
+        if not await BackgroundRunDao.get_run_by_id(query_db, run_id, user_id):
+            raise ServiceException(message='记录不存在')
+        try:
+            await BackgroundRunDao.soft_delete_run_dao(query_db, run_id, user_id)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return CrudResponseModel(is_success=True, message='删除成功')
+
+    @classmethod
+    async def stop_services(cls, query_db: AsyncSession, session_id: str, user_id: int) -> CrudResponseModel:
+        """
+        请求停止。**停止是异步的** —— worker 在下一个检查点才会真正退出，
+        所以这里只发信号并把库里标为 stopped，不假装已经停了
+
+        :param query_db: orm对象
+        :param session_id: worker 任务id
+        :param user_id: 访客id
+        :return: 结果
+        """
+        record = await BackgroundRunDao.get_run_by_session(query_db, session_id, user_id)
+        if not record:
+            raise ServiceException(message='任务不存在')
+        run = cls._snapshot(record)
+        if run.run_status in ('completed', 'failed', 'stopped'):
+            return CrudResponseModel(is_success=True, message='任务已结束')
+        with contextlib.suppress(Exception):
+            async with cls._client() as client:
+                await client.stop(session_id)
+        await cls._commit_values(
+            query_db, run, {'run_status': 'stopped', 'error_msg': '已停止', 'finish_time': datetime.now()}
+        )
+
+        return CrudResponseModel(is_success=True, message='已请求停止')

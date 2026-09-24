@@ -66,6 +66,8 @@ def load_pool_from_db(timeout: float) -> list[ModelConfig]:
             provider=m.provider, model=m.model_code, api_key=m.api_key, base_url=m.base_url,
             temperature=float(m.temperature) if m.temperature is not None else 0.0,
             max_tokens=m.max_tokens, ref=m.ref, timeout=timeout,
+            # 与 worker 一致：结构化方式按库里那列、「支持推理」=否就关思考
+            structured_method=m.structured_method, extra=m.chat_extra,
         )
         for m in models
     ]
@@ -230,7 +232,7 @@ def main(argv: list[str]) -> int:
         'model': pool[0].model if isinstance(pool, list) else pool.model,
         'model_pool': [c.label for c in pool] if isinstance(pool, list) else [pool.label],
         'engine_config': {
-            'extract_scope': cfg.extract_scope, 'granularity': cfg.judge_granularity,
+            'granularity': cfg.judge_granularity,
             'max_concurrency': cfg.max_concurrency, 'timeout': timeout, 'freeze_seconds': FREEZE_SECONDS, 'max_rounds': MAX_ROUNDS,
         },
         'pair_count': len(summaries),

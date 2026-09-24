@@ -40,6 +40,7 @@ import httpx
 from exceptions.exception import ServiceException
 from module_action.service.report_assist_prompt import AssistContext, build_messages
 from module_ai.service.ai_model_service import AiModelService
+from utils.llm_thinking_util import thinking_off_params
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -126,11 +127,12 @@ class AiAssistService:
             # **产出的 JSON 一字不差**。而且思维链正是当初撞截断的元凶 ——
             # 它先吃掉大半额度，正文写到一半就没了。
             #
-            # `thinking` 是火山方舟 / DeepSeek 系的开关。厂商不认这个字段时会 400，
+            # 各厂商的开关不同名（火山方舟/DeepSeek 是 `thinking`，百炼 qwen 是 `enable_thinking`），
+            # 按端点挑，见 `utils/llm_thinking_util`。仍有厂商不认时会 400，
             # 那时模型池会自动切下一个（`complete` 的 HTTPStatusError 分支）——
             # 池子里只有那一个不认识它的模型时才会真的失败，届时把这个模型的
             # 「支持推理」改成是即可绕开
-            body['thinking'] = {'type': 'disabled'}
+            body.update(thinking_off_params(model.provider, model.base_url, model.model_code))
         if max_tokens is not None:
             # 「AI模型管理」里那一栏「最大输出」会把调用方要的额度再压低一道。
             # 输出长度不确定的任务（PDF 元数据抽取）就别下发这个参数 —— 截断的表现是

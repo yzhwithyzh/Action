@@ -1,0 +1,167 @@
+﻿========================================================================================
+研究方向：针刺治疗慢性失眠的疗效与安全性
+知识库：566 篇
+========================================================================================
+
+【1】研究问题解析（PICO）
+   population   慢性失眠成人患者
+   condition    慢性失眠 / 失眠障碍 / 慢性失眠障碍 / 原发性失眠
+   intervention 针刺 / 电针 / 毫针针刺 / 体针
+   comparator   假针刺 / 安慰针 / 药物治疗 / 常规护理 / 等待治疗
+   outcomes     睡眠质量 / 入睡潜伏期 / 总睡眠时间 / 睡眠效率 / 失眠严重程度 / 不良事件
+
+   病种类目：失眠 → 该类目 38 篇　|　全库可用 546 篇（已排除 protocol 20 篇）
+
+【2-3】逐槽位检索 + 覆盖度闸
+
+   [S1] 疾病负担与临床重要性　查询「慢性失眠 流行病学 疾病负担」
+        最高相关度 0.747 · 符合证据类型 0 篇 → ✗ 不生成，如实报告覆盖不足
+          0.747  #330  2022  rct   positive      Randomized Controlled Trial on Effect and Sa
+          0.742  #384  2023  rct   positive      Effect of Wu Binghuang's Shallow Acupuncture
+          0.741  #265  2021  rct   positive      The effect of acupuncture on the excessive a
+          0.734  #386  2023  rct   positive      Clinical effect of acupuncture based on synd
+
+   [S2] 现有疗法及其局限　查询「慢性失眠 常规治疗 疗效有限 不良反应」
+        最高相关度 0.842 · 符合证据类型 12 篇 → ✓ 生成
+          0.842  #255  2021  rct   positive      Effects of electroacupuncture on sleep quali
+          0.840  #330  2022  rct   positive      Randomized Controlled Trial on Effect and Sa
+          0.831  #386  2023  rct   positive      Clinical effect of acupuncture based on synd
+          0.824  #265  2021  rct   positive      The effect of acupuncture on the excessive a
+
+   [S3] 针刺/电针的既往证据　查询「针刺 慢性失眠 随机对照 疗效 安全性」
+        最高相关度 0.883 · 符合证据类型 12 篇 → ✓ 生成
+          0.883  #330  2022  rct   positive      Randomized Controlled Trial on Effect and Sa
+          0.848  #137  2018  rct   positive      A randomized controlled trial with acupunctu
+          0.840  #255  2021  rct   positive      Effects of electroacupuncture on sleep quali
+          0.803  #253  2021  rct   no_difference Effect of Tongdu Tiaoshen acupuncture on ser
+
+   [S4] 现有证据的不足（研究缺口）　查询「针刺失眠 证据质量 样本量不足 随访短」
+        最高相关度 0.616 · 符合证据类型 12 篇 → ✓ 生成
+          0.616  #46   2015  rct   no_difference Clinical Randomized Controlled Study of Usin
+          0.589  #357  2023  rct   positive      Effect of Electroacupuncture on the Treatmen
+          0.589  #484  2024  rct   positive      The Effect of Acupuncture by Liver-Soothing 
+          0.586  #44   2015  rct   positive      Acupuncture Treatment for VBI and Randomized
+
+【4】核心文献排序（0.65×相关 + 0.35×近期，当前年 2026）
+       总分     相关     近期  年份     设计         n 方向             标题
+    0.862  1.000  0.607  2024   rct      100 positive       #457 Acupuncture for reducing the south to re⚠截断⚠夹带
+    0.862  0.999  0.607  2024   rct       60 positive       #482 Clinical effect of the warm acupuncture ⚠截断⚠夹带
+    0.861  0.998  0.607  2024   rct       60 positive       #475 Effect of Filiform Needle Acupuncture on
+    0.860  0.997  0.607  2024   rct       86 no_difference  #370 Intervention effect of electroacupunctur⚠夹带
+    0.858  0.993  0.607  2024   rct      108 positive       #495 Acupuncture for residual sleep disturban
+    0.853  0.985  0.607  2024   rct       76 positive       #484 The Effect of Acupuncture by Liver-Sooth
+    0.815  1.000  0.472  2023   rct       60 positive       #384 Effect of Wu Binghuang's Shallow Acupunc
+    0.815  0.999  0.472  2023   rct       72 positive       #381 Bushen Anshen acupuncture for perimenopa
+    0.814  0.999  0.472  2023   rct      138 no_difference  #341 Acupuncture for chemotherapy-associated 
+    0.814  0.998  0.472  2023   rct       90 positive       #386 Clinical effect of acupuncture based on 
+    0.814  0.997  0.472  2023   rct       60 positive       #427 Effect of acupuncture combined with low ⚠截断⚠夹带
+    0.805  0.984  0.472  2023   rct       70 no_difference  #342 Acupuncture for comorbid depression and 
+    0.799  0.975  0.472  2023   rct       90 positive       #373 The effects of acupuncture on clinical E
+    0.778  0.999  0.368  2022   rct       84 positive       #330 Randomized Controlled Trial on Effect an⚠夹带
+
+【5】Evidence Table + 不一致检测（按病种类目内全部文献）
+
+   C1 针刺 vs 假针刺：21 篇 | {'positive': 19, 'no_difference': 2} | **INCONSISTENT**
+      #484  2024  n=76   positive       vs 假针刺
+      #341  2023  n=138  no_difference  vs 假针刺
+      #342  2023  n=70   no_difference  vs 假针刺
+      #373  2023  n=90   positive       vs 假针刺
+      #381  2023  n=72   positive       vs 假针刺
+      #427  2023  n=60   positive       vs 假针刺/揿针/低频重复经颅磁刺激
+      #317  2022  n=144  positive       vs 假针刺
+      #235  2021  n=60   positive       vs 假针刺
+      → 写作层强制 mixed-evidence 模板，不许只写阳性结论
+
+   C2 针刺 vs 阳性药/常规疗法：17 篇 | {'positive': 14, 'no_difference': 3} | **INCONSISTENT**
+      #495  2024  n=108  positive       vs 艾司唑仑
+      #475  2024  n=60   positive       vs 非效穴浅刺
+      #370  2024  n=86   no_difference  vs 低剂量唑吡坦/放松疗法
+      #457  2024  n=100  positive       vs 劳拉西泮
+      #482  2024  n=60   positive       vs 艾司唑仑
+      #384  2023  n=60   positive       vs 艾司唑仑
+      #386  2023  n=90   positive       vs 艾司唑仑
+      #288  2022  n=60   positive       vs 谷维素片
+      → 写作层强制 mixed-evidence 模板，不许只写阳性结论
+
+【6】逐槽位写作（模型只拿到编号表，共 12 条）
+
+【7】编号越界检查
+   [S2] 引用 9 条 · 越界 0 处 ✓
+   [S3] 引用 8 条 · 越界 0 处 ✓
+   [S4] 引用 1 条 · 越界 0 处 ✓
+
+【8】引证核验（每句 × 每条引文）
+   [S2] 判定 0 处：
+   [S3] 判定 16 处：partial 11 · supports 5
+        ⚠ [1] 既往随机对照研究提示，针刺及温针可能改善慢性失眠患者… → partial（仅支持睡眠改善，未涉及心理症状）
+        ⚠ [2] 既往随机对照研究提示，针刺及温针可能改善慢性失眠患者… → partial（支持睡眠改善，心理症状证据不足）
+        ⚠ [7] 既往随机对照研究提示，针刺及温针可能改善慢性失眠患者… → partial（仅支持睡眠改善，未涉及心理症状）
+        ⚠ [10] 既往随机对照研究提示，针刺及温针可能改善慢性失眠患者… → partial（支持睡眠改善，未涉及心理症状）
+        ⚠ [1] 与劳拉西泮、艾司唑仑等药物相比，部分研究显示针刺可进一步改善… → partial（支持PSQI和睡眠结构改善）
+        ⚠ [2] 与劳拉西泮、艾司唑仑等药物相比，部分研究显示针刺可进一步改善… → partial（未支持睡眠结构及心理评分）
+        ⚠ [5] 与劳拉西泮、艾司唑仑等药物相比，部分研究显示针刺可进一步改善… → partial（未报告睡眠结构改善）
+        ⚠ [7] 与劳拉西泮、艾司唑仑等药物相比，部分研究显示针刺可进一步改善… → partial（未支持焦虑抑郁，疗效差异不显著）
+        ⚠ [10] 与劳拉西泮、艾司唑仑等药物相比，部分研究显示针刺可进一步改善… → partial（未涉及ISI、睡眠结构及心理评分）
+        ⚠ [8] 与假针刺相比，现有研究报告针刺可改善PSQI、ISI、SAS及部分睡… → partial（未报告ISI和SAS改善）
+        ⚠ [6] 安全性方面，一项研究未见针刺相关不良反应，但现有证据对整体安全性的评… → partial（仅报告未见不良反应）
+   [S4] 判定 5 处：supports 3 · partial 2
+        ⚠ [2,3,11] 此外，疗程从3～8周不等，随访安排亦不统一；部分研究报告了治疗后随访… → partial（未涵盖8周，无法证实多数）
+        ⚠ [6] 安全性方面，现有研究中明确报告未见相关不良反应者有限… → partial（单篇不足证明报告者有限）
+
+========================================================================================
+研究背景初稿　|　针刺治疗慢性失眠的疗效与安全性
+========================================================================================
+
+【S1】疾病负担与临床重要性
+  ⛔ 未生成 —— 本库缺少「流行病学调查 / 系统综述 / 指南」类型的文献（候选 12 篇的设计分布：{'rct': 12}）
+     该段需引用本库之外的文献，请自行补充。
+
+【S2】现有疗法及其局限
+    现有慢性失眠研究中的常用对照治疗主要包括劳拉西泮、艾司唑仑、低剂量唑吡坦及放松疗法，但其临床疗效并不一致。与劳拉西泮或艾司唑仑相比，针刺在PSQI、睡眠效率、睡眠结构及焦虑抑郁等指标上表现出更明显的改善，部分研究中针刺组总有效率亦高于药物组[1][2][5][10]；然而，另有研究显示浅针与艾司唑仑在总有效率上的差异无统计学意义[7]。此外，针刺虽可改善失眠严重程度，但与低剂量唑吡坦或放松疗法相比，深睡眠时间、睡眠维持时间及唑吡坦用量等指标未见显著差异，提示现有药物或行为干预对部分核心睡眠结局的改善仍较有限[4]。非效穴浅刺对PSQI及焦虑、抑郁评分亦有一定改善，但总体效果低于规范针刺[3]；针刺相较假针刺虽可进一步改善PSQI、ISI及睡眠相关指标，但对照干预本身可能产生一定反应[6][8]。因此，现有疗法在疗效稳定性、睡眠结构改善及长期临床获益方面仍存在不足，有必要进一步评价针刺治疗慢性失眠的疗效与安全性[1][3][4][6]。
+
+【S3】针刺/电针的既往证据
+    既往随机对照研究提示，针刺及温针可能改善慢性失眠患者的睡眠与相关心理症状。与劳拉西泮、艾司唑仑等药物相比，部分研究显示针刺可进一步改善PSQI、ISI、睡眠结构及焦虑抑郁评分，部分研究的总有效率亦较高[1][2][5][7][10]；但另一项研究虽发现电针第14天和第28天ISI评分低于低剂量唑吡坦或放松疗法对照，深睡眠时间、睡眠维持时间及唑吡坦用量的组间差异并无统计学意义，提示与阳性药物或常规疗法对照的结论并不一致[4]。与假针刺相比，现有研究报告针刺可改善PSQI、ISI、SAS及部分睡眠指标，且部分研究观察到睡眠时间延长[6][8]；然而，不同研究的评价指标和研究方案存在差异，关于针刺相对于假针刺的稳定优势仍需进一步验证[6][8]。安全性方面，一项研究未见针刺相关不良反应，但现有证据对整体安全性的评价仍较有限[6]。
+
+【S4】现有证据的不足（研究缺口）
+    现有随机对照研究的样本量总体较小且不均衡，单项研究纳入60～108例，尚不足以充分评估针刺疗效的稳定性及安全性[1-8,11]。对照设置亦较为多样，包括劳拉西泮、艾司唑仑、低剂量唑吡坦联合放松疗法、非效穴浅刺、假针刺及多种治疗方式比较，导致不同研究间疗效结果的可比性受到限制[1-8,11]。干预方案同样存在明显异质性，涵盖毫针、温针、电针、浅针及揿针，取穴、留针时间、治疗次数和疗程均不一致，且部分电针参数未予报告[1-8,11]。此外，疗程从3～8周不等，随访安排亦不统一；部分研究报告了治疗后随访或12周结局，但多数结果主要限于疗程结束时评价，长期疗效及持续获益仍缺乏一致证据[2,3,11]。安全性方面，现有研究中明确报告未见相关不良反应者有限，仍需在更大样本、规范对照和较长期随访中进一步验证针刺治疗慢性失眠的安全性[6]。
+
+【S5】本研究目的
+    因此，本研究拟开展一项【待补充：设计类型】试验，以【待补充：对照措施】为对照，评价针刺治疗慢性失眠的疗效与安全性，主要结局为【待补充：主要结局指标】，随访【待补充：随访时长】。
+
+========================================================================================
+参考文献（由系统按被引编号从库中拼装，写作模型不参与）
+========================================================================================
+  [ 1] 刘义, 等. Acupuncture for reducing the south to reinforce the north on executive function and sleep structure in patients with chronic insomnia disorder of heart-kidney disharmony. 中国针灸. 2024.  ⚠正文截断  ⚠PDF含夹带
+  [ 2] 曹丽, 等. Clinical effect of the warm acupuncture of Mongolian medicine on insomnia in the elderly and its brain-gut peptide mechanism: a randomized controlled trial. 中国针灸. 2024.  ⚠正文截断  ⚠PDF含夹带
+  [ 3] 朱敬云, 等. Effect of Filiform Needle Acupuncture on Sleep Quality and Psychological State in Patients with Primary Insomnia: A Randomized Controlled Clinical Study. 中国实用医刊. 2024.
+  [ 4] Haixiao Zhang, 等. Intervention effect of electroacupuncture therapy on drug reducing and discontinuation of insomnia patients with long-term excessive use of zolpidem. EXPLORE. 2024.  ⚠PDF含夹带
+  [ 5] 付清楠, 等. Acupuncture for residual sleep disturbances in patients remitted from
+major depressive disorder: a randomized controlled clinical research. 北京中医药大学学报. 2024.
+  [ 6] 李晓峰, 等. The Effect of Acupuncture by Liver-Soothing and Mind-Regulating in FemalePatients with Liver-Qi Stagnation type of Insomnia: A Randomized Controlled Trial. 中国针灸学会年会论文集. 2024.
+  [ 7] 洪天生, 等. Effect of Wu Binghuang's Shallow Acupuncture in the Chronic Insomnia Patients: A Randomized Controlled Trial. 世界睡眠医学杂志. 2023.
+  [ 8] 杨文佳, 等. Bushen Anshen acupuncture for perimenopausal insomnia of kidney-yin deficiency: a randomized controlled trial. 中国针灸. 2023.
+  [10] 吴宝贤, 等. Clinical effect of acupuncture based on syndrome differentiation in the treatment of chronic insomnia and its influence on cognitive function. 中国针灸. 2023.
+
+========================================================================================
+推荐核心参考文献（近 3–5 年）
+========================================================================================
+  近5年：24 篇
+    · 2024  #457  n=100  positive       Acupuncture for reducing the south to reinforce the 
+    · 2024  #482  n=60   positive       Clinical effect of the warm acupuncture of Mongolian
+    · 2024  #475  n=60   positive       Effect of Filiform Needle Acupuncture on Sleep Quali
+    · 2024  #370  n=86   no_difference  Intervention effect of electroacupuncture therapy on
+    · 2024  #495  n=108  positive       Acupuncture for residual sleep disturbances in patie
+    · 2024  #484  n=76   positive       The Effect of Acupuncture by Liver-Soothing and Mind
+    · 2023  #384  n=60   positive       Effect of Wu Binghuang's Shallow Acupuncture in the 
+    · 2023  #381  n=72   positive       Bushen Anshen acupuncture for perimenopausal insomni
+  近3年：13 篇
+
+========================================================================================
+语料构成披露（本次检索所在病种类目）
+========================================================================================
+  类目「失眠」共 38 篇：阳性 33 · 无差异 5 · 阴性 0 · 无法判定 0
+  可判定文献阳性率 86.8%（全库 82.8%，阴性结果 0 篇 —— 存在发表偏倚，本段结论须谨慎解读）
+  语种：中文 27 · 英文 11　样本量中位 72
+  质量标记：夹带未处理 1 · 正文截断 3 · 年份未核实 0
+
+耗时 300s

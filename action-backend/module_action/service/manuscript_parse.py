@@ -61,13 +61,18 @@ def _from_txt(data: bytes) -> str:
     """
     纯文本 / Markdown
 
-    编码按「utf-8 → utf-8-sig → gbk」顺序试。**gbk 不能省**：中文 Windows 上另存为
+    编码按「utf-8-sig → gbk」顺序试。**gbk 不能省**：中文 Windows 上另存为
     「ANSI」的 txt 就是它，而那恰恰是国内研究者最容易产出的文件。
+
+    **utf-8-sig 必须排第一**：它对不带 BOM 的 utf-8 一样能解，带 BOM 的则把 BOM 剥掉。
+    原来 `utf-8` 排在前面，带 BOM 的文件也被它解开、BOM 原样留在正文开头 ——
+    记事本另存的 txt 常以「BOM + 空行」开头，那一行在前台（JS）算空行、在引擎（Python）
+    曾经不算，行号从那里起整体错一行。
 
     :param data: 文件字节
     :return: 文本
     """
-    for enc in ('utf-8', 'utf-8-sig', 'gbk'):
+    for enc in ('utf-8-sig', 'gbk'):
         with contextlib.suppress(UnicodeDecodeError):
             return data.decode(enc)
     # 兜底：用 utf-8 忽略坏字节，总比整份拒收强

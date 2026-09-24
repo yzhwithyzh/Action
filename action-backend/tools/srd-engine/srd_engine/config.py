@@ -22,7 +22,14 @@ from dataclasses import dataclass, field, replace
 #        重复百分比随之由 `(满分−得分)/满分` 改为 `得分/满分`。
 #        **这两处一起改的净效果是 pct / level / overall_level 数值一格不动** ——
 #        翻转只重新标注了分数这一层。历史数据靠 `schemas.flip_rating` 迁移。
-ENGINE_VERSION = 'srd-engine/0.8.0'
+# 0.8.1：三处「静默出假结论」的修补（2026-09-24，火山方舟 deepseek 关思考后暴露）：
+#        ① 抽取/判定 Schema 全部字段标 required（`schemas.LlmSchema`）—— function calling
+#           下可选字段会被整个省掉，37 个抽取字段一个不填；
+#        ② 一次判完 34 条被截断时，截断的那些按分组拆开重判（`pipeline.judge_all`）；
+#        ③ 关键领域（主题 / 结果）任一个没有可评分条目时不出整体结论（`aggregate`）——
+#           原先会按「无重复」参与查表，1/34 条可评也能给出「无重复」。
+#        升版本也顺带让旧的（可能是空的）抽取缓存全部失效。
+ENGINE_VERSION = 'srd-engine/0.8.1'
 PROMPT_VERSION = 'prompt/2026-08-18'
 CRITERIA_VERSION = 'criteria/2026-08-18'
 
@@ -96,15 +103,10 @@ class FailoverConfig:
 class EngineConfig:
     """一次评估的运行参数."""
 
-    # 抽取时喂给模型的正文范围：
-    #   full     —— 整篇（默认）。章节切分只用于导航与页码，不再决定模型能看到什么。
-    #   sections —— 按批次的章节关键词挑正文（0.1.0 的老行为，留作对照与超长文献兜底）。
-    # 改成 full 的原因见 DESIGN.md：sections 模式下「部分命中」会静默丢掉关键段落，
-    # 而回退全文只在「一个章节都没命中」时触发，最该兜底的情况反而兜不住。
-    extract_scope: str = 'full'
-    # 判定粒度：all（默认，34 条一次调用）/ per_group（12 次）/ per_item（34 次）
-    # 默认改为 all 的实测依据见 judge.py 模块 docstring：per_item 的 76 次调用
-    # 并未换来更稳的输出，两种模式的自一致率都是 95%。
+    # 判定粒度：all（默认，34 条一次调用）/ per_group（12 次，all 被截断时也按它拆开重判）。
+    # 默认 all 的实测依据见 judge.py 模块 docstring。0.8.1 删了 per_item（34 次）：
+    # 76 次调用并未换来更稳的输出，两种模式的自一致率都是 95%，后端也从不启用。
+    # 抽取范围的开关 `extract_scope` 同批删除，抽取一律喂整篇（见 extract.batch_text）。
     judge_granularity: str = 'all'
     # 并发上限（LangChain abatch 的 max_concurrency）
     max_concurrency: int = 8

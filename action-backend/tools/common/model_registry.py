@@ -40,6 +40,35 @@ class LlmModelInfo:
     #: 结构化输出方式（json_schema / function_calling / json_mode / text）。
     #: 空 = 库里没指定，交给调用方运行时探测；探测出来的结果由 `save_structured_method` 回写。
     structured_method: str = ''
+    #: 「AI模型管理」里那一栏「支持推理」：'Y' 才允许思考，其余一律按关闭处理
+    support_reasoning: str = 'N'
+
+    @property
+    def chat_extra(self) -> dict:
+        """建 LangChain 客户端时额外带上的参数（进 `ModelConfig.extra`）。
+
+        「支持推理」配成否时关掉思考，与后端 `ai_assist_service._call_one` 共用
+        `utils/llm_thinking_util.thinking_off_params`（各厂商参数不同名：火山方舟/DeepSeek 是
+        `thinking`，百炼 qwen 是 `enable_thinking`）—— 否则后台明明配了「否」，worker 这边照样思考、
+        照样按输出价计费：实测火山方舟 deepseek 开着思考时，一批 8 条的判定输出 2k–8k token，大头是思维链。
+
+        经 `extra_body` 原样进请求体，所以只对 OpenAI 兼容端点下发：Anthropic / Google 的客户端
+        不认 `extra_body`，构造时就会报错（`thinking_off_params` 对它们返回空）。厂商不认时会 400、
+        模型池切下一个；池子里只有它一个时，把这个模型的「支持推理」改成是即可绕开。
+        """
+        params = self.thinking_params
+
+        return {'extra_body': params} if params else {}
+
+    @property
+    def thinking_params(self) -> dict:
+        """直接并进请求体的字段（手拼 HTTP 请求的调用方用，如背景生成 worker）；走 LangChain 的用 `chat_extra`。"""
+        if self.support_reasoning == 'Y':
+            return {}
+        # 局部 import：本模块的其他部分不该被后端路径连坐（同 load_llm_models）
+        from utils.llm_thinking_util import thinking_off_params  # noqa: PLC0415
+
+        return thinking_off_params(self.provider, self.base_url, self.model_code)
 
     @property
     def ref(self) -> str:
@@ -80,6 +109,7 @@ async def load_llm_models(
             max_tokens=item.max_tokens,
             model_type=(item.model_type or '').strip(),
             structured_method=(item.structured_method or '').strip(),
+            support_reasoning=(item.support_reasoning or 'N').strip().upper(),
         )
         for item in pool
         if item.model_id and item.model_code and item.api_key

@@ -13,23 +13,17 @@
       "user_id": 1,
       "review_a": {"url": "https://.../a.pdf", "title": "综述A标题"},
       "review_b": {"path": "E:/data/b.pdf"},      url 与 path 二选一
-      "engine": {"extract_scope": "full", "judge_granularity": "all", "max_concurrency": 8},
+      "engine": {"judge_granularity": "all", "max_concurrency": 8},
       "model_ids": [3, 7],                        可选：只用这几个 ai_models 里的模型
-      "model":  {"temperature": 0.2, "max_tokens": 8192},   可选覆盖，见下
       "options": {"force": false}                 force=true 时忽略断点重跑
     }
 
 `review_a/b` 也接受直接给字符串（URL 或本地路径），或用 `"files": [a, b]` 简写。
 
-模型从哪来（优先级从高到低）：
-
-1. `payload.model` 里**带 api_key** —— 当成一次性的临时模型，直接用，不查库也不轮换；
-2. `ai_models` 表里启用中的模型（可用 `payload.model_ids` 缩小范围）——
-   按 `model_sort` 排成一个池子交给引擎「粘性 + 出错切换」地轮换，撞到限流/欠费就冻 5 分钟换下一个；
-3. 环境变量 `SRD_PROVIDER / SRD_MODEL / SRD_API_KEY / SRD_BASE_URL` —— 库里一个都没有时的兜底。
-
-`payload.model` 里不带 api_key 时，其中的 temperature / max_tokens / timeout 会作为覆盖
-套到池子里**每一个**模型上（用来临时调参，不改数据库）。
+**模型只从 `ai_models` 表来**（可用 `payload.model_ids` 缩小范围），按 `model_sort` 排成一个池子
+交给引擎「粘性 + 出错切换」地轮换，撞到限流/欠费就冻 5 分钟换下一个。与 checklist worker 同口径：
+官网前台在调它，配置必须从后台可见可控。0.8.1 前还有两条旁路 —— payload 里直接带 api_key 的
+临时模型、库里没模型时回落 `SRD_*` 环境变量 —— 后端从不走，已删（引擎自己的离线 CLI 仍认环境变量）。
 """
 
 from __future__ import annotations
@@ -37,7 +31,6 @@ from __future__ import annotations
 import asyncio
 import re
 import shutil
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -61,7 +54,6 @@ from srd_engine.config import (  # noqa: E402 —— 必须先把引擎目录塞
     EngineConfig,
     FailoverConfig,
     ModelConfig,
-    model_config_from_env,
 )
 from srd_engine.pipeline import assess  # noqa: E402
 from srd_engine.report import render_text, to_csv  # noqa: E402
@@ -98,7 +90,6 @@ class SrdSessionTask(BaseSessionTask):
         self._model_health = model_health
         #: 本次用的模型池与实际调用它们的 runner，收尾时写进摘要
         self._pool: list[ModelConfig] = []
-        self._pool_source = ''  # payload / db / env
         self._runner: LlmRunner | None = None
 
     # ================================================================== 校验
@@ -212,30 +203,11 @@ class SrdSessionTask(BaseSessionTask):
 
     # ================================================================== 评估
 
-    def _model_config(self) -> ModelConfig:
-        """环境变量打底，payload.model 覆盖。空串/None 一律当作「没传」，不覆盖。"""
-        cfg = model_config_from_env('SRD')
-        raw = self.payload.get('model') or {}
-        allowed = ('provider', 'model', 'api_key', 'base_url', 'temperature', 'max_tokens', 'timeout')
-        overrides = {k: raw[k] for k in allowed if raw.get(k) not in (None, '')}
-        if isinstance(raw.get('extra'), dict):
-            overrides['extra'] = dict(raw['extra'])
-        return replace(cfg, **overrides) if overrides else cfg
-
     # ================================================================== 模型池
-
-    def _tuning_overrides(self) -> dict[str, Any]:
-        """payload.model 里那些「只调参、不换模型」的字段，会套到池内每个模型上。"""
-        raw = self.payload.get('model') or {}
-        allowed = ('temperature', 'max_tokens', 'timeout')
-        overrides = {k: raw[k] for k in allowed if raw.get(k) not in (None, '')}
-        if isinstance(raw.get('extra'), dict):
-            overrides['extra'] = dict(raw['extra'])
-        return overrides
 
     def _requested_model_ids(self) -> list[int] | None:
         """payload 里指定的模型主键。数组和 "3,7" 这种字符串都收。"""
-        raw = self.payload.get('model_ids') or (self.payload.get('model') or {}).get('model_ids')
+        raw = self.payload.get('model_ids')
         if not raw:
             return None
         items = raw.split(',') if isinstance(raw, str) else raw
@@ -243,68 +215,39 @@ class SrdSessionTask(BaseSessionTask):
         return ids or None
 
     async def _load_pool_from_db(self) -> list[ModelConfig]:
-        """从 ai_models 表拉一份模型池；库连不上或一条都没有时返回空列表。"""
-        try:
-            models = await load_llm_models(
-                model_ids=self._requested_model_ids(),
-                model_types=self.cfg.model_type_list or None,
-            )
-        except Exception as exc:
-            await self.log.write_warning(f'读取 ai_models 失败，回落到环境变量配置：{type(exc).__name__}: {exc}')
-            return []
-
-        tuning = self._tuning_overrides()
+        """从 ai_models 表拉一份模型池（也是全冻结时 runner 重载池子的入口）。"""
+        models = await load_llm_models(
+            model_ids=self._requested_model_ids(),
+            model_types=self.cfg.model_type_list or None,
+        )
         return [
             ModelConfig(
-                **{
-                    'provider': m.provider,
-                    'model': m.model_code,
-                    'api_key': m.api_key,
-                    'base_url': m.base_url,
-                    'temperature': float(m.temperature) if m.temperature is not None else 0.0,
-                    'max_tokens': m.max_tokens,
-                    'ref': m.ref,
-                    'structured_method': m.structured_method,
-                    **tuning,  # payload 的调参覆盖库里的默认值
-                }
+                provider=m.provider,
+                model=m.model_code,
+                api_key=m.api_key,
+                base_url=m.base_url,
+                temperature=float(m.temperature) if m.temperature is not None else 0.0,
+                max_tokens=m.max_tokens,
+                ref=m.ref,
+                structured_method=m.structured_method,
+                # 后台「支持推理」配成否就关思考，参数名按端点挑（见 utils/llm_thinking_util）
+                extra=m.chat_extra,
             )
             for m in models
         ]
 
     async def _resolve_pool(self) -> list[ModelConfig]:
-        """确定这次评估能用哪些模型。优先级见模块 docstring。"""
-        inline = (self.payload.get('model') or {}).get('api_key')
-        if str(inline or '').strip():
-            cfg = self._model_config()
-            await self.log.write_info(f'使用 payload 指定的临时模型：{cfg.label}（不参与轮换）')
-            self._pool_source = 'payload'
-            return [cfg]
-
-        raw = self.payload.get('model') or {}
-        if raw.get('provider') or raw.get('model'):
-            await self.log.write_warning(
-                'payload.model 指定了 provider/model 但没给 api_key：模型池以 ai_models 表为准，'
-                '这两项只有在回落到环境变量时才生效（要指定用哪些模型请用 model_ids）'
-            )
-
-        pool = await self._load_pool_from_db()
-        if pool:
-            await self.log.write_info(
-                f'模型池（共 {len(pool)} 个，按 model_sort 轮换）：{"、".join(c.label for c in pool)}'
-            )
-            self._pool_source = 'db'
-            return pool
-
-        env_cfg = self._model_config()
-        if (env_cfg.api_key or '').strip():
-            await self.log.write_warning(f'ai_models 里没有可用模型，回落到环境变量：{env_cfg.label}')
-            self._pool_source = 'env'
-            return [env_cfg]
-
-        raise TaskPayloadError(
-            '没有可用模型：ai_models 表里没有启用中且配了 API key 的模型，'
-            'payload.model 与环境变量 SRD_API_KEY 也都没给 API key'
+        """确定这次评估能用哪些模型：只认 ai_models，一个都没有就如实失败。"""
+        try:
+            pool = await self._load_pool_from_db()
+        except Exception as exc:
+            raise TaskPayloadError(f'读取 ai_models 失败：{type(exc).__name__}: {exc}') from exc
+        if not pool:
+            raise TaskPayloadError('ai_models 表里没有启用中且配了 API key 的模型，请先在后台配置')
+        await self.log.write_info(
+            f'模型池（共 {len(pool)} 个，按 model_sort 轮换）：{"、".join(c.label for c in pool)}'
         )
+        return pool
 
     def _build_runner(self, engine_cfg: EngineConfig) -> LlmRunner:
         """把模型池、共享冻结表、切换通知接到一起。"""
@@ -318,8 +261,8 @@ class SrdSessionTask(BaseSessionTask):
             ),
             health=self._model_health,
             on_event=self._on_model_event,
-            # 只有池子本来就来自数据库时才允许中途重载：全冻结时能捡到运维新启用的模型
-            reload_pool=self._load_pool_from_db if self._pool_source == 'db' else None,
+            # 全冻结时重载一次池子：能捡到运维新启用的模型
+            reload_pool=self._load_pool_from_db,
         )
 
     def _on_model_event(self, event: str, message: str) -> None:
@@ -337,7 +280,6 @@ class SrdSessionTask(BaseSessionTask):
         share = max(1, self.cfg.max_concurrent_llm // max(1, self.cfg.max_concurrent_sessions))
         requested = int(raw.get('max_concurrency') or EngineConfig.max_concurrency)
         return EngineConfig(
-            extract_scope=str(raw.get('extract_scope') or EngineConfig.extract_scope),
             judge_granularity=str(raw.get('judge_granularity') or EngineConfig.judge_granularity),
             max_concurrency=max(1, min(requested, share)),
             evidence_sufficient_ratio=float(
@@ -377,24 +319,29 @@ class SrdSessionTask(BaseSessionTask):
         「两篇综述毫无重复」在前台长得一模一样，用户会拿它当结论。
         引擎那边已经把 `overall_level` 判成 None（不落进四档），这里再把任务本身判失败：
         断点没落、抽取缓存还在，重新入队同一个 session_id 接着跑就行，不用重花抽取的钱。
+
+        0.8.1 起闸与引擎对齐：看 `overall_level` 而不是「有没有分」—— 关键领域（主题 / 结果）
+        空着时引擎也不出结论。实测抽取全空时 34 条恰好 1 条有分，旧闸放行，报成「无重复 0%」。
         """
-        if result.overall_score_max:
+        if result.overall_level is not None:
             return
         total = len(result.items)
+        scored = sum(1 for it in result.items if it.score is not None)
+        what = (
+            f'{total} 个条目全部无法评分' if not scored
+            else f'{total} 个条目只有 {scored} 条可评分、且关键领域（主题 / 结果）没有可评分条目'
+        )
         raise SrdUnjudgeableError(
-            f'{total} 个条目全部无法评分（证据不足或判定输出被截断），没有可交付的结论。'
-            f'抽取结果与断点已保留，可直接重跑；持续失败请检查模型的最大输出长度（ai_models.max_tokens）'
-            f'或把判定粒度调成 per_group'
+            f'{what}（证据不足、抽取为空或判定输出被截断），没有可交付的结论。'
+            f'抽取结果与断点已保留，可直接重跑；持续失败请检查 ai_models 里该模型的'
+            f'结构化输出方式（structured_method）与最大输出长度（max_tokens）'
         )
 
     async def _persist_structured_methods(self, runner: LlmRunner) -> None:
         """把运行时探测出来的结构化输出方式回写进 ai_models，下个任务不用再撞一次墙。
 
-        只对来自数据库的池子做，且 `save_structured_method` 里还会再挡一道
-        「列非空就不覆盖」—— 人工钉死的值优先于探测结果。
+        `save_structured_method` 里还会再挡一道「列非空就不覆盖」—— 人工钉死的值优先于探测结果。
         """
-        if self._pool_source != 'db':
-            return
         for identity, method in runner.resolved_methods().items():
             model_id = model_id_from_ref(identity)
             if model_id and await save_structured_method(model_id, method):
@@ -482,7 +429,6 @@ class SrdSessionTask(BaseSessionTask):
             'criteria_version': result.criteria_version,
             'model': result.model,
             'model_pool': [c.label for c in self._pool],
-            'model_pool_source': self._pool_source,
             # 中途换过模型的话，结论是几个模型合力给出的，摘要里必须能看出来
             'models_used': self._runner.models_used if self._runner else [],
             'model_switches': self._runner.switches if self._runner else [],

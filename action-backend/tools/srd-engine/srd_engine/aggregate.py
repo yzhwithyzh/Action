@@ -194,11 +194,21 @@ def build_overall_reason(result: AssessmentResult) -> tuple[str, str]:
     if result.overall_level is None:
         # 无法判定也要给出理由：报告里留一句空白，看的人只会以为是渲染坏了
         total = len(result.items)
+        if not any(it.score is not None for it in result.items):
+            return (
+                f'{total} 个条目全部无法评分（证据不足或模型未返回判定），本次评估无法判定重复程度。'
+                f'请检查两篇综述的原文是否完整可读，或重新发起一次评估。',
+                f'All {total} items were unscorable (insufficient evidence or no verdict returned); '
+                f'the degree of duplication could not be determined.',
+            )
+        blank = [d for d in (d1, d3) if d.level is None]
+        names_zh = '、'.join(f'「{d.name_zh.split("：")[-1]}」' for d in blank)
+        names_en = ', '.join(f'"{d.name_en.split(": ")[-1]}"' for d in blank)
         return (
-            f'{total} 个条目全部无法评分（证据不足或模型未返回判定），本次评估无法判定重复程度。'
+            f'关键领域{names_zh}没有一条可评分的条目，整体判定依赖它，本次评估无法判定重复程度。'
             f'请检查两篇综述的原文是否完整可读，或重新发起一次评估。',
-            f'All {total} items were unscorable (insufficient evidence or no verdict returned); '
-            f'the degree of duplication could not be determined.',
+            f'Key domain {names_en} had no scorable item; the overall verdict depends on it, '
+            f'so the degree of duplication could not be determined.',
         )
 
     ks = key_state(_effective_level(d1), _effective_level(d3))
@@ -241,10 +251,16 @@ def aggregate(result: AssessmentResult, cfg: EngineConfig | None = None) -> Asse
 
     key = (_effective_level(by_seq[1]), _effective_level(by_seq[3]))
     nonkey = (_effective_level(by_seq[2]), _effective_level(by_seq[4]))
-    # 一条都没评出来时不许查表。查表会拿四个「证据不足按无重复算」凑出一个
-    # 「无重复」——那和「两篇综述毫无重复」在前台长得一模一样，用户会拿它当结论。
+    # 关键领域（主题 / 结果）任一个没有可评分条目时不许查表。查表会把它按「无重复」算，
+    # 凑出来的结论和「两篇综述毫无重复」在前台长得一模一样，用户会拿它当结论。
     # 判定不出来就老实说判定不出来（level=None → 前台渲染「无法判定」的中性灰）。
-    result.overall_level = overall_of(key, nonkey) if scores else None
+    #
+    # 0.8.0 只拦「一条都没评出来」，实测漏过：抽取全空时 34 条里恰好 1 条有分，
+    # 整体判成「无重复 0%」。**不按全稿可评比例设闸**：正常评估本来就只有 11–26 条可评
+    # （两篇都没写的条目判 unclear 是对的），按 50% 设闸会把大半正常结果拦掉。
+    # 非关键领域照旧允许空着按「无重复」参与查表，并由 provisional / 理由里那句话标出来。
+    key_blank = [d for d in (by_seq[1], by_seq[3]) if d.level is None]
+    result.overall_level = overall_of(key, nonkey) if not key_blank else None
 
     result.overall_score_sum = sum(scores)
     result.overall_score_max = SCORE_PER_ITEM * len(scores)

@@ -16,7 +16,11 @@ from module_action.entity.do.action_do import (
     ActionGuestProfile,
     ActionGuideline,
     ActionGuidelineCategory,
+    ActionBackgroundRun,
+    ActionConditionDict,
     ActionGuidelineItem,
+    ActionLiterature,
+    ActionLiteratureText,
     ActionNews,
     ActionPublication,
     ActionReaimDimension,
@@ -42,6 +46,7 @@ from module_action.entity.vo.action_vo import (
     GuidelineCategoryPageQueryModel,
     GuidelineItemModel,
     GuidelineItemPageQueryModel,
+    LiteraturePageQueryModel,
     GuidelineModel,
     GuidelinePageQueryModel,
     NewsModel,
@@ -2377,6 +2382,7 @@ class ReportReviewDao:
                     reason=v.get('reason') or '',
                     evidence=v.get('evidence') or '',
                     lines=v.get('lines') or '',
+                    evidence_located=v.get('located') or '',
                 )
                 for v in verdicts
             ]
@@ -2499,13 +2505,16 @@ class ReportReviewDao:
         错误 / 计数 / 时间）留着不动：事后排查「上周那次校验为什么挂了」靠的正是它们，
         而它们不含任何稿件内容。
 
+        `consistency` 也要清：那份 JSON 里每条发现都带着从稿件逐字摘出的 `evidence` 与 `claims`，
+        留着它等于正文换了个地方继续躺在库里。各档计数在台账列里另有，排障不靠它。
+
         :param db: orm对象
         :param review_id: 校验记录id
         """
         await db.execute(
             update(ActionReportReview)
             .where(ActionReportReview.review_id == review_id)
-            .values(del_flag='2', manuscript=None)
+            .values(del_flag='2', manuscript=None, consistency=None, run_warnings=None)
         )
         await db.execute(
             update(ActionReportReviewItem)
@@ -2642,4 +2651,434 @@ class ReportTrailDao:
             )
             .scalars()
             .all()
+        )
+
+class LiteratureDao:
+    """
+    针灸文献知识库数据库操作层
+
+    列表查询**不 join 全文表**：567 篇全文合计 14.3M 字符，列表页一个字都用不上。
+    """
+
+    #: 质量标记筛选 → 条件。专为「复核」这条主线设计的合并筛选项
+    _QUALITY = {
+        'contaminated': lambda: and_(
+            ActionLiterature.contamination == '1',
+            ActionLiterature.clean_status.notin_(['ok', 'na']),
+        ),
+        'truncated': lambda: ActionLiterature.truncated == '1',
+        'lowYear': lambda: ActionLiterature.year_confidence != 'high',
+        'needReview': lambda: ActionLiterature.review_status == 'pending',
+        'failed': lambda: ActionLiterature.extract_status != 'ok',
+    }
+
+    @classmethod
+    async def get_literature_detail_by_id(cls, db: AsyncSession, lit_id: int) -> ActionLiterature | None:
+        """
+        根据文献id获取详情
+
+        :param db: orm对象
+        :param lit_id: 文献id
+        :return: 文献对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionLiterature).where(
+                        ActionLiterature.lit_id == lit_id, ActionLiterature.del_flag == '0'
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_literature_text(cls, db: AsyncSession, lit_id: int) -> ActionLiteratureText | None:
+        """
+        取全文。**单独一次查询**，绝不并进列表或详情的主查询
+
+        :param db: orm对象
+        :param lit_id: 文献id
+        :return: 全文对象
+        """
+        return (
+            (await db.execute(select(ActionLiteratureText).where(ActionLiteratureText.lit_id == lit_id)))
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_literature_list(
+        cls,
+        db: AsyncSession,
+        query_object: LiteraturePageQueryModel,
+        is_page: bool = False,
+    ) -> PageModel | list[dict[str, Any]]:
+        """
+        根据查询参数获取文献列表
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :param is_page: 是否开启分页
+        :return: 文献列表
+        """
+        conditions = [
+            ActionLiterature.del_flag == '0',
+            ActionLiterature.corpus_no == query_object.corpus_no if query_object.corpus_no else True,
+            ActionLiterature.study_design == query_object.study_design if query_object.study_design else True,
+            ActionLiterature.effect_direction == query_object.effect_direction
+            if query_object.effect_direction
+            else True,
+            ActionLiterature.lang == query_object.lang if query_object.lang else True,
+            ActionLiterature.review_status == query_object.review_status if query_object.review_status else True,
+            ActionLiterature.status == query_object.status if query_object.status else True,
+            ActionLiterature.year >= query_object.year_begin if query_object.year_begin else True,
+            ActionLiterature.year <= query_object.year_end if query_object.year_end else True,
+        ]
+        if query_object.condition_group:
+            # condition_group 是 JSON 文本，按子串匹配即可 —— 这一列只用于筛选，
+            # 不做库内结构化查询，为它上 jsonb 与 GIN 索引在 567 行的规模上是净亏
+            conditions.append(ActionLiterature.condition_group.like(f'%"{query_object.condition_group}"%'))
+        if query_object.quality:
+            build = cls._QUALITY.get(query_object.quality)
+            if build:
+                conditions.append(build())
+        if query_object.keyword:
+            kw = f'%{query_object.keyword}%'
+            conditions.append(
+                ActionLiterature.title.like(kw)
+                | ActionLiterature.journal.like(kw)
+                | ActionLiterature.authors.like(kw)
+                | ActionLiterature.abstract.like(kw)
+                | ActionLiterature.condition.like(kw)
+                | ActionLiterature.file_name.like(kw)
+            )
+
+        query = (
+            select(ActionLiterature)
+            .where(*conditions)
+            .order_by(ActionLiterature.corpus_no)
+            .distinct()
+        )
+
+        return await PageUtil.paginate(db, query, query_object.page_num, query_object.page_size, is_page)
+
+    @classmethod
+    async def edit_literature_dao(cls, db: AsyncSession, literature: dict) -> None:
+        """
+        编辑文献
+
+        :param db: orm对象
+        :param literature: 需要更新的文献字典
+        :return:
+        """
+        await db.execute(update(ActionLiterature), [literature])
+
+    @classmethod
+    async def review_literature_dao(cls, db: AsyncSession, lit_ids: list[int], payload: dict) -> None:
+        """
+        批量置复核状态
+
+        :param db: orm对象
+        :param lit_ids: 文献id列表
+        :param payload: 需要更新的字段
+        :return:
+        """
+        await db.execute(update(ActionLiterature).where(ActionLiterature.lit_id.in_(lit_ids)).values(**payload))
+
+    @classmethod
+    async def soft_delete_literature_dao(cls, db: AsyncSession, lit_ids: list[int], payload: dict) -> None:
+        """
+        逻辑删除文献
+
+        全文**跟着一起删**：正文脱离元数据没有任何用途，留着只是占空间。
+        与 `action_report_review` 那边「删除时真删正文、留下台账」是同一个取舍。
+
+        :param db: orm对象
+        :param lit_ids: 文献id列表
+        :param payload: 需要更新的字段
+        :return:
+        """
+        await db.execute(update(ActionLiterature).where(ActionLiterature.lit_id.in_(lit_ids)).values(**payload))
+        await db.execute(delete(ActionLiteratureText).where(ActionLiteratureText.lit_id.in_(lit_ids)))
+
+    @classmethod
+    async def get_condition_groups(cls, db: AsyncSession) -> list[Row]:
+        """
+        取病种上位类目词表（筛选下拉用），按语料中的篇数降序
+
+        :param db: orm对象
+        :return: (类目名, 篇数) 列表
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionConditionDict.group_name, func.sum(ActionConditionDict.hits).label('hits'))
+                    .where(ActionConditionDict.hits > 0)
+                    .group_by(ActionConditionDict.group_name)
+                    .order_by(func.sum(ActionConditionDict.hits).desc())
+                )
+            ).all()
+        )
+
+    @classmethod
+    async def get_stats(cls, db: AsyncSession) -> dict[str, Any]:
+        """
+        语料统计。**一次查询取回全部计数**，不要为每张卡片发一条 SQL
+
+        :param db: orm对象
+        :return: 统计字典
+        """
+        base = ActionLiterature.del_flag == '0'
+        row = (
+            await db.execute(
+                select(
+                    func.count().label('total'),
+                    func.count().filter(ActionLiterature.status == '0').label('usable'),
+                    func.count().filter(ActionLiterature.lang == 'zh').label('zh'),
+                    func.count().filter(ActionLiterature.lang == 'en').label('en'),
+                    func.count()
+                    .filter(
+                        and_(
+                            ActionLiterature.year_confidence == 'high',
+                            ActionLiterature.year >= datetime.now().year - 5,
+                        )
+                    )
+                    .label('recent5'),
+                    func.count().filter(ActionLiterature.effect_direction == 'positive').label('positive'),
+                    func.count().filter(ActionLiterature.effect_direction == 'no_difference').label('no_difference'),
+                    func.count().filter(ActionLiterature.effect_direction == 'negative').label('negative'),
+                    func.count().filter(ActionLiterature.effect_direction == 'unclear').label('unclear'),
+                    func.count()
+                    .filter(
+                        and_(
+                            ActionLiterature.contamination == '1',
+                            ActionLiterature.clean_status.notin_(['ok', 'na']),
+                        )
+                    )
+                    .label('contaminated'),
+                    func.count().filter(ActionLiterature.truncated == '1').label('truncated'),
+                    func.count().filter(ActionLiterature.year_confidence != 'high').label('low_year'),
+                    func.count().filter(ActionLiterature.review_status == 'pending').label('pending'),
+                ).where(base)
+            )
+        ).first()
+        designs = list(
+            (
+                await db.execute(
+                    select(ActionLiterature.study_design, func.count().label('n'))
+                    .where(base)
+                    .group_by(ActionLiterature.study_design)
+                    .order_by(func.count().desc())
+                )
+            ).all()
+        )
+
+        return {
+            **{k: (getattr(row, k, 0) or 0) for k in
+               ('total', 'usable', 'zh', 'en', 'recent5', 'positive', 'no_difference', 'negative',
+                'unclear', 'contaminated', 'truncated', 'low_year', 'pending')},
+            'designs': [{'name': d or 'other', 'value': n} for d, n in designs],
+        }
+
+
+class BackgroundRunDao:
+    """
+    背景生成任务数据库操作层
+
+    列表查询**不取 `result_json` / `corpus_snapshot`**：一次结果几千字，列表页一个字都用不上。
+    """
+
+    @classmethod
+    async def add_run_dao(cls, db: AsyncSession, run: ActionBackgroundRun) -> ActionBackgroundRun:
+        """
+        新增任务台账
+
+        :param db: orm对象
+        :param run: 任务对象
+        :return: 任务对象（flush 后主键可用）
+        """
+        db.add(run)
+        await db.flush()
+
+        return run
+
+    @classmethod
+    async def get_run_by_session(cls, db: AsyncSession, session_id: str, user_id: int) -> ActionBackgroundRun | None:
+        """
+        按 worker 任务id 取记录。**必须带 user_id** —— 不带的话换个 session_id 就能轮询别人的任务
+
+        :param db: orm对象
+        :param session_id: worker 任务id
+        :param user_id: 访客id
+        :return: 任务对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionBackgroundRun).where(
+                        ActionBackgroundRun.session_id == session_id,
+                        ActionBackgroundRun.user_id == user_id,
+                        ActionBackgroundRun.del_flag == '0',
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_run_by_id(cls, db: AsyncSession, run_id: int, user_id: int) -> ActionBackgroundRun | None:
+        """
+        按记录id 取详情（含结果）
+
+        :param db: orm对象
+        :param run_id: 任务记录id
+        :param user_id: 访客id
+        :return: 任务对象
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionBackgroundRun).where(
+                        ActionBackgroundRun.run_id == run_id,
+                        ActionBackgroundRun.user_id == user_id,
+                        ActionBackgroundRun.del_flag == '0',
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def edit_run_dao(cls, db: AsyncSession, run_id: int, values: dict[str, Any]) -> None:
+        """
+        更新任务记录
+
+        :param db: orm对象
+        :param run_id: 任务记录id
+        :param values: 列名到值的映射
+        :return:
+        """
+        await db.execute(update(ActionBackgroundRun).where(ActionBackgroundRun.run_id == run_id).values(**values))
+
+    @classmethod
+    async def count_running_dao(cls, db: AsyncSession, user_id: int) -> int:
+        """
+        该访客有几个任务在跑（pending / running）
+
+        :param db: orm对象
+        :param user_id: 访客id
+        :return: 条数
+        """
+        return int(
+            (
+                await db.execute(
+                    select(func.count())
+                    .select_from(ActionBackgroundRun)
+                    .where(
+                        ActionBackgroundRun.user_id == user_id,
+                        ActionBackgroundRun.del_flag == '0',
+                        ActionBackgroundRun.run_status.in_(['pending', 'running']),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
+    @classmethod
+    async def list_pending_dao(cls, db: AsyncSession, user_id: int) -> list[ActionBackgroundRun]:
+        """
+        取该访客所有未终结的记录，供对账
+
+        :param db: orm对象
+        :param user_id: 访客id
+        :return: 任务列表
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionBackgroundRun).where(
+                        ActionBackgroundRun.user_id == user_id,
+                        ActionBackgroundRun.del_flag == '0',
+                        ActionBackgroundRun.run_status.in_(['pending', 'running']),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def list_history_dao(cls, db: AsyncSession, user_id: int, limit: int) -> list[Row]:
+        """
+        历史列表。**不取结果列** —— 一次结果几千字，列表页用不上
+
+        :param db: orm对象
+        :param user_id: 访客id
+        :param limit: 最多几条
+        :return: 行列表
+        """
+        return list(
+            (
+                await db.execute(
+                    select(
+                        ActionBackgroundRun.run_id, ActionBackgroundRun.session_id, ActionBackgroundRun.topic,
+                        ActionBackgroundRun.condition_group, ActionBackgroundRun.run_status,
+                        ActionBackgroundRun.progress, ActionBackgroundRun.error_msg,
+                        ActionBackgroundRun.slot_total, ActionBackgroundRun.slot_blocked,
+                        ActionBackgroundRun.ref_count, ActionBackgroundRun.partial_count,
+                        ActionBackgroundRun.retrieve_mode,
+                        ActionBackgroundRun.create_time, ActionBackgroundRun.finish_time,
+                    )
+                    .where(ActionBackgroundRun.user_id == user_id, ActionBackgroundRun.del_flag == '0')
+                    .order_by(ActionBackgroundRun.run_id.desc())
+                    .limit(limit)
+                )
+            ).all()
+        )
+
+    @classmethod
+    async def soft_delete_run_dao(cls, db: AsyncSession, run_id: int, user_id: int) -> None:
+        """
+        删除一条记录。
+
+        **置 del_flag 的同时物理清空 topic 与结果**：用户点「删除」期待的是
+        「那次生成没了」，不是「列表里看不见了」。而排障要的那几列（状态/错误/计数/时间）
+        留着，它们不含任何用户输入。同 `soft_delete_review_dao` 的口径。
+
+        :param db: orm对象
+        :param run_id: 任务记录id
+        :param user_id: 访客id
+        :return:
+        """
+        await db.execute(
+            update(ActionBackgroundRun)
+            .where(ActionBackgroundRun.run_id == run_id, ActionBackgroundRun.user_id == user_id)
+            .values(del_flag='2', topic='', result_json=None, corpus_snapshot=None)
+        )
+
+    @classmethod
+    async def trim_user_runs_dao(cls, db: AsyncSession, user_id: int, keep: int) -> None:
+        """
+        只留最近 `keep` 条，更早的软删并清空正文
+
+        :param db: orm对象
+        :param user_id: 访客id
+        :param keep: 保留条数
+        :return:
+        """
+        keep_ids = select(ActionBackgroundRun.run_id).where(
+            ActionBackgroundRun.user_id == user_id, ActionBackgroundRun.del_flag == '0'
+        ).order_by(ActionBackgroundRun.run_id.desc()).limit(keep)
+        await db.execute(
+            update(ActionBackgroundRun)
+            .where(
+                ActionBackgroundRun.user_id == user_id,
+                ActionBackgroundRun.del_flag == '0',
+                ActionBackgroundRun.run_id.notin_(keep_ids),
+            )
+            .values(del_flag='2', topic='', result_json=None, corpus_snapshot=None)
         )

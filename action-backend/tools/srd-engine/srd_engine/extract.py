@@ -28,18 +28,6 @@ if TYPE_CHECKING:
 
     from srd_engine.adapters.langchain_client import LlmRunner
 
-# 每个批次抽哪些字段。默认整篇喂给模型，`extract_scope='sections'` 时才按这张表挑章节 ——
-# 实测挑章节会静默丢掉关键段落（字段填充率 70% vs 全文 87%），保留只为对照，不推荐。
-_BATCH_SECTIONS: dict[str, tuple[str, ...]] = {
-    'topic': ('abstract', 'introduction', 'background', 'method', 'eligibility', 'inclusion',
-              '摘要', '前言', '背景', '方法', '纳入'),
-    'method': ('method', 'search', 'information sources', 'data', 'effect measures', 'study selection',
-               '方法', '检索', '资料', '数据', '统计'),
-    'result': ('result', 'study characteristics', 'meta-analys', 'subgroup', 'sensitivity', 'synthesis',
-               'discussion', '结果', '亚组', '敏感性', '讨论'),
-    'quality': ('risk of bias', 'grade', 'certainty', 'publication bias', 'funding', 'interest',
-                'limitation', 'discussion', '偏倚', '质量', '利益冲突', '局限', '讨论'),
-}
 #: 失败或抽空的批次最多补跑几轮（含首轮）。
 #:
 #: 值得多补几轮：抽取是「一篇抽一次、34 条判定都吃这一份 facet」，一个批次抽空，
@@ -57,17 +45,15 @@ BATCH_SCHEMA: dict[str, type[BaseModel]] = {
 }
 
 
-def batch_text(doc: ParsedDoc, batch: str, scope: str = 'full') -> tuple[list[str], list[str]]:
+def batch_text(doc: ParsedDoc, batch: str) -> tuple[list[str], list[str]]:
     """取该批次要喂给模型的正文（已剔参考文献，超长已切块）。
+
+    一律喂整篇。0.8.1 前还有个按章节关键词挑正文的 `extract_scope='sections'`，实测会静默丢掉
+    关键段落（字段填充率 70% vs 全文 87%），且后端从不启用，已删。
 
     :return: (正文块列表, 告警列表)
     """
-    text = (
-        doc.section_text(*_BATCH_SECTIONS[batch], fallback_all=True)
-        if scope == 'sections'
-        else doc.full_text
-    )
-    return overlong.prepare(text, label=f'批次 {batch}')
+    return overlong.prepare(doc.full_text, label=f'批次 {batch}')
 
 
 def is_empty_facets(facets: BaseModel) -> bool:
@@ -130,7 +116,7 @@ async def extract_doc(
     """
     cfg = cfg or EngineConfig()
     batches = list(BATCH_SCHEMA)
-    plan = {b: batch_text(doc, b, cfg.extract_scope) for b in batches}
+    plan = {b: batch_text(doc, b) for b in batches}
     warnings: list[str] = [n for b in batches for n in plan[b][1]]
 
     extract = ExtractDoc(

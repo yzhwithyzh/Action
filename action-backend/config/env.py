@@ -204,6 +204,45 @@ class OssSettings(BaseSettings):
         return f'https://{self.oss_bucket}.{self.oss_endpoint}'
 
 
+class RetrievalSettings(BaseSettings):
+    """
+    针灸文献知识库的检索配置（向量 + 重排）
+
+    【为什么是向量为主、BM25 只做降级】20 题评测集实测（`tools/lit_embed.py`）：
+    BM25 P@5=0.730 / qwen 向量 0.940 / 向量+重排 P@10=0.912。BM25 在同义改写上直接崩掉
+    （「扎针能不能让人睡得着」前 5 条 0 命中），而用户不会每次都说规范词。
+    等权 RRF 混合反而掉到 0.850 —— **RRF 只在两路强弱相当时才是免费的午餐**，
+    悬殊时弱的那一路就是噪声。所以 BM25 只在向量端点不可用时兜底，不进主路径。
+
+    【embed 与 rerank 分成两组配置】它们常常不在同一个端点上，也不一定同时启用；
+    重排是可选的加成（P@10 +5.8%），端点不通时退回纯向量仍有 P@5=0.94，
+    所以 `rerank_enabled` 独立开关，失败静默降级 —— 这是少数**应该**静默降级的地方，
+    因为降级后的结果依然可用，报错反而会打断用户。
+
+    【embed 端点不可用则如实报错，不静默】与重排相反：没有向量就没有主路径，
+    此时退到 BM25 会让检索质量从 0.94 掉到 0.73，而用户完全看不出来。
+    降级必须在出参里标出来（见 `LiteratureSearch.last_mode`）。
+    """
+
+    #: 向量。留空则整个检索退回 BM25
+    embed_enabled: bool = False
+    embed_base_url: str = ''
+    embed_api_key: str = ''
+    embed_model: str = 'qwen3.7-text-embedding'
+    embed_batch: int = 10
+    embed_timeout_seconds: int = 60
+
+    #: 重排。走 DashScope 原生路径（compatible-mode 下没有 /rerank，实测 404），
+    #: 所以这里要的是**不含 /compatible-mode/v1 的主机地址**
+    rerank_enabled: bool = False
+    rerank_host: str = ''
+    rerank_api_key: str = ''
+    rerank_model: str = 'qwen3.7-text-rerank'
+    #: 送多少条给重排。逐对打分是 O(n)，全库跑一遍既慢又贵；召回仍归向量
+    rerank_candidates: int = 30
+    rerank_timeout_seconds: int = 30
+
+
 class SiteBuildSettings(BaseSettings):
     """
     官网静态站重新生成配置
@@ -385,6 +424,12 @@ class GetConfig:
         """
         return OssSettings()
 
+    def get_retrieval_config(self) -> RetrievalSettings:
+        """
+        获取文献检索配置
+        """
+        return RetrievalSettings()
+
     def get_site_build_config(self) -> SiteBuildSettings:
         """
         获取官网重新生成配置
@@ -450,3 +495,5 @@ UploadConfig = get_config.get_upload_config()
 OssConfig = get_config.get_oss_config()
 # 官网重新生成配置
 SiteBuildConfig = get_config.get_site_build_config()
+# 文献检索（向量 + 重排）配置
+RetrievalConfig = get_config.get_retrieval_config()

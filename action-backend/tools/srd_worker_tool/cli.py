@@ -7,7 +7,7 @@
     python -m tools.srd_worker_tool.cli stop   <session_id>
     python -m tools.srd_worker_tool.cli queue
 
-a/b 既可以是本地路径，也可以是 http(s) URL。模型参数不传就走 worker 侧的 SRD_* 环境变量。
+a/b 既可以是本地路径，也可以是 http(s) URL。模型一律取自 ai_models 表。
 """
 
 from __future__ import annotations
@@ -41,20 +41,13 @@ async def cmd_submit(args: argparse.Namespace) -> int:
         'review_b': _spec(args.b, args.title_b),
         'engine': {
             'judge_granularity': args.granularity,
-            'extract_scope': args.extract_scope,
             'max_concurrency': args.concurrency,
         },
         'options': {'force': args.force},
     }
-    # 不传 --api-key 时模型来自 ai_models 表（--model-ids 可缩小范围）；
-    # 传了 --api-key 就是一次性的临时模型，不查库也不轮换
+    # 模型一律来自 ai_models 表，--model-ids 只能缩小范围
     if args.model_ids:
         payload['model_ids'] = [int(x) for x in args.model_ids.split(',') if x.strip().isdigit()]
-    model = {k: v for k, v in
-             (('provider', args.provider), ('model', args.model), ('api_key', args.api_key),
-              ('base_url', args.base_url)) if v}
-    if model:
-        payload['model'] = model
 
     async with TaskClient(CONFIG) as client:
         sid = await client.submit(payload, session_id=args.session_id)
@@ -109,12 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('--user-id', type=int, default=0)
     sp.add_argument('--session-id', default='')
     sp.add_argument('--model-ids', default='', help='只用 ai_models 里的这几个模型，逗号分隔')
-    sp.add_argument('--provider', default='')
-    sp.add_argument('--model', default='', help='仅在同时给了 --api-key（临时模型）时生效')
-    sp.add_argument('--api-key', default='', help='给了就是一次性临时模型，不查 ai_models 表')
-    sp.add_argument('--base-url', default='')
-    sp.add_argument('--granularity', choices=['all', 'per_group', 'per_item'], default='all')
-    sp.add_argument('--extract-scope', choices=['full', 'sections'], default='full')
+    sp.add_argument('--granularity', choices=['all', 'per_group'], default='all')
     sp.add_argument('--concurrency', type=int, default=8)
     sp.add_argument('--force', action='store_true', help='忽略断点，强制重跑')
     sp.set_defaults(func=cmd_submit)

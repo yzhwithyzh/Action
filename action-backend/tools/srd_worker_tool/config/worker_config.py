@@ -7,8 +7,7 @@
     SRD_WORKER_MAX_CONCURRENT_LLM      默认 16（跨任务的模型调用总闸）
     SRD_WORKER_LOG_LEVEL               默认 INFO
 
-模型配置沿用引擎自己的 `SRD_*`（SRD_PROVIDER / SRD_MODEL / SRD_API_KEY / SRD_BASE_URL），
-任务 payload 里传的 model 段优先级更高 —— 后端从 ai_model 表取到密钥后直接塞进 payload 即可。
+模型不在这里配：worker 只从后台的 `ai_models` 表取模型池（见 `srd_session_task` 模块 docstring）。
 """
 
 from __future__ import annotations

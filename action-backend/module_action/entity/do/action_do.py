@@ -7,6 +7,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -329,6 +330,10 @@ class ActionGuidelineItem(Base):
     ext_label_en = Column(String(300), nullable=True, server_default="''", comment='扩展列列名（英文）')
     extension_zh = Column(Text, nullable=True, comment='扩展/对照条目内容（中文）')
     extension_en = Column(Text, nullable=True, comment='扩展/对照条目内容（英文）')
+    # 报告助手第二步「要求 / 示例 / 撰写」三段式面板的中间那段。由后台「规范条目管理」逐条录入，
+    # 各规范 docx 里没有这一列，所以 extract_checklists.py 不产出它；为空即「暂无示例」。
+    example_zh = Column(Text, nullable=True, comment='条目示例/范例（中文）')
+    example_en = Column(Text, nullable=True, comment='条目示例/范例（英文）')
     # 报告规范的通例是条目默认都要应答，所以默认 '0'（必填）；只有带「如适用 / if applicable」
     # 这类限定语的才是 '1'。种子由 sql/007 的关键词启发式回填，后台可逐条修正。
     require_level = Column(CHAR(1), nullable=True, server_default='0', comment='填写要求（0必填 1条件填写/选填）')
@@ -825,6 +830,9 @@ class ActionReportReview(Base):
     truncated = Column(CHAR(1), nullable=True, server_default='0', comment='稿件是否被截断（0否 1是）')
     manuscript = Column(Text, nullable=True, comment='稿件正文；删除记录时物理清空')
     consistency = Column(Text, nullable=True, comment='全稿一致性判定结果（JSON）')
+    #: 任务完成了、但有一部分没判成（批次失败 / 条目未作答 / 某条全稿规则没跑成），JSON 字符串数组。
+    #: 与 error_msg 不同：那一列是「整个任务失败」的原因。sql/039；删除记录时物理清空
+    run_warnings = Column(Text, nullable=True, comment='部分判定未完成的说明（JSON 数组）；删除记录时物理清空')
     del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
     create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
     finish_time = Column(DateTime, nullable=True, comment='任务到终态的时间')
@@ -854,6 +862,10 @@ class ActionReportReviewItem(Base):
     reason = Column(Text, nullable=True, comment='判定说明')
     evidence = Column(Text, nullable=True, comment='判定引用的稿件原文片段；删除记录时物理清空')
     lines = Column(String(200), nullable=True, server_default=text("''"), comment='报告于第几行，逗号分隔')
+    #: 引文回原文核对的结论（sql/037）。只是给人看的提示，status 不因它改变
+    evidence_located = Column(
+        String(8), nullable=True, server_default=text("''"), comment='引文回原文核对：yes / partial / no / 空'
+    )
 class ActionReportTrail(Base):
     """
     官网-报告助手操作留痕
@@ -886,3 +898,216 @@ class ActionReportTrail(Base):
     char_count = Column(Integer, nullable=True, comment='稿件字符数（只记长度，不记内容）')
     note = Column(String(300), nullable=True, server_default=text("''"), comment='系统诊断信息，不得写入稿件内容')
     create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+
+class ActionLiterature(Base):
+    """
+    针灸文献知识库
+
+    「研究背景与讨论智能生成」的唯一数据源。567 篇针刺文献 PDF 由
+    `tools/lit_ingest.py` 离线抽取入库，后台「参考文献管理」页做人工复核与修正。
+
+    **这张表的记录是机器抽取的产物，不是人工录入的。** 后台页面的主要工作是
+    「复核」而不是「新增」—— 一条记录必须对应一个真实的 PDF 文件（`corpus_no`
+    的唯一约束就是这条纪律的落点），手工凭空建一条会得到一份没有原文可核的元数据。
+
+    `authors` / `condition` / `intervention` / `comparator` / `outcomes` /
+    `acu_points` 等列是 **JSON 文本**，读写在 `LiteratureService` 里成对完成。
+    用 text 不用 jsonb：整体读写、不在库内按字段查。
+
+    `condition_group` 是病种上位类目（见 `ActionConditionDict`），
+    **覆盖度统计与检索扩展按它算，不按原始 `condition`** —— 原始标签 485 个、
+    80% 只出现一次，按它算几乎所有研究方向都会被判「本库撑不住」。
+    """
+
+    __tablename__ = 'action_literature'
+    __table_args__ = (
+        UniqueConstraint('corpus_no', name='uk_action_literature_corpus_no'),
+        {'comment': '针灸文献知识库'},
+    )
+
+    lit_id = Column(BigInteger, primary_key=True, autoincrement=True, comment='文献id')
+    corpus_no = Column(Integer, nullable=False, comment='语料编号（目录.xlsx 的「新编号」，唯一）')
+    file_name = Column(String(500), nullable=False, comment='PDF 文件名')
+    title = Column(String(1000), nullable=False,
+                   comment='原文题名，按 PDF 原语言照录（中文文献存中文题名）。引用输出用这一列')
+    title_en = Column(String(1000), nullable=True,
+                      comment='英文题名，取自目录.xlsx；同时是抽取时的防夹带锚。英文文献与 title 同值')
+
+    year = Column(Integer, nullable=True, comment='出版年')
+    year_evidence = Column(String(300), nullable=True, server_default=text("''"), comment='判定出版年所依据的原文片段')
+    year_confidence = Column(String(10), nullable=True, server_default=text("'low'"), comment='high/low')
+    authors = Column(Text, nullable=True, comment='作者 JSON 数组，顺序即署名顺序')
+    journal = Column(String(300), nullable=True, server_default=text("''"), comment='期刊名')
+    country = Column(String(100), nullable=True, server_default=text("''"), comment='国家')
+    lang = Column(CHAR(2), nullable=True, server_default=text("'zh'"), comment='文献语言 zh/en')
+
+    abstract = Column(Text, nullable=True, comment='摘要')
+    population = Column(String(1000), nullable=True, server_default=text("''"), comment='研究对象')
+    condition = Column(Text, nullable=True, comment='病种 JSON 数组（归一化中文标签，非原文）')
+    condition_norm = Column(Text, nullable=True, comment='规范病种名 JSON 数组')
+    condition_group = Column(Text, nullable=True, comment='上位病种类目 JSON 数组，覆盖度按它算')
+    intervention = Column(Text, nullable=True, comment='干预 JSON 数组')
+    comparator = Column(Text, nullable=True, comment='对照 JSON 数组，短标签；自由文本会让下游分组静默漂移')
+    outcomes = Column(Text, nullable=True, comment='结局指标 JSON 数组')
+    tcm_syndrome = Column(Text, nullable=True, comment='中医证候 JSON 数组')
+
+    study_design = Column(String(20), nullable=True, server_default=text("'other'"), comment='研究设计')
+    sample_size = Column(Integer, nullable=True, comment='总样本量')
+    effect_direction = Column(
+        String(20), nullable=True, server_default=text("'unclear'"), comment='效应方向，按主要结局判'
+    )
+    finding_summary = Column(Text, nullable=True, comment='主要结果概括')
+
+    acu_points = Column(Text, nullable=True, comment='穴位 JSON 数组，国际代码优先')
+    acu_meridian = Column(Text, nullable=True, comment='经络 JSON 数组')
+    acu_method = Column(String(200), nullable=True, server_default=text("''"), comment='针法')
+    acu_frequency = Column(String(200), nullable=True, server_default=text("''"), comment='电针频率')
+    acu_deqi = Column(CHAR(1), nullable=True, comment='是否报告得气：1是 0否 null未提及')
+    acu_retention_min = Column(Integer, nullable=True, comment='留针分钟数')
+    acu_sessions = Column(Integer, nullable=True, comment='总治疗次数')
+    acu_course_weeks = Column(Integer, nullable=True, comment='疗程周数')
+
+    contamination = Column(CHAR(1), nullable=True, server_default='0', comment='PDF 是否夹带其他论文内容')
+    contamination_note = Column(String(1000), nullable=True, server_default=text("''"), comment='夹带说明')
+    contam_kind = Column(String(20), nullable=True, server_default=text("''"), comment='夹带形态')
+    clean_status = Column(String(20), nullable=True, server_default=text("'na'"), comment='切除结果')
+    clean_ratio = Column(Integer, nullable=True, comment='切除后正文占原文百分比')
+    intruders = Column(Text, nullable=True, comment='混入的其他论文标题 JSON 数组')
+    truncated = Column(CHAR(1), nullable=True, server_default='0', comment='本文后半截不在本 PDF 里')
+    review_status = Column(String(20), nullable=True, server_default=text("'pending'"), comment='人工复核状态')
+    review_by = Column(String(64), nullable=True, server_default=text("''"), comment='复核人')
+    review_time = Column(DateTime, nullable=True, comment='复核时间')
+
+    #: 检索向量。float32 小端原始字节（numpy tobytes），**已 L2 归一化**，检索时点积即余弦。
+    #: 567 × 1024 × 4B = 2.2MB，全量常驻内存 numpy 暴力算 —— 不装 pgvector、不引向量库。
+    #: `embed_hash` 是送去 embed 那段文本的指纹：后台改了标题/摘要/病种标签之后向量就过期了，
+    #: 而**过期的表现是「这篇检索排位莫名其妙」，没有任何报错**，不靠 hash 就永远发现不了。
+    #: `embed_model` 同理不能省 —— 不同模型的向量空间不可比，换模型必须全量重算。
+    embedding = Column(LargeBinary, nullable=True, comment='检索向量（float32 原始字节，已归一化）')
+    embed_model = Column(String(100), nullable=True, server_default=text("''"), comment='算这条向量的模型标识')
+    embed_dim = Column(Integer, nullable=True, comment='向量维度')
+    embed_hash = Column(String(64), nullable=True, server_default=text("''"), comment='embed 输入文本的指纹')
+    embed_time = Column(DateTime, nullable=True, comment='向量计算时间')
+
+    extract_model = Column(String(200), nullable=True, server_default=text("''"), comment='抽取所用模型')
+    extract_status = Column(String(20), nullable=True, server_default=text("'ok'"), comment='抽取状态')
+    extract_error = Column(String(500), nullable=True, server_default=text("''"), comment='抽取失败原因')
+    extract_time = Column(DateTime, nullable=True, comment='抽取时间')
+    pages = Column(Integer, nullable=True, comment='PDF 页数')
+    text_chars = Column(Integer, nullable=True, comment='正文字符数')
+
+    status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用，停用即不进检索）')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_by = Column(String(64), nullable=True, server_default=text("''"), comment='创建者')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_by = Column(String(64), nullable=True, server_default=text("''"), comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+    remark = Column(String(500), nullable=True, comment='备注')
+
+
+class ActionLiteratureText(Base):
+    """
+    针灸文献全文，与 `ActionLiterature` 1:1
+
+    **单独一张表**：567 篇全文合计 14.3M 字符、单篇中位 17.9k。列表查询与检索排序
+    都不读正文，混在主表里会让每次 `select *` 平均多拖 20KB。
+
+    `clean_text` 是切除 PDF 夹带内容后的正文（见 `tools/lit_declean.py`）。
+    **检索与展示用它，元数据重抽仍用 `full_text`** —— 原文要留着，切错了能回滚、
+    人工复核时能看到切掉的是什么。为空表示无须切除。
+    """
+
+    __tablename__ = 'action_literature_text'
+    __table_args__ = {'comment': '针灸文献全文'}
+
+    lit_id = Column(BigInteger, primary_key=True, comment='文献id')
+    corpus_no = Column(Integer, nullable=False, comment='语料编号')
+    full_text = Column(Text, nullable=True, comment='NFKC 规范化后的 PDF 正文')
+    clean_text = Column(Text, nullable=True, comment='切除夹带后的正文；为空表示无须切除')
+
+
+class ActionConditionDict(Base):
+    """
+    病种词表：原始标签 → 规范名 → 上位类目
+
+    抽取产出的 `condition` 是模型按各篇原文写的自由标签，实测 566 篇产出 485 个
+    不同标签、80% 只出现一次（失眠散在 15 种写法里共 38 篇）。不归并的直接后果是
+    覆盖度闸对几乎所有研究方向都判「本库撑不住」，而库里其实有料。
+
+    **norm 与 group 必须分两层**：「围绝经期失眠」不是「失眠」的另一种写法 ——
+    人群、病因、干预方案都不同，合并到 norm 就是把两类研究混为一谈；但判
+    「这个方向撑不撑得住」时它确实该算进失眠。一层解决不了这个矛盾。
+
+    `source='manual'` 的行由 `tools/lit_conditions.py` 重跑时**不覆盖**，
+    同 `action_site_text` 的人工覆盖优先。
+    """
+
+    __tablename__ = 'action_condition_dict'
+    __table_args__ = {'comment': '病种词表'}
+
+    raw_name = Column(String(200), primary_key=True, comment='原始标签，永不修改')
+    norm_name = Column(String(200), nullable=False, comment='规范名，只合并同义词与异写')
+    group_name = Column(String(200), nullable=False, comment='上位类目，覆盖度统计与检索扩展用')
+    system_name = Column(String(50), nullable=True, server_default=text("'其他'"), comment='人体系统归类')
+    hits = Column(Integer, nullable=True, server_default='0', comment='该标签在语料中出现的篇数')
+    source = Column(String(20), nullable=True, server_default=text("'llm'"), comment='llm/manual，人工优先')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+
+
+class ActionBackgroundRun(Base):
+    """
+    背景与讨论智能生成任务（报告助手第四步的第四个工具）
+
+    研究方向 → 检索 `ActionLiterature` → 研究背景初稿 + 推荐近 3-5 年核心文献。
+    算法在 `tools/background_worker_tool`。
+
+    **为什么不走 `/report-assist` 那条同步路**：另外三个工具（续写/润色/翻译）是秒级
+    单次模型调用；这一个是 PICO + 4 槽检索 + 4 槽写作 + 引证核验，实测约 5 分钟，
+    同步跑必然超时。所以照第三步 checklist 校验那套「提交 → 轮询」的 worker 模式另建。
+
+    **结果整块存 JSON 不拆子表**：一次生成的产出（正文分段 / 参考文献 / 引证核验）
+    只作为一次生成的完整快照被读取与展示，没有跨记录的查询需求。拆子表只换来级联维护。
+
+    **`corpus_snapshot` 必须存快照，不能查的时候现算**：语料构成（「阴性 0 篇」那组
+    数字）是这次生成的证据基础。文献库随时会补录，三个月后现算会得到与当时不同的数字，
+    而用户当初正是基于那组数字判断该不该信这段背景的。
+    """
+
+    __tablename__ = 'action_background_run'
+    __table_args__ = {'comment': '背景与讨论智能生成任务'}
+
+    run_id = Column(BigInteger, primary_key=True, autoincrement=True, comment='任务id')
+    user_id = Column(BigInteger, nullable=False, comment='访客id')
+    session_id = Column(String(64), nullable=False, comment='worker 任务id，轮询用')
+    topic = Column(String(500), nullable=False, comment='用户输入的研究方向；删除时随记录物理清除')
+    guideline_code = Column(String(64), nullable=True, server_default=text("''"), comment='按哪份规范写')
+    locale = Column(String(8), nullable=True, server_default=text("'zh'"), comment='语言')
+
+    run_status = Column(String(20), nullable=True, server_default=text("'pending'"), comment='任务状态')
+    progress = Column(Integer, nullable=True, server_default='0', comment='进度百分比')
+    phase = Column(String(20), nullable=True, server_default=text("''"), comment='当前阶段 pico/search/write/verify')
+    error_msg = Column(String(500), nullable=True, server_default=text("''"), comment='失败原因')
+
+    condition_group = Column(String(200), nullable=True, server_default=text("''"), comment='命中的病种上位类目')
+    slot_total = Column(Integer, nullable=True, server_default='0', comment='段落总数')
+    slot_blocked = Column(
+        Integer, nullable=True, server_default='0',
+        comment='被覆盖度闸拦下的段落数。**这不是失败**：本库缺流行病学文献时 S1 永远被拦，如实报告是正确行为',
+    )
+    ref_count = Column(Integer, nullable=True, server_default='0', comment='参考文献条数')
+    partial_count = Column(
+        Integer, nullable=True, server_default='0',
+        comment='引证核验判为 partial 的处数。引文真实、数据真实、但那篇文献不支持这句话',
+    )
+    retrieve_mode = Column(
+        String(30), nullable=True, server_default=text("''"),
+        comment='vector+rerank / vector / bm25。**bm25 表示降级了**，实测 P@5 由 0.94 掉到 0.73',
+    )
+
+    result_json = Column(Text, nullable=True, comment='完整结果快照')
+    corpus_snapshot = Column(Text, nullable=True, comment='生成当时的语料构成，必须存快照')
+    model_label = Column(String(200), nullable=True, server_default=text("''"), comment='出结果的模型')
+
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    finish_time = Column(DateTime, nullable=True, comment='结束时间')

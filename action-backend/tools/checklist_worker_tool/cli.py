@@ -32,7 +32,10 @@ MIN_MANUSCRIPT_CHARS = 200
 
 
 def _read_manuscript(source: str) -> str:
-    """从文件或 stdin 读稿件。稿件不落库、不落盘，只在队列与 worker 进程里流转。"""
+    """从文件或 stdin 读稿件（UTF-8 纯文本；docx/pdf 请先用后端的 manuscript_parse 转成文本）。
+
+    CLI 这条路上稿件不进业务库，只随 payload 进 Redis 队列、被 worker 取走后留在进程内存里。
+    """
     text = sys.stdin.read() if source == '-' else Path(source).read_text(encoding='utf-8')
     text = text.strip()
     if len(text) < MIN_MANUSCRIPT_CHARS:
@@ -42,6 +45,12 @@ def _read_manuscript(source: str) -> str:
 
 
 async def cmd_submit(args: argparse.Namespace) -> int:
+    """投递一次校验，打印 session_id。
+
+    等价于官网后端 `POST /action/site/checklist-review` 的投递那一半，但**不写业务库**：
+    不建 `action_report_review` 台账，跑完的结果只在 Redis 任务状态与 worker 的留档文件里。
+    用来在不开浏览器、不登录的情况下验证 worker 与模型配置。
+    """
     payload: dict[str, object] = {
         'user_id': args.user_id,
         'guideline_code': args.guideline,
@@ -64,6 +73,7 @@ async def cmd_submit(args: argparse.Namespace) -> int:
 
 
 async def cmd_status(args: argparse.Namespace) -> int:
+    """打印任务状态 JSON（与后端轮询接口读到的是同一份）。任务状态在 Redis 里保留 task_ttl（默认 7 天）。"""
     async with TaskClient(CONFIG) as client:
         state = await client.status(args.session_id)
     if state is None:
@@ -75,6 +85,7 @@ async def cmd_status(args: argparse.Namespace) -> int:
 
 
 async def cmd_logs(args: argparse.Namespace) -> int:
+    """打印任务日志；`-f` 时订阅实时日志，直到 worker 写出结束事件（与前台 SSE 同一个源）。"""
     async with TaskClient(CONFIG) as client:
         if not args.follow:
             for record in await client.logs(args.session_id):
@@ -87,6 +98,10 @@ async def cmd_logs(args: argparse.Namespace) -> int:
 
 
 async def cmd_stop(args: argparse.Namespace) -> int:
+    """请求停止：只是在 Redis 里置一个标志，worker 的看门狗每 stop_check_interval 秒查一次。
+
+    引擎内部不认识停止信号，正在飞的那几次模型调用会被取消；已判完的条目不会落进任何结果。
+    """
     async with TaskClient(CONFIG) as client:
         await client.stop(args.session_id)
     print(f'已请求停止，worker 最多 {CONFIG.stop_check_interval}s 后响应')
@@ -95,6 +110,7 @@ async def cmd_stop(args: argparse.Namespace) -> int:
 
 
 async def cmd_queue(_: argparse.Namespace) -> int:
+    """打印队列里还没被取走的任务数。一直不降多半是 worker 没起来，或者后端与 worker 连的不是同一个队列。"""
     async with TaskClient(CONFIG) as client:
         length = await client.queue_length()
     print(f'{CONFIG.queue_key}  待处理 {length} 个')
