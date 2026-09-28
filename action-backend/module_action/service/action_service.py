@@ -34,6 +34,7 @@ from module_action.dao.action_dao import (
     SiteTextDao,
     SrdDao,
     StudyTypeDao,
+    StudyWizardDao,
     TeamMemberDao,
 )
 from module_action.entity.do.action_do import (
@@ -42,13 +43,9 @@ from module_action.entity.do.action_do import (
     ActionReportTrail,
     ActionSrdAssessment,
     ActionStudyType,
+    ActionWizardQuestion,
 )
 from module_action.entity.vo.action_vo import (
-    LiteratureModel,
-    LiteraturePageQueryModel,
-    LiteratureReviewModel,
-    LiteratureStatsModel,
-    LiteratureTextModel,
     MAX_ASSIST_INPUT_CHARS,
     MAX_TRAIL_ROWS,
     MIN_MANUSCRIPT_CHARS,
@@ -76,6 +73,11 @@ from module_action.entity.vo.action_vo import (
     GuidelineItemPageQueryModel,
     GuidelineModel,
     GuidelinePageQueryModel,
+    LiteratureModel,
+    LiteraturePageQueryModel,
+    LiteratureReviewModel,
+    LiteratureStatsModel,
+    LiteratureTextModel,
     NewsModel,
     NewsPageQueryModel,
     PublicationModel,
@@ -111,13 +113,16 @@ from module_action.entity.vo.action_vo import (
     TeamMemberPageQueryModel,
     TrailAddModel,
     TrailModel,
+    WizardOptionModel,
+    WizardQuestionModel,
 )
 from module_action.service.ai_assist_service import AiAssistService
 from module_action.service.publication_parse import build_citation_text
 from module_action.service.report_assist_prompt import AssistContext, needs_current_text
 from module_action.service.report_compose_service import ComposeItem, compose_draft_text
-from module_action.service.report_export_service import BUILDERS, ExportDraft, ExportItem
+from module_action.service.report_export_service import BUILDERS, ExportDraft, ExportItem, build_docx_on
 from module_action.service.srd_export_service import build_assessment_xlsx
+from module_action.service.study_wizard_tree import check_wizard_tree, result_type_refs
 from utils.common_util import CamelCaseUtil
 from utils.log_util import logger
 
@@ -1893,17 +1898,21 @@ class ChecklistReviewService:
         contents = {r.item_id: (r.content or '') for r in existing}
 
         filled = 0
+        # 锚点：这一条取自原稿哪几行、当时填进去的是什么。「生成初稿」拿现在的正文与它比，
+        # 变了的才写回原处（manuscript_rebuild）
+        anchors: dict[str, dict[str, Any]] = {}
         for r in rows:
             item_id = int(r['item_id'])
             if contents.get(item_id, '').strip():
                 continue
             if r.get('status') == 'missing' or r.get('located') not in ('yes', 'partial'):
                 continue
-            nums = [int(n) for n in str(r.get('lines') or '').split(',') if n.strip().isdigit()]
-            text = '\n'.join(lines[n] for n in sorted(set(nums)) if n in lines)
+            nums = sorted({int(n) for n in str(r.get('lines') or '').split(',') if n.strip().isdigit()})
+            text = '\n'.join(lines[n] for n in nums if n in lines)
             if not text.strip():
                 continue
             contents[item_id] = text
+            anchors[str(item_id)] = {'lines': nums, 'text': text}
             filled += 1
 
         if not filled:
@@ -1913,6 +1922,9 @@ class ChecklistReviewService:
         valid_ids = {int(it['itemId']) for it in items}
         try:
             await ReportDraftDao.replace_draft_items(query_db, run.draft_id, run.user_id, contents, valid_ids)
+            await ReportDraftDao.save_source_dao(
+                query_db, run.draft_id, {'anchors': json.dumps(anchors, ensure_ascii=False)}
+            )
             await query_db.commit()
         except Exception:
             await query_db.rollback()
@@ -2089,16 +2101,19 @@ class StudyTypeService:
     """
 
     @classmethod
-    async def get_study_type_tree_services(cls, query_db: AsyncSession) -> list[StudyTypeModel]:
+    async def get_study_type_tree_services(
+        cls, query_db: AsyncSession, include_disabled: bool = False
+    ) -> list[StudyTypeModel]:
         """
         获取研究类型及其关联规范、统计推荐
 
         单独取三张表后在内存里组装，避免 ORM 关系映射带来的 N+1 查询。
 
         :param query_db: orm对象
+        :param include_disabled: 是否连停用的一起取（后台列表要，官网不要）
         :return: 研究类型列表
         """
-        types = await StudyTypeDao.get_study_type_list(query_db)
+        types = await StudyTypeDao.get_study_type_list(query_db, include_disabled)
         type_ids = [t.type_id for t in types]
         guidelines = await StudyTypeDao.get_guidelines_by_type_ids(query_db, type_ids)
         stats = await StudyTypeDao.get_stats_by_type_ids(query_db, type_ids)
@@ -2119,6 +2134,9 @@ class StudyTypeService:
                 nameEn=t.name_en,
                 hotGuideline=t.hot_guideline,
                 sortNum=t.sort_num,
+                tipZh=t.tip_zh or '',
+                tipEn=t.tip_en or '',
+                status=t.status,
                 guidelines=gl_map.get(t.type_id, []),
                 stats=stat_map.get(t.type_id, []),
             )
@@ -2166,7 +2184,7 @@ class StudyTypeService:
         :param keyword: 按标识或名称模糊搜索
         :return: 研究类型列表（含两张子表）
         """
-        rows = await cls.get_study_type_tree_services(query_db)
+        rows = await cls.get_study_type_tree_services(query_db, include_disabled=True)
         kw = (keyword or '').strip().lower()
         if not kw:
             return rows
@@ -2206,6 +2224,8 @@ class StudyTypeService:
                 hot_guideline=save.hot_guideline,
                 sort_num=sort_num,
                 status=save.status,
+                tip_zh=save.tip_zh,
+                tip_en=save.tip_en,
                 create_by=operator,
                 create_time=datetime.now(),
                 update_by=operator,
@@ -2220,12 +2240,12 @@ class StudyTypeService:
             await query_db.rollback()
             raise e
 
-        # 前台第一步的选项直接来自本表（`GET /action/site/study-types`），入库即生效，
-        # 不再需要开发同步任何前端常量。剩下的只有「访客要等官网那次重取」这一条时效说明
+        # sql/041 起第一步是分支问卷，研究类型是问卷的「判定结果」—— 新类型不挂到某个
+        # 选项上，用户就永远选不到它。这句提醒比「新增成功」四个字重要
         return CrudResponseModel(
             is_success=True,
-            message='新增成功。官网第一步的选项直接取自本表，访客刷新即可看到；'
-            '要让搜索引擎与分享卡片也看到，请到「站点文案管理」页点一次「重新生成官网」',
+            message='新增成功。注意：还需要在「分支问卷」里把某个选项的判定结果指向它，'
+            '官网第一步才能选到这一类研究',
         )
 
     @classmethod
@@ -2250,6 +2270,13 @@ class StudyTypeService:
             exist = await StudyTypeDao.get_study_type_by_key(query_db, save.type_key)
             if exist and exist.type_id != save.type_id:
                 raise ServiceException(message=f'修改失败，类型标识 {save.type_key} 已存在')
+        if save.status == '1' and current.status != '1':
+            refs = result_type_refs(await StudyWizardService.get_wizard_tree_services(query_db), old_key)
+            if refs:
+                raise ServiceException(
+                    message=f'分支问卷里还有选项判定为这一类（{"、".join(refs)}），'
+                    '停用后用户选到那里会看不到结果。请先在「分支问卷」里改掉这些选项'
+                )
 
         try:
             await StudyTypeDao.edit_study_type_dao(
@@ -2262,6 +2289,8 @@ class StudyTypeService:
                     'hot_guideline': save.hot_guideline,
                     'sort_num': save.sort_num if save.sort_num is not None else current.sort_num,
                     'status': save.status,
+                    'tip_zh': save.tip_zh,
+                    'tip_en': save.tip_en,
                     'update_by': operator,
                     'update_time': datetime.now(),
                 },
@@ -2269,17 +2298,19 @@ class StudyTypeService:
             await StudyTypeDao.replace_type_children_dao(
                 query_db, save.type_id, save.guidelines, [(s.text_zh or '', s.text_en or '') for s in save.stats]
             )
+            if save.type_key != old_key:
+                # 分支问卷的选项按标识指向这里，不连带改的话那几个选项就成了死路
+                await StudyWizardDao.rename_result_type_dao(query_db, old_key, save.type_key)
             await query_db.commit()
         except Exception as e:
             await query_db.rollback()
             raise e
 
         if save.type_key != old_key:
-            # 标识进 URL（`/assistant?type=<key>`），改了之后老链接就还原不到这一项了
             return CrudResponseModel(
                 is_success=True,
-                message=f'更新成功。注意：类型标识由 {old_key} 改为 {save.type_key}，'
-                f'带着 ?type={old_key} 的旧链接将无法还原到这个选项',
+                message=f'更新成功。类型标识由 {old_key} 改为 {save.type_key}，'
+                '分支问卷里指向它的选项已一并改过去',
             )
 
         return CrudResponseModel(is_success=True, message='更新成功')
@@ -2296,14 +2327,186 @@ class StudyTypeService:
         id_list = [int(i) for i in type_ids.split(',') if i.strip()]
         if not id_list:
             raise ServiceException(message='传入类型id为空')
+        tree = await StudyWizardService.get_wizard_tree_services(query_db)
+        for type_id in id_list:
+            row = await StudyTypeDao.get_study_type_by_id(query_db, type_id)
+            refs = result_type_refs(tree, row.type_key) if row else []
+            if refs:
+                raise ServiceException(
+                    message=f'研究类型「{row.name_zh}」仍被分支问卷的选项引用（{"、".join(refs)}），'
+                    '请先在「分支问卷」里改掉这些选项再删'
+                )
         try:
             await StudyTypeDao.delete_study_types_dao(query_db, id_list)
             await query_db.commit()
 
-            return CrudResponseModel(is_success=True, message='删除成功，官网第一步的选项会同步减少')
+            return CrudResponseModel(is_success=True, message='删除成功')
         except Exception as e:
             await query_db.rollback()
             raise e
+
+
+class StudyWizardService:
+    """
+    报告助手第一步分支问卷服务层（sql/041）
+
+    问卷是一棵树，官网按《ACTION智能匹配研究类型.docx》的分支逻辑逐层弹出下一题，
+    叶子选项判定出一类研究（`action_study_type`），那一类挂什么规范、推荐什么统计方法
+    仍由研究类型那张表管。结构校验在 `study_wizard_tree.check_wizard_tree`。
+    """
+
+    @classmethod
+    async def get_wizard_tree_services(cls, query_db: AsyncSession) -> list[WizardQuestionModel]:
+        """
+        全部问题连同选项。官网与后台用的是同一份 —— 整棵树十来道题，官网拿去自己走
+
+        :param query_db: orm对象
+        :return: 问题列表（含选项，按顺序）
+        """
+        questions = await StudyWizardDao.get_question_list(query_db)
+        options = await StudyWizardDao.get_option_list(query_db)
+        opt_map: dict[int, list[WizardOptionModel]] = defaultdict(list)
+        for o in options:
+            opt_map[o.question_id].append(
+                WizardOptionModel(
+                    option_id=o.option_id,
+                    opt_key=o.opt_key,
+                    label_zh=o.label_zh,
+                    label_en=o.label_en or '',
+                    next_question_id=o.next_question_id,
+                    result_type_key=o.result_type_key or '',
+                    tip_zh=o.tip_zh or '',
+                    tip_en=o.tip_en or '',
+                )
+            )
+
+        return [
+            WizardQuestionModel(
+                question_id=q.question_id,
+                q_key=q.q_key,
+                text_zh=q.text_zh,
+                text_en=q.text_en or '',
+                is_root=q.is_root or '0',
+                sort_num=q.sort_num,
+                options=opt_map.get(q.question_id, []),
+            )
+            for q in questions
+        ]
+
+    @classmethod
+    async def _assert_tree_valid(cls, query_db: AsyncSession) -> list[str]:
+        """
+        读回整棵树（含本事务里尚未提交的改动）做结构校验，有错直接抛
+
+        :param query_db: orm对象
+        :return: 警告（不拦）
+        :raises ServiceException: 结构有错
+        """
+        await query_db.flush()
+        tree = await cls.get_wizard_tree_services(query_db)
+        type_keys = {t.type_key for t in await StudyTypeDao.get_study_type_list(query_db)}
+        errors, warnings = check_wizard_tree(tree, type_keys)
+        if errors:
+            raise ServiceException(message='未生效：' + '；'.join(errors))
+
+        return warnings
+
+    @classmethod
+    async def save_question_services(
+        cls, query_db: AsyncSession, save: WizardQuestionModel, operator: str
+    ) -> CrudResponseModel:
+        """
+        新增或编辑一道题（`question_id` 为空即新增），选项整体覆盖
+
+        :param query_db: orm对象
+        :param save: 入参
+        :param operator: 操作人
+        :return: 保存结果（警告放进 message）
+        """
+        exist = await StudyWizardDao.get_question_by_key(query_db, save.q_key)
+        if exist and exist.question_id != save.question_id:
+            raise ServiceException(message=f'保存失败，问题标识 {save.q_key} 已存在')
+        if save.question_id and not await StudyWizardDao.get_question_by_id(query_db, save.question_id):
+            raise ServiceException(message='问题不存在')
+
+        options = [
+            {
+                'opt_key': o.opt_key,
+                'label_zh': o.label_zh,
+                'label_en': o.label_en,
+                'next_question_id': o.next_question_id,
+                'result_type_key': o.result_type_key.strip(),
+                'tip_zh': o.tip_zh.strip(),
+                'tip_en': o.tip_en.strip(),
+            }
+            for o in save.options
+        ]
+        try:
+            if save.question_id:
+                question_id = save.question_id
+                fields: dict[str, Any] = {
+                    'q_key': save.q_key,
+                    'text_zh': save.text_zh,
+                    'text_en': save.text_en,
+                    'is_root': save.is_root,
+                    'update_by': operator,
+                    'update_time': datetime.now(),
+                }
+                if save.sort_num is not None:
+                    fields['sort_num'] = save.sort_num
+                await StudyWizardDao.edit_question_dao(query_db, question_id, fields)
+            else:
+                sort_num = save.sort_num
+                if sort_num is None:
+                    sort_num = await StudyWizardDao.get_max_question_sort_num(query_db) + 1
+                obj = await StudyWizardDao.add_question_dao(
+                    query_db,
+                    ActionWizardQuestion(
+                        q_key=save.q_key,
+                        text_zh=save.text_zh,
+                        text_en=save.text_en,
+                        is_root=save.is_root,
+                        sort_num=sort_num,
+                        create_by=operator,
+                        create_time=datetime.now(),
+                        update_by=operator,
+                        update_time=datetime.now(),
+                    ),
+                )
+                # 取成普通值：下面还要跨好几次 execute，别让后续代码去读 ORM 属性
+                question_id = int(obj.question_id)
+            if save.is_root == '1':
+                await StudyWizardDao.clear_root_except_dao(query_db, question_id)
+            await StudyWizardDao.replace_options_dao(query_db, question_id, options)
+            warnings = await cls._assert_tree_valid(query_db)
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return CrudResponseModel(is_success=True, message='；'.join(['保存成功', *warnings]))
+
+    @classmethod
+    async def delete_question_services(cls, query_db: AsyncSession, question_ids: str) -> CrudResponseModel:
+        """
+        删除问题（连同它自己的选项）。删完树不成立（删了第一题、别的选项还指着它）就整笔回滚
+
+        :param query_db: orm对象
+        :param question_ids: 问题id字符串，多个以逗号分隔
+        :return: 删除结果
+        """
+        id_list = [int(i) for i in question_ids.split(',') if i.strip()]
+        if not id_list:
+            raise ServiceException(message='传入问题id为空')
+        try:
+            await StudyWizardDao.delete_questions_dao(query_db, id_list)
+            warnings = await cls._assert_tree_valid(query_db)
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            raise e
+
+        return CrudResponseModel(is_success=True, message='；'.join(['删除成功', *warnings]))
 
 class ImplementationService:
     """
@@ -3636,6 +3839,12 @@ class ReportDraftService:
             )
             # commit 之后连主键都读不得（expire_on_commit），趁现在抄下来
             new_draft_id = draft.draft_id
+            # 原文件留着：「生成初稿」要从它出发，把改过的条目写回原处、图片表格样式原样保留
+            await ReportDraftDao.save_source_dao(
+                query_db,
+                new_draft_id,
+                {'file_name': safe_name, 'file_ext': Path(safe_name).suffix.lower()[:10], 'file_data': data},
+            )
             await query_db.commit()
         except Exception:
             await query_db.rollback()
@@ -3776,6 +3985,33 @@ class ReportDraftService:
         contents = {row.item_id: row.content or '' for row in rows}
 
         lang = 'en' if locale == 'en' else 'zh'
+
+        # 导入的草稿：初稿 = 原稿 + 改过的条目写回原处（图片、表格、没对应条目的章节原样保留）。
+        # 不能按条目重拼 —— 那会丢掉讨论、致谢、参考文献，也带不过去任何图表
+        built = await cls._rebuild(query_db, draft, items, contents, user_id, lang)
+        if built is not None:
+            result, keeps_layout = built
+            missing = sum(
+                1
+                for it in items
+                if (it.get('requireLevel') or '0') == '0' and not contents.get(int(it['itemId']), '').strip()
+            )
+            st = result.stats
+            return ReportDraftComposeModel(
+                draftId=draft_id,
+                text=result.text,
+                charCount=len(result.text),
+                missingRequired=missing,
+                fromSource=True,
+                keepsLayout=keeps_layout,
+                replaced=st.replaced,
+                inserted=st.inserted,
+                appended=st.appended,
+                removed=st.removed,
+                images=st.images,
+                tables=st.tables,
+            )
+
         # 已被后台停用/删除的条目，它的正文仍是用户写的东西 —— 合成时不能因为「没有对应条目」
         # 就静默丢掉，那会让用户拿到一份看起来完整、实际少了几段的初稿。挪到末尾单独成节
         valid_ids = {int(it['itemId']) for it in items}
@@ -3807,6 +4043,102 @@ class ReportDraftService:
             charCount=result.char_count,
             missingRequired=result.missing_required,
         )
+
+    @classmethod
+    async def _anchors_of(
+        cls, query_db: AsyncSession, draft: Any, source: Any, user_id: int, line_texts: dict[int, str]
+    ) -> dict[int, dict[str, Any]]:
+        """
+        条目锚点：导入时每条取自原稿哪几行、填进去的是什么
+
+        044 起导入回填时就存下了；之前导入的老草稿没存，从那次导入的映射记录现推
+        （规则与 `_backfill_draft` 逐字一致）。两样都没有就返回空 —— 生成时所有改过的条目
+        都当成「没有位置」按清单顺序插入，原稿本身一个字不丢。
+        """
+        if source is not None and (source.anchors or '').strip():
+            with contextlib.suppress(ValueError, TypeError):
+                raw = json.loads(source.anchors)
+                return {int(k): v for k, v in raw.items()}
+
+        review = await ReportReviewDao.get_import_review_dao(query_db, draft.draft_id, user_id)
+        if review is None:
+            return {}
+        out: dict[int, dict[str, Any]] = {}
+        for r in await ReportReviewDao.get_review_items_dao(query_db, review.review_id):
+            if r.status == 'missing' or (r.evidence_located or '') not in ('yes', 'partial'):
+                continue
+            nums = sorted({int(n) for n in (r.lines or '').split(',') if n.strip().isdigit()})
+            text = '\n'.join(line_texts[n] for n in nums if n in line_texts)
+            if text.strip():
+                out[int(r.item_id)] = {'lines': nums, 'text': text}
+
+        return out
+
+    @classmethod
+    async def _rebuild(
+        cls,
+        query_db: AsyncSession,
+        draft: Any,
+        items: list[dict[str, Any]],
+        contents: dict[int, str],
+        user_id: int,
+        lang: str,
+    ) -> tuple[Any, bool] | None:
+        """
+        导入的草稿：从原稿出发、把改过的条目写回原处，得到新稿件（见 `manuscript_rebuild`）
+
+        :return: (重建结果, 是否保留了原稿版式)；不是导入的草稿时为 None
+        """
+        # 逐条填出来的草稿没有原稿（getattr：单测里的草稿桩不带这个字段）
+        source_text = getattr(draft, 'source_text', '') or ''
+        if not source_text.strip():
+            return None
+
+        from module_action.service.manuscript_rebuild import ItemEdit, rebuild  # noqa: PLC0415
+
+        draft_id = draft.draft_id
+        source = await ReportDraftDao.get_source_dao(query_db, draft_id)
+        line_texts = _manuscript_line_map(source_text)
+        anchors = await cls._anchors_of(query_db, draft, source, user_id, line_texts)
+        edits = []
+        for it in items:
+            item_id = int(it['itemId'])
+            a = anchors.get(item_id) or {}
+            edits.append(
+                ItemEdit(
+                    item_id=item_id,
+                    lines=tuple(int(n) for n in a.get('lines') or ()),
+                    baseline=str(a.get('text') or ''),
+                    current=contents.get(item_id, ''),
+                )
+            )
+        data = source.file_data if source is not None else None
+        name = (source.file_name if source is not None else '') or ''
+        # python-docx / pymupdf 都是同步阻塞的，几十页的稿子能占住事件循环好几百毫秒
+        try:
+            result = await asyncio.to_thread(rebuild, name, data, source_text, line_texts, edits, lang)
+        except Exception as e:
+            # 原文件读不动（损坏、格式意外）时退回按纯文本重建，不让用户卡在这一步
+            logger.warning(f'按原稿重建失败 draft={draft_id}，退回纯文本：{type(e).__name__}: {e}')
+            result = await asyncio.to_thread(rebuild, '', None, source_text, line_texts, edits, lang)
+            data = None
+
+        return result, bool(data) and Path(name).suffix.lower() in ('.docx', '.pdf')
+
+    @classmethod
+    async def _rebuild_docx(
+        cls,
+        query_db: AsyncSession,
+        draft: Any,
+        items: list[dict[str, Any]],
+        contents: dict[int, str],
+        user_id: int,
+        lang: str,
+    ) -> bytes | None:
+        """导出用：只要重建后的 docx 字节"""
+        built = await cls._rebuild(query_db, draft, items, contents, user_id, lang)
+
+        return built[0].docx if built is not None else None
 
 
     @classmethod
@@ -3870,12 +4202,15 @@ class ReportDraftService:
             )
             for it in items
         ]
-        payload = build(
-            ExportDraft(
-                title=title, guideline_code=code, items=tuple(export_items), source_text=source_text
-            ),
-            lang,
-        )
+        export = ExportDraft(title=title, guideline_code=code, items=tuple(export_items), source_text=source_text)
+        payload = None
+        if ext == 'docx' and source_text.strip():
+            # 导入的草稿：正文 = 原稿 + 改过的条目写回原处，图片、表格、样式都在（与「生成初稿」同一份）
+            built = await cls._rebuild_docx(query_db, draft, items, contents, user_id, lang)
+            if built is not None:
+                payload = build_docx_on(built, export, lang)
+        if payload is None:
+            payload = build(export, lang)
 
         # 文件名里带草稿名，但**只保留安全字符**：这个值进 Content-Disposition，
         # 用户能自取的字符串里混进换行或引号就能往响应头里注入
@@ -4107,13 +4442,23 @@ class ReportReviewService:
             raise ServiceException(
                 message='请先给几个关键词，或先在第二步写一句' if from_draft else '请先给几个关键词'
             )
+        # 「AI 完善」对着空条目、又没有任何补充意见时，模型手里只有条目要求 ——
+        # 写出来的会是一段满屏【待补充】的空壳，看着像完成了其实什么也没说
+        if req.action == 'refine' and not req.instruction.strip() and not ctx.current_text.strip():
+            raise ServiceException(message='这一条还是空的，请先写几句，或在补充意见里给出要点')
         # 一条 checklist 应答不该长过这个数，超了多半是把整篇稿子粘进来了。
         # 独立模式下入参已由 VO 的 max_length 挡过一道，这里兜的是草稿里存量的超长正文
         if len(ctx.current_text) > MAX_ASSIST_INPUT_CHARS:
             raise ServiceException(message=f'正文超过 {MAX_ASSIST_INPUT_CHARS} 字符，请先拆分')
 
         text, label = await AiAssistService.rewrite(
-            query_db, action=req.action, ctx=ctx, style=req.style, keywords=req.keywords, locale=lang
+            query_db,
+            action=req.action,
+            ctx=ctx,
+            style=req.style,
+            keywords=req.keywords,
+            locale=lang,
+            instruction=req.instruction,
         )
 
         return AssistResultModel(itemId=req.item_id or 0, action=req.action, text=text, modelLabel=label)

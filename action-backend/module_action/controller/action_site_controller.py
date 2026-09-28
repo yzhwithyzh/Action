@@ -62,6 +62,7 @@ from module_action.entity.vo.action_vo import (
     TeamMemberPageQueryModel,
     TrailAddModel,
     TrailModel,
+    WizardQuestionModel,
 )
 from module_action.service.action_service import (
     BackgroundGenService,
@@ -80,6 +81,7 @@ from module_action.service.action_service import (
     SiteTextService,
     SrdService,
     StudyTypeService,
+    StudyWizardService,
     TeamMemberService,
 )
 from module_action.service.guest_auth_service import GuestAuthService
@@ -437,6 +439,25 @@ async def get_site_study_types(
 ) -> Response:
     result = await StudyTypeService.get_study_type_tree_services(query_db)
     logger.info('获取研究类型成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/study-wizard',
+    summary='获取报告助手第一步的分支问卷',
+    description=(
+        '整棵问卷树（题 + 选项）。第一题 `isRoot=1`；每个选项要么 `nextQuestionId` 弹出下一题，'
+        '要么 `resultTypeKey` 判定为 `/study-types` 里的某一类。前台自己逐层往下走'
+    ),
+    response_model=DataResponseModel[list[WizardQuestionModel]],
+)
+async def get_site_study_wizard(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await StudyWizardService.get_wizard_tree_services(query_db)
+    logger.info('获取分支问卷成功')
 
     return ResponseUtil.success(data=result)
 
@@ -957,8 +978,8 @@ async def create_site_report_draft(
     return ResponseUtil.success(data=result, msg='已新建草稿')
 
 
-# 导入口在**第二步**，不在第三步 —— 第三步只产出只读判定，导进去之后第四步没东西可写回、
-# 第五步整个导不出、下次再来还得重新粘一遍。挂限流：解析 + 几十次模型调用，比新建草稿重得多。
+# 已有稿件从第二步进来：导入即建草稿并把原文分到各条目，之后逐条完善、一致性检查、导出。
+# 挂限流：解析 + 几十次模型调用，比新建草稿重得多。
 @action_site_controller.post(
     '/report-drafts/import',
     summary='导入已有稿件，建草稿并映射到 checklist 条目',

@@ -46,10 +46,17 @@ from dataclasses import dataclass
 ZH = 'zh'
 EN = 'en'
 
-#: 三个动作
+#: 动作
 CONTINUE = 'continue'
 POLISH = 'polish'
 TRANSLATE = 'translate'
+#: 「AI 完善」：第二步逐条撰写时的就地完善（2026-09 起向导收成三步后的主力动作）。
+#: 与 continue / polish 的区别：它的目标是**让这一条满足条目要求**——空的从零写、
+#: 有的补全要素并扩写，同时把作者在「补充意见」里给的事实与要求融进去
+REFINE = 'refine'
+
+#: 作者补充意见的上限。它是给模型的事实与修改要求，不是正文，长过这个数多半是粘错了地方
+MAX_INSTRUCTION_CHARS = 1000
 
 
 @dataclass(frozen=True)
@@ -181,15 +188,25 @@ def _verdict_block(ctx: AssistContext, lang: str) -> str:
     return f'{head}{tail}. Your rewrite must address it directly.'
 
 
-def build_messages(action: str, ctx: AssistContext, style: str = '', keywords: str = '', locale: str = ZH) -> list[dict]:
+def build_messages(
+    action: str,
+    ctx: AssistContext,
+    style: str = '',
+    keywords: str = '',
+    locale: str = ZH,
+    instruction: str = '',
+) -> list[dict]:
     """
     构造一次改写调用的消息列表
 
-    :param action: continue / polish / translate
+    :param action: continue / polish / translate / refine
     :param ctx: 条目上下文
     :param style: 润色风格，仅 polish 用；不在表内一律按 rigorous
     :param keywords: 续写关键词，仅 continue 用
     :param locale: 界面语言，决定提示词语言与输出语言（translate 例外，固定输出英文）
+    :param instruction: 作者的补充意见，仅 refine 用。**进 user 消息、标明是作者提供的**：
+        它是作者自己给的事实（「对照组浅刺非穴位点，留针 20 分钟」），按硬约束 2
+        属于「已提供」、可以写进正文；它不是指令通道，system 里那三条照发不误
     :return: [{'role': ..., 'content': ...}, ...]
     :raises ValueError: action 不认识
     """
@@ -227,6 +244,28 @@ def build_messages(action: str, ctx: AssistContext, style: str = '', keywords: s
             'international acupuncture research (e.g. de qi). Output the translation only.'
         )
         user = ('待翻译正文：\n' if lang == ZH else 'Passage to translate:\n') + current
+    elif action == REFINE:
+        task = (
+            '任务：完善这一条的报告正文，使它完整满足上面的条目要求。'
+            '已有正文非空时，以它为基础补全缺失的要素、把含糊的表述写具体，保留作者已写的全部事实与数据；'
+            '已有正文为空时，按条目要求从头写出这一段。'
+            '作者补充的信息可以当作事实写进正文；条目要求需要、但作者和已有正文都没提供的内容，'
+            '一律用「【待补充：xxx】」占位。只输出完善后的整段正文。'
+            if lang == ZH
+            else 'Task: refine this item\'s reporting text so that it fully satisfies the requirement above. '
+            'If existing text is present, build on it: fill in missing elements and make vague wording '
+            'specific, keeping every fact and number the author wrote. If it is empty, write the passage '
+            'from scratch. Information the author supplies below may be used as fact; anything the '
+            'requirement calls for that neither the author nor the existing text provides must be a '
+            '"[to be completed: ...]" placeholder. Output the complete refined passage only.'
+        )
+        note = instruction.strip()[:MAX_INSTRUCTION_CHARS]
+        blocks = [
+            ('已有正文：\n' if lang == ZH else 'Existing text:\n') + (current or ('（空）' if lang == ZH else '(empty)')),
+        ]
+        if note:
+            blocks.append(('作者补充的信息与修改意见：\n' if lang == ZH else 'Information and requests from the author:\n') + note)
+        user = '\n\n'.join(blocks)
     else:
         raise ValueError(f'未知的改写动作: {action}')
 

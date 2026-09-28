@@ -209,6 +209,7 @@ class AiAssistService:
         style: str = '',
         keywords: str = '',
         locale: str = 'zh',
+        instruction: str = '',
     ) -> tuple[str, str]:
         """
         跑一次续写 / 润色 / 中译英
@@ -219,9 +220,10 @@ class AiAssistService:
         :param style: 润色风格
         :param keywords: 续写关键词
         :param locale: 界面语言
+        :param instruction: 作者补充意见，仅 refine 用
         :return: (改写后的正文, 出结果的模型标识)
         :raises ServiceException: 池子是空的，或池里所有模型都失败了
         """
-        messages = build_messages(action, ctx, style=style, keywords=keywords, locale=locale)
+        messages = build_messages(action, ctx, style=style, keywords=keywords, locale=locale, instruction=instruction)
 
         return await cls.complete(query_db, messages, failure_hint='AI 改写失败')

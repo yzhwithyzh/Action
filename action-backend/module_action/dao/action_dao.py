@@ -7,17 +7,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from common.constant import CommonConstant
 from common.vo import PageModel
 from module_action.entity.do.action_do import (
+    ActionBackgroundRun,
     ActionCfirConstruct,
     ActionCfirDomain,
     ActionCfirStrategy,
     ActionCollabRequest,
+    ActionConditionDict,
     ActionEricCategory,
     ActionEricStrategy,
     ActionGuestProfile,
     ActionGuideline,
     ActionGuidelineCategory,
-    ActionBackgroundRun,
-    ActionConditionDict,
     ActionGuidelineItem,
     ActionLiterature,
     ActionLiteratureText,
@@ -26,6 +26,7 @@ from module_action.entity.do.action_do import (
     ActionReaimDimension,
     ActionReportDraft,
     ActionReportDraftItem,
+    ActionReportDraftSource,
     ActionReportReview,
     ActionReportReviewItem,
     ActionReportTrail,
@@ -39,6 +40,8 @@ from module_action.entity.do.action_do import (
     ActionStudyTypeGuideline,
     ActionStudyTypeStat,
     ActionTeamMember,
+    ActionWizardOption,
+    ActionWizardQuestion,
 )
 from module_action.entity.vo.action_vo import (
     CollabRequestPageQueryModel,
@@ -46,9 +49,9 @@ from module_action.entity.vo.action_vo import (
     GuidelineCategoryPageQueryModel,
     GuidelineItemModel,
     GuidelineItemPageQueryModel,
-    LiteraturePageQueryModel,
     GuidelineModel,
     GuidelinePageQueryModel,
+    LiteraturePageQueryModel,
     NewsModel,
     NewsPageQueryModel,
     PublicationPageQueryModel,
@@ -1226,18 +1229,19 @@ class StudyTypeDao:
     """
 
     @classmethod
-    async def get_study_type_list(cls, db: AsyncSession) -> list[ActionStudyType]:
+    async def get_study_type_list(cls, db: AsyncSession, include_disabled: bool = False) -> list[ActionStudyType]:
         """
-        获取启用中的研究类型列表
+        获取研究类型列表
 
         :param db: orm对象
+        :param include_disabled: 是否连停用的一起取（后台要能看见停用的行才能再启用）
         :return: 研究类型列表
         """
         return list(
             (
                 await db.execute(
                     select(ActionStudyType)
-                    .where(ActionStudyType.status == '0')
+                    .where(True if include_disabled else ActionStudyType.status == '0')
                     .order_by(ActionStudyType.sort_num, ActionStudyType.type_id)
                 )
             )
@@ -1405,6 +1409,174 @@ class StudyTypeDao:
         if rows:
             db.add_all(rows)
 
+
+class StudyWizardDao:
+    """
+    报告助手第一步分支问卷（`action_wizard_question` + `action_wizard_option`）数据库操作层
+    """
+
+    @classmethod
+    async def get_question_list(cls, db: AsyncSession) -> list[ActionWizardQuestion]:
+        """
+        全部问题。整棵树也就十来道题，不分页
+
+        :param db: orm对象
+        :return: 问题列表
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionWizardQuestion).order_by(ActionWizardQuestion.sort_num, ActionWizardQuestion.question_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def get_option_list(cls, db: AsyncSession) -> list[ActionWizardOption]:
+        """
+        全部选项，按所属问题与顺序排
+
+        :param db: orm对象
+        :return: 选项列表
+        """
+        return list(
+            (
+                await db.execute(
+                    select(ActionWizardOption).order_by(
+                        ActionWizardOption.question_id, ActionWizardOption.sort_num, ActionWizardOption.option_id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def get_question_by_id(cls, db: AsyncSession, question_id: int) -> ActionWizardQuestion | None:
+        """
+        按id取一道题
+
+        :param db: orm对象
+        :param question_id: 问题id
+        :return: 问题；没有则 None
+        """
+        return (
+            (await db.execute(select(ActionWizardQuestion).where(ActionWizardQuestion.question_id == question_id)))
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_question_by_key(cls, db: AsyncSession, q_key: str) -> ActionWizardQuestion | None:
+        """
+        按标识取一道题（判重用）
+
+        :param db: orm对象
+        :param q_key: 问题标识
+        :return: 问题；没有则 None
+        """
+        return (
+            (await db.execute(select(ActionWizardQuestion).where(ActionWizardQuestion.q_key == q_key)))
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_max_question_sort_num(cls, db: AsyncSession) -> int:
+        """
+        当前最大顺序，新题排到末尾
+
+        :param db: orm对象
+        :return: 最大值；表空时 0
+        """
+        return (await db.execute(select(func.coalesce(func.max(ActionWizardQuestion.sort_num), 0)))).scalar() or 0
+
+    @classmethod
+    async def add_question_dao(cls, db: AsyncSession, obj: ActionWizardQuestion) -> ActionWizardQuestion:
+        """
+        新增一道题
+
+        :param db: orm对象
+        :param obj: 问题
+        :return: 落库后的对象（已 flush，主键可用）
+        """
+        db.add(obj)
+        await db.flush()
+
+        return obj
+
+    @classmethod
+    async def edit_question_dao(cls, db: AsyncSession, question_id: int, fields: dict[str, Any]) -> None:
+        """
+        改一道题
+
+        :param db: orm对象
+        :param question_id: 问题id
+        :param fields: 待改字段
+        """
+        await db.execute(
+            update(ActionWizardQuestion).where(ActionWizardQuestion.question_id == question_id).values(**fields)
+        )
+
+    @classmethod
+    async def clear_root_except_dao(cls, db: AsyncSession, question_id: int) -> None:
+        """
+        把除这一道以外的题都置为非第一题 —— 第一题全表唯一
+
+        :param db: orm对象
+        :param question_id: 保留为第一题的问题id
+        """
+        await db.execute(
+            update(ActionWizardQuestion)
+            .where(ActionWizardQuestion.question_id != question_id, ActionWizardQuestion.is_root == '1')
+            .values(is_root='0')
+        )
+
+    @classmethod
+    async def replace_options_dao(cls, db: AsyncSession, question_id: int, options: list[dict[str, Any]]) -> None:
+        """
+        整体覆盖一道题的选项（先删后插，数组下标即 sort_num）
+
+        :param db: orm对象
+        :param question_id: 问题id
+        :param options: 选项字段字典列表
+        """
+        await db.execute(delete(ActionWizardOption).where(ActionWizardOption.question_id == question_id))
+        if options:
+            db.add_all(
+                [ActionWizardOption(question_id=question_id, sort_num=i, **opt) for i, opt in enumerate(options)]
+            )
+        await db.flush()
+
+    @classmethod
+    async def delete_questions_dao(cls, db: AsyncSession, question_ids: list[int]) -> None:
+        """
+        删除问题，连同它们自己的选项
+
+        :param db: orm对象
+        :param question_ids: 问题id列表
+        """
+        if not question_ids:
+            return
+        await db.execute(delete(ActionWizardOption).where(ActionWizardOption.question_id.in_(question_ids)))
+        await db.execute(delete(ActionWizardQuestion).where(ActionWizardQuestion.question_id.in_(question_ids)))
+
+    @classmethod
+    async def rename_result_type_dao(cls, db: AsyncSession, old_key: str, new_key: str) -> None:
+        """
+        研究类型改了标识时，把指向它的选项一并改过去
+
+        :param db: orm对象
+        :param old_key: 旧标识
+        :param new_key: 新标识
+        """
+        await db.execute(
+            update(ActionWizardOption)
+            .where(ActionWizardOption.result_type_key == old_key)
+            .values(result_type_key=new_key)
+        )
 
 
 class ImplementationDao:
@@ -2185,11 +2357,50 @@ class ReportDraftDao:
                 ActionReportDraftItem.draft_id.in_(cls._owned_draft(draft_id, user_id))
             )
         )
+        # 导入的原文件同理物理删：那是一整篇未发表的稿件
+        await db.execute(
+            delete(ActionReportDraftSource).where(
+                ActionReportDraftSource.draft_id.in_(cls._owned_draft(draft_id, user_id))
+            )
+        )
         await db.execute(
             update(ActionReportDraft)
             .where(ActionReportDraft.draft_id == draft_id, ActionReportDraft.user_id == user_id)
             .values(del_flag='2', update_time=datetime.now())
         )
+
+    @classmethod
+    async def get_source_dao(cls, db: AsyncSession, draft_id: int) -> ActionReportDraftSource | None:
+        """
+        取导入草稿的原文件与锚点。**不判归属** —— 调用方必须先用 `get_draft_by_id` 确认过
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        :return: 原稿行；044 之前导入的草稿、逐条填的草稿都没有
+        """
+        return (
+            (await db.execute(select(ActionReportDraftSource).where(ActionReportDraftSource.draft_id == draft_id)))
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def save_source_dao(cls, db: AsyncSession, draft_id: int, values: dict[str, Any]) -> None:
+        """
+        写原稿行：有就改、没有就建（老草稿补记锚点时会走到「建」）
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        :param values: 待写字段
+        """
+        values = {**values, 'update_time': datetime.now()}
+        row = await cls.get_source_dao(db, draft_id)
+        if row is None:
+            db.add(ActionReportDraftSource(draft_id=draft_id, create_time=datetime.now(), **values))
+        else:
+            await db.execute(
+                update(ActionReportDraftSource).where(ActionReportDraftSource.draft_id == draft_id).values(**values)
+            )
 
     @classmethod
     async def get_draft_items(cls, db: AsyncSession, draft_id: int, user_id: int) -> list[ActionReportDraftItem]:
@@ -2547,6 +2758,34 @@ class ReportReviewDao:
                         ActionReportReview.user_id == user_id,
                         ActionReportReview.run_status == 'completed',
                         ActionReportReview.del_flag == '0',
+                    )
+                    .order_by(ActionReportReview.review_id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def get_import_review_dao(cls, db: AsyncSession, draft_id: int, user_id: int) -> ActionReportReview | None:
+        """
+        取某份草稿导入时那次跑完的映射（限本人）。044 之前导入的草稿没存锚点，从它现推
+
+        :param db: orm对象
+        :param draft_id: 草稿id
+        :param user_id: 归属访客用户id
+        :return: 校验记录；没有（或已被历史修剪掉）时为 None
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionReportReview)
+                    .where(
+                        ActionReportReview.draft_id == draft_id,
+                        ActionReportReview.user_id == user_id,
+                        ActionReportReview.purpose == 'import',
+                        ActionReportReview.run_status == 'completed',
                     )
                     .order_by(ActionReportReview.review_id.desc())
                     .limit(1)

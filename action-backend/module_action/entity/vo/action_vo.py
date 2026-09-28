@@ -1075,6 +1075,15 @@ class ReportDraftComposeModel(BaseModel):
     text: str = Field(description='初稿正文（纯文本，可直接送第三步校验）')
     char_count: int = Field(default=0, description='正文字符数')
     missing_required: int = Field(default=0, description='仍未填写的必填条目数')
+    #: 以下只对导入的草稿有意义：初稿是从原稿出发、把改过的条目写回原处生成的（manuscript_rebuild）
+    from_source: bool = Field(default=False, description='是否按原稿重建（导入的草稿）')
+    keeps_layout: bool = Field(default=False, description='是否保留了原稿的图片、表格与样式（有原文件才能）')
+    replaced: int = Field(default=0, description='原位替换的条目数')
+    inserted: int = Field(default=0, description='插入的新条目数（导入时没找到位置）')
+    appended: int = Field(default=0, description='与未改条目共用段落或位于表格中、改为追加的条目数')
+    removed: int = Field(default=0, description='被清空、原段落已删的条目数')
+    images: int = Field(default=0, description='稿件中的图片数')
+    tables: int = Field(default=0, description='稿件中的表格数')
 
 
 # ---------------------------------------------------------------- 第三步判定 · 第四步改写
@@ -1084,7 +1093,7 @@ VerdictStatus = Literal['reported', 'vague', 'missing']
 
 #: 第四步能对一条条目做的三件事。
 #: continue 续写（据关键词补完这一条）· polish 润色（改写已有正文）· translate 中译英
-AssistAction = Literal['continue', 'polish', 'translate']
+AssistAction = Literal['continue', 'polish', 'translate', 'refine']
 
 #: 润色风格。与前台那组风格 chip 一一对应；续写与翻译不看这个值
 AssistStyle = Literal['', 'rigorous', 'concise', 'critical']
@@ -1212,6 +1221,8 @@ class AssistRequestModel(BaseModel):
     action: AssistAction = Field(description='续写 / 润色 / 中译英')
     style: AssistStyle = Field(default='', description='润色风格，仅 action=polish 时有意义')
     keywords: str = Field(default='', max_length=500, description='续写关键词，仅 action=continue 时有意义')
+    #: 第二步「AI 完善」旁那个输入框：作者自己补充的事实与修改要求。仅 action=refine 时有意义
+    instruction: str = Field(default='', max_length=1000, description='作者补充意见，仅 action=refine 时有意义')
 
     @model_validator(mode='after')
     def check_mode(self) -> 'AssistRequestModel':
@@ -1327,8 +1338,13 @@ class StudyTypeModel(ActionBaseModel):
     name_en: str | None = Field(default=None, description='名称（英文）')
     hot_guideline: str | None = Field(default=None, description='重点推荐规范代号')
     sort_num: int | None = Field(default=None, description='显示顺序')
+    tip_zh: str | None = Field(default=None, description='专属提示（中文）')
+    tip_en: str | None = Field(default=None, description='专属提示（英文）')
+    status: str | None = Field(default=None, description='状态（0正常 1停用）')
     guidelines: list[str] = Field(default_factory=list, description='关联规范代号列表')
     stats: list[StudyTypeStatModel] = Field(default_factory=list, description='统计方法推荐')
+
+
 class StudyTypePageQueryModel(StudyTypeModel):
     """
     研究类型列表查询入参
@@ -1343,11 +1359,10 @@ class StudyTypeSaveModel(BaseModel):
 
     ## 三个字段各有各的下游，改错了症状完全不同
 
-    - **`type_key` 是问卷词表的键**。前台第一步的按钮直接来自本表
-      （`GET /action/site/study-types`，按 `sort_num` 排、文案取 `name_zh`/`name_en`），
-      **加一个类型入库即生效，不需要改前端**。唯一的例外是 `rct`/`nrct`：页面上把这两行
-      合成一个「临床试验」按钮，再由问题 2（是否随机化）落到具体哪一个（见 `assistant.vue`
-      的 `TRIAL_KEYS`）。另外这个键会进 URL（`/assistant?type=<key>`），改键会让老链接失效。
+    - **`type_key` 是分支问卷的「判定结果」**。sql/041 起第一步不再是「一行一个按钮」，
+      而是 `action_wizard_question/option` 那棵树，树的叶子选项用 `result_type_key` 指到这里。
+      所以新加的类型要在「分支问卷」里挂到某个选项上才会被用户选到；改键时服务层会连带
+      改掉选项上的引用，删类型时有选项引用就拦下。
     - **`hot_guideline` 决定第二步展开哪份 checklist**，必须指向 `action_guideline.code`
       且那份规范真有条目 —— 指错了前台第二步展不开，用户只会看到一片空白。这条是硬闸。
     - **`guidelines` 只是展示标签**，不是外键。库里现有「针灸专属条目」「针刺检索策略」
@@ -1369,8 +1384,53 @@ class StudyTypeSaveModel(BaseModel):
     hot_guideline: str = Field(default='', max_length=64, description='重点推荐规范代号')
     sort_num: int | None = Field(default=None, ge=0, description='显示顺序，留空排到末尾')
     status: Literal['0', '1'] = Field(default='0', description='状态（0正常 1停用）')
+    tip_zh: str = Field(default='', max_length=1000, description='专属提示（中文）')
+    tip_en: str = Field(default='', max_length=2000, description='专属提示（英文）')
     guidelines: list[str] = Field(default_factory=list, max_length=20, description='关联规范代号（展示标签，整体覆盖）')
     stats: list[StudyTypeStatModel] = Field(default_factory=list, max_length=20, description='统计方法推荐（整体覆盖）')
+
+
+class WizardOptionModel(ActionBaseModel):
+    """
+    分支问卷的一个选项（出参与入参共用）
+
+    `next_question_id` 与 `result_type_key` **二选一**：前者选了之后接着弹出下一题，
+    后者到此判定为这一类研究。两者都填含义不明，两者都空是一条死路 —— 保存时都会被拒。
+    """
+
+    # 服务层要用 snake_case 直接构造（从 ORM 行装出参）；只有 alias 时多余的 snake_case 键
+    # 会被**静默忽略**，得到一个字段全默认的空模型（同 PublicationModel 那个坑）
+    model_config = ConfigDict(alias_generator=to_camel, from_attributes=True, populate_by_name=True)
+
+    option_id: int | None = Field(default=None, description='选项id')
+    opt_key: str = Field(
+        min_length=1, max_length=32, pattern=r'^[A-Za-z0-9_]+$',
+        description='选项标识，同一题内唯一；进 URL（?path=A.y.y），所以不许带点号',
+    )
+    label_zh: str = Field(min_length=1, max_length=200, description='选项文字（中文）')
+    label_en: str = Field(default='', max_length=300, description='选项文字（英文）')
+    next_question_id: int | None = Field(default=None, description='下一题id')
+    result_type_key: str = Field(default='', max_length=32, description='判定的研究类型标识')
+    tip_zh: str = Field(default='', max_length=1000, description='选中时额外显示的提示（中文）')
+    tip_en: str = Field(default='', max_length=2000, description='选中时额外显示的提示（英文）')
+
+
+class WizardQuestionModel(ActionBaseModel):
+    """
+    分支问卷的一道题，连同它的选项（出参；后台保存也用它，选项整体覆盖）
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, from_attributes=True, populate_by_name=True)
+
+    question_id: int | None = Field(default=None, description='问题id，新增时不传')
+    q_key: str = Field(
+        min_length=1, max_length=32, pattern=r'^[a-z][a-z0-9_]*$', description='问题标识，仅后台辨认用'
+    )
+    text_zh: str = Field(min_length=1, max_length=300, description='题干（中文）')
+    text_en: str = Field(default='', max_length=500, description='题干（英文）')
+    is_root: Literal['0', '1'] = Field(default='0', description='是否第一题（全表唯一）')
+    sort_num: int | None = Field(default=None, ge=0, description='后台列表顺序')
+    options: list[WizardOptionModel] = Field(default_factory=list, max_length=30, description='选项（整体覆盖）')
 
 
 # ---------------------------------------------------------------- CFIR

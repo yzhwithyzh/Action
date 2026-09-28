@@ -44,6 +44,7 @@ from module_action.entity.vo.action_vo import (
     StudyTypeSaveModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
+    WizardQuestionModel,
 )
 from module_action.service.action_service import (
     CollabRequestService,
@@ -57,6 +58,7 @@ from module_action.service.action_service import (
     SiteRebuildService,
     SiteTextService,
     StudyTypeService,
+    StudyWizardService,
     TeamMemberService,
 )
 from module_action.service.publication_meta_service import PublicationMetaService
@@ -1368,6 +1370,86 @@ async def delete_admin_study_type(
     query_db: Annotated[AsyncSession, DBSessionDependency()],
 ) -> Response:
     result = await StudyTypeService.delete_study_type_services(query_db, type_ids)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+# ---------------------------------------------------------------- 分支问卷（报告助手第一步，sql/041）
+#
+# 与研究类型同一个后台页面、同一套权限：问卷的叶子就是研究类型，两者分开授权没有意义。
+
+
+@action_admin_controller.get(
+    '/study-wizard/list',
+    summary='获取分支问卷（全部题与选项）',
+    response_model=DataResponseModel[list[WizardQuestionModel]],
+    dependencies=[UserInterfaceAuthDependency('action:studyType:list')],
+)
+async def get_admin_study_wizard(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await StudyWizardService.get_wizard_tree_services(query_db)
+    logger.info('获取分支问卷成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.post(
+    '/study-wizard',
+    summary='新增问卷题目',
+    description='选项整体覆盖。保存后对整棵树做结构校验（第一题唯一、选项二选一、无环、结果类型存在），不通过整笔回滚',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:studyType:add')],
+)
+async def add_admin_study_wizard(
+    request: Request,
+    save: WizardQuestionModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    save.question_id = None
+    result = await StudyWizardService.save_question_services(query_db, save, current_user.user.user_name)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.put(
+    '/study-wizard',
+    summary='编辑问卷题目',
+    description='选项整体覆盖：传进来是什么就是什么，没带上的选项会被删掉',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:studyType:edit')],
+)
+async def edit_admin_study_wizard(
+    request: Request,
+    save: WizardQuestionModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    if not save.question_id:
+        raise ServiceException(message='缺少问题id')
+    result = await StudyWizardService.save_question_services(query_db, save, current_user.user.user_name)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_admin_controller.delete(
+    '/study-wizard/{question_ids}',
+    summary='删除问卷题目',
+    description='连同它自己的选项。删完树不成立（删了第一题、其他选项还指着它）则整笔回滚',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:studyType:remove')],
+)
+async def delete_admin_study_wizard(
+    request: Request,
+    question_ids: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await StudyWizardService.delete_question_services(query_db, question_ids)
     logger.info(result.message)
 
     return ResponseUtil.success(msg=result.message)

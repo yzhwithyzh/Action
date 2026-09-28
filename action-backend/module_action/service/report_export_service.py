@@ -201,6 +201,29 @@ def build_docx(draft: ExportDraft, locale: str = ZH) -> bytes:
     else:
         _write_item_body(doc, draft, t)
 
+    return _append_appendix(doc, draft, t)
+
+
+def build_docx_on(body_docx: bytes, draft: ExportDraft, locale: str = ZH) -> bytes:
+    """
+    导出稿件（.docx），正文是「生成初稿」按原稿重建出来的那份文档
+
+    导入的草稿走这里：正文就是用户自己的 Word（改过的条目已写回原处，图片、表格、样式、
+    页面设置原样保留），**不再往最前面加标题和统计行** —— 那是用户的论文，第一行应当是他的题目。
+    附录对照表照旧接在最后。
+
+    :param body_docx: `manuscript_rebuild.rebuild` 产出的 docx 字节
+    :param draft: 草稿（附录要用条目与要求原文）
+    :param locale: 语言
+    :return: docx 字节
+    """
+    doc = Document(io.BytesIO(body_docx))
+
+    return _append_appendix(doc, draft, _T[_lang(locale)])
+
+
+def _append_appendix(doc: Any, draft: ExportDraft, t: dict[str, str]) -> bytes:
+    """在文档末尾接上 checklist 对照表附录，返回整份 docx 字节"""
     # 附录：对照表。这里**才**放要求原文 —— 它以「对照表」而非「稿件」的身份出现
     doc.add_page_break()
     doc.add_heading(t['appendix'], level=1)

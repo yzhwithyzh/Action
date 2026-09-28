@@ -43,3 +43,10 @@ sqlglot[rs]==28.10.0
 textual==8.2.5
 user-agents==2.2.0
 .
+# tools/srd-engine 的运行时依赖（adapters/langchain_client.py 调模型、判定口径 YAML）。
+# SRD / checklist / 背景生成三个 worker 与后端共用这个 venv，而后两者没有自己的
+# requirements —— 只写在 tools/srd_worker_tool/requirements.txt 里的话，按本文件装的
+# 服务器上 worker 一启动就是 ModuleNotFoundError: No module named 'langchain_openai'
+langchain-core==1.5.3
+langchain-openai==1.1.9
+PyYAML==6.0.3

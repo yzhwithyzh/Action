@@ -362,10 +362,59 @@ class ActionStudyType(Base):
     hot_guideline = Column(String(64), nullable=True, server_default="''", comment='重点推荐规范代号')
     sort_num = Column(Integer, nullable=True, server_default='0', comment='显示顺序')
     status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
+    tip_zh = Column(String(1000), nullable=True, server_default="''", comment='专属提示（中文）')
+    tip_en = Column(String(2000), nullable=True, server_default="''", comment='专属提示（英文）')
     create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
     create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
     update_by = Column(String(64), nullable=True, server_default="''", comment='更新者')
     update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+
+
+class ActionWizardQuestion(Base):
+    """
+    官网-报告助手第一步分支问卷：问题（sql/041）
+
+    问卷是一棵树：第一题（`is_root='1'`，全表唯一）的每个选项要么弹出下一题、要么判定出
+    一类研究（`action_study_type`）。同一层的题在不同分支里问的东西完全不同，层数也不齐，
+    所以不能再用「研究类型一行一个按钮」来表达。
+    """
+
+    __tablename__ = 'action_wizard_question'
+    __table_args__ = {'comment': '官网-报告助手第一步分支问卷：问题'}
+
+    question_id = Column(Integer, primary_key=True, autoincrement=True, comment='问题id')
+    q_key = Column(String(32), nullable=False, comment='问题标识')
+    text_zh = Column(String(300), nullable=False, comment='题干（中文）')
+    text_en = Column(String(500), nullable=True, server_default="''", comment='题干（英文）')
+    is_root = Column(CHAR(1), nullable=True, server_default='0', comment='是否第一题')
+    sort_num = Column(Integer, nullable=True, server_default='0', comment='后台列表顺序')
+    create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_by = Column(String(64), nullable=True, server_default="''", comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+
+
+class ActionWizardOption(Base):
+    """
+    官网-报告助手第一步分支问卷：选项与去向
+
+    `next_question_id` 与 `result_type_key` **二选一**：前者接着弹出下一题，后者到此判定。
+    `opt_key` 进 URL（`/assistant?path=A.y.y`），同一题内唯一。
+    """
+
+    __tablename__ = 'action_wizard_option'
+    __table_args__ = {'comment': '官网-报告助手第一步分支问卷：选项与去向'}
+
+    option_id = Column(Integer, primary_key=True, autoincrement=True, comment='选项id')
+    question_id = Column(Integer, nullable=False, comment='所属问题id')
+    opt_key = Column(String(32), nullable=False, comment='选项标识')
+    label_zh = Column(String(200), nullable=False, comment='选项文字（中文）')
+    label_en = Column(String(300), nullable=True, server_default="''", comment='选项文字（英文）')
+    next_question_id = Column(Integer, nullable=True, comment='下一题id')
+    result_type_key = Column(String(32), nullable=True, server_default="''", comment='判定的研究类型标识')
+    tip_zh = Column(String(1000), nullable=True, server_default="''", comment='选中时的提示（中文）')
+    tip_en = Column(String(2000), nullable=True, server_default="''", comment='选中时的提示（英文）')
+    sort_num = Column(Integer, nullable=True, server_default='0', comment='显示顺序')
 
 
 class ActionStudyTypeGuideline(Base):
@@ -748,6 +797,26 @@ class ActionReportDraft(Base):
     create_by = Column(String(64), nullable=True, server_default=text("''"), comment='创建者')
     create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
     update_by = Column(String(64), nullable=True, server_default=text("''"), comment='更新者')
+    update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
+
+
+class ActionReportDraftSource(Base):
+    """
+    官网-报告草稿导入的原文件与条目锚点（sql/044，与草稿 1:1，删草稿时物理删除）
+
+    「生成初稿」从原文件出发、把改过的条目写回原位（`service/manuscript_rebuild.py`），
+    图片、表格、样式因此得以保留。存库而不是 OSS：那个桶整桶公共读，未发表稿件不能放那儿。
+    """
+
+    __tablename__ = 'action_report_draft_source'
+    __table_args__ = {'comment': '官网-报告草稿导入原稿（原文件 + 条目锚点）'}
+
+    draft_id = Column(BigInteger, primary_key=True, comment='草稿id')
+    file_name = Column(String(255), nullable=True, server_default=text("''"), comment='原始文件名')
+    file_ext = Column(String(10), nullable=True, server_default=text("''"), comment='扩展名（带点）')
+    file_data = Column(LargeBinary, nullable=True, comment='原文件字节')
+    anchors = Column(Text, nullable=True, server_default=text("''"), comment='条目锚点 JSON')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
     update_time = Column(DateTime, nullable=True, comment='更新时间', default=datetime.now)
 
 
