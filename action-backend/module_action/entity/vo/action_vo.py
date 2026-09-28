@@ -1336,7 +1336,8 @@ class StudyTypeModel(ActionBaseModel):
     type_key: str | None = Field(default=None, description='类型标识')
     name_zh: str | None = Field(default=None, description='名称（中文）')
     name_en: str | None = Field(default=None, description='名称（英文）')
-    hot_guideline: str | None = Field(default=None, description='重点推荐规范代号')
+    hot_guideline: str | None = Field(default=None, description='重点推荐规范代号（按 id 现取的当前代号）')
+    hot_guideline_id: int | None = Field(default=None, description='重点推荐规范id')
     sort_num: int | None = Field(default=None, description='显示顺序')
     tip_zh: str | None = Field(default=None, description='专属提示（中文）')
     tip_en: str | None = Field(default=None, description='专属提示（英文）')
@@ -1363,8 +1364,10 @@ class StudyTypeSaveModel(BaseModel):
       而是 `action_wizard_question/option` 那棵树，树的叶子选项用 `result_type_key` 指到这里。
       所以新加的类型要在「分支问卷」里挂到某个选项上才会被用户选到；改键时服务层会连带
       改掉选项上的引用，删类型时有选项引用就拦下。
-    - **`hot_guideline` 决定第二步展开哪份 checklist**，必须指向 `action_guideline.code`
-      且那份规范真有条目 —— 指错了前台第二步展不开，用户只会看到一片空白。这条是硬闸。
+    - **`hot_guideline_id` 决定第二步展开哪份 checklist**，必须指向一份存在的 `action_guideline`
+      —— 指错了前台第二步展不开，用户只会看到一片空白。这条是硬闸。**按 id 不按代号**：
+      代号在「规范目录管理」里可改，2026-08 改过一次，按字符串挂的研究类型全部指空（sql/048）。
+      出参的 `hot_guideline` 是按 id 现取的当前代号，入参里不收它。
     - **`guidelines` 只是展示标签**，不是外键。库里现有「针灸专属条目」「针刺检索策略」
       「GRADE 证据分级」这类值在 `action_guideline` 里根本不存在，它们是给用户看的说明文字。
       所以这一栏不校验，只按顺序存。
@@ -1381,7 +1384,7 @@ class StudyTypeSaveModel(BaseModel):
     type_key: str = Field(min_length=1, max_length=32, pattern=r'^[a-z][a-z0-9_]*$', description='类型标识')
     name_zh: str = Field(min_length=1, max_length=100, description='名称（中文）')
     name_en: str = Field(default='', max_length=200, description='名称（英文）')
-    hot_guideline: str = Field(default='', max_length=64, description='重点推荐规范代号')
+    hot_guideline_id: int | None = Field(default=None, description='重点推荐规范id，留空=不展开 checklist')
     sort_num: int | None = Field(default=None, ge=0, description='显示顺序，留空排到末尾')
     status: Literal['0', '1'] = Field(default='0', description='状态（0正常 1停用）')
     tip_zh: str = Field(default='', max_length=1000, description='专属提示（中文）')

@@ -1071,6 +1071,7 @@ class GuidelineService:
         guideline_info = await GuidelineDao.get_guideline_detail_by_id(query_db, page_object.guideline_id)
         if not guideline_info:
             raise ServiceException(message='报告规范不存在')
+        old_code = guideline_info.code
         if page_object.code:
             exist = await GuidelineDao.get_guideline_by_code(query_db, page_object.code)
             if exist and exist.guideline_id != page_object.guideline_id:
@@ -1080,6 +1081,9 @@ class GuidelineService:
             await GuidelineDao.edit_guideline_dao(
                 query_db, page_object.model_dump(exclude_unset=True, exclude={'keyword'})
             )
+            if page_object.code and page_object.code != old_code:
+                # 研究类型按 id 挂规范，这里只是同步给人看的代号快照（sql/048）
+                await StudyTypeDao.sync_hot_guideline_code_dao(query_db, page_object.guideline_id, page_object.code)
             await query_db.commit()
 
             return CrudResponseModel(is_success=True, message='更新成功')
@@ -1099,6 +1103,13 @@ class GuidelineService:
         id_list = [int(i) for i in guideline_ids.split(',') if i.strip()]
         if not id_list:
             raise ServiceException(message='传入规范id为空')
+        in_use = await StudyTypeDao.get_type_keys_by_hot_guideline_ids(query_db, id_list)
+        if in_use:
+            # 删了的话这几类研究在报告助手第二步一条 checklist 都展不开，且要走到那一步才发现
+            raise ServiceException(
+                message=f'研究类型 {"、".join(in_use)} 把它挂作重点推荐规范（决定第二步展开哪份 checklist），'
+                '请先在「研究类型管理」里改掉'
+            )
         try:
             await GuidelineDao.delete_guideline_dao(query_db, id_list)
             await query_db.commit()
@@ -2122,6 +2133,11 @@ class StudyTypeService:
         for g in guidelines:
             gl_map[g.type_id].append(g.guideline_code)
 
+        # 按 id 现取规范当前的代号：代号在后台可改，库里的 hot_guideline 只是快照（sql/048）。
+        # 规范已删或没挂的给空串 —— 前台第二步据此判「没有 checklist」，不会拿一个查不到的代号去查
+        hot_ids = sorted({t.hot_guideline_id for t in types if t.hot_guideline_id})
+        hot_code = {g.guideline_id: g.code for g in await StudyTypeDao.get_hot_guidelines_by_ids(query_db, hot_ids)}
+
         stat_map: dict[int, list[StudyTypeStatModel]] = defaultdict(list)
         for s in stats:
             stat_map[s.type_id].append(StudyTypeStatModel(textZh=s.text_zh, textEn=s.text_en))
@@ -2132,7 +2148,8 @@ class StudyTypeService:
                 typeKey=t.type_key,
                 nameZh=t.name_zh,
                 nameEn=t.name_en,
-                hotGuideline=t.hot_guideline,
+                hotGuideline=hot_code.get(t.hot_guideline_id, ''),
+                hotGuidelineId=t.hot_guideline_id if t.hot_guideline_id in hot_code else None,
                 sortNum=t.sort_num,
                 tipZh=t.tip_zh or '',
                 tipEn=t.tip_en or '',
@@ -2151,27 +2168,29 @@ class StudyTypeService:
     # 同一类研究在两边取同样的 key，但不构成外键关系。
 
     @classmethod
-    async def _assert_hot_guideline(cls, query_db: AsyncSession, code: str) -> None:
+    async def _resolve_hot_guideline(cls, query_db: AsyncSession, guideline_id: int | None) -> str:
         """
-        校验重点推荐规范：必须存在，且**真有 checklist 条目**
+        校验重点推荐规范必须存在，返回它当前的代号（写进 `hot_guideline` 快照列）
 
-        `hot_guideline` 决定第二步展开哪份 checklist。指向一份不存在或 0 条目的规范，
+        `hot_guideline_id` 决定第二步展开哪份 checklist。指向一份不存在或 0 条目的规范，
         表现是「第一步选得出来、第二步一片空白」，而且要等用户走到第二步才发现。
-        眼下 `obs → STROBE` 就是 0 条（仓库里没有 STROBE 的中英素材），所以 0 条**只警告不拦**
-        —— 拦死就没法先把类型建起来、素材后补。不存在的代号则直接拦。
+        眼下 `STROBE` 就是 0 条（仓库里没有 STROBE 的中英素材），所以 0 条**只警告不拦**
+        —— 拦死就没法先把类型建起来、素材后补。不存在的规范则直接拦。
 
         :param query_db: orm对象
-        :param code: 规范代号
-        :raises ServiceException: 代号在 action_guideline 里不存在
+        :param guideline_id: 规范id，None 表示不挂
+        :return: 规范当前代号；不挂时为空串
+        :raises ServiceException: 规范不存在或已删除
         """
-        if not code:
-            return
-        guideline = await GuidelineDao.get_guideline_by_code(query_db, code)
+        if not guideline_id:
+            return ''
+        guideline = await GuidelineDao.get_guideline_detail_by_id(query_db, guideline_id)
         if not guideline:
             raise ServiceException(
-                message=f'重点推荐规范 {code} 不存在；它决定第二步展开哪份 checklist，'
-                f'请先在「规范目录管理」中建好这份规范'
+                message='所选的重点推荐规范不存在或已删除；它决定第二步展开哪份 checklist，'
+                '请先在「规范目录管理」中建好这份规范'
             )
+        return guideline.code
 
     @classmethod
     async def get_study_type_page_services(
@@ -2211,7 +2230,7 @@ class StudyTypeService:
         """
         if await StudyTypeDao.get_study_type_by_key(query_db, save.type_key):
             raise ServiceException(message=f'新增失败，类型标识 {save.type_key} 已存在')
-        await cls._assert_hot_guideline(query_db, save.hot_guideline)
+        hot_code = await cls._resolve_hot_guideline(query_db, save.hot_guideline_id)
 
         sort_num = save.sort_num
         if sort_num is None:
@@ -2221,7 +2240,8 @@ class StudyTypeService:
                 type_key=save.type_key,
                 name_zh=save.name_zh,
                 name_en=save.name_en,
-                hot_guideline=save.hot_guideline,
+                hot_guideline=hot_code,
+                hot_guideline_id=save.hot_guideline_id or None,
                 sort_num=sort_num,
                 status=save.status,
                 tip_zh=save.tip_zh,
@@ -2264,7 +2284,7 @@ class StudyTypeService:
         if not current:
             raise ServiceException(message='研究类型不存在')
         old_key = current.type_key
-        await cls._assert_hot_guideline(query_db, save.hot_guideline)
+        hot_code = await cls._resolve_hot_guideline(query_db, save.hot_guideline_id)
 
         if save.type_key != old_key:
             exist = await StudyTypeDao.get_study_type_by_key(query_db, save.type_key)
@@ -2286,7 +2306,8 @@ class StudyTypeService:
                     'type_key': save.type_key,
                     'name_zh': save.name_zh,
                     'name_en': save.name_en,
-                    'hot_guideline': save.hot_guideline,
+                    'hot_guideline': hot_code,
+                    'hot_guideline_id': save.hot_guideline_id or None,
                     'sort_num': save.sort_num if save.sort_num is not None else current.sort_num,
                     'status': save.status,
                     'tip_zh': save.tip_zh,

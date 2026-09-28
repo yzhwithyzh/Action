@@ -359,7 +359,9 @@ class ActionStudyType(Base):
     type_key = Column(String(32), nullable=False, comment='类型标识（rct/nrct/case/sr/obs）')
     name_zh = Column(String(200), nullable=False, comment='名称（中文）')
     name_en = Column(String(300), nullable=True, server_default="''", comment='名称（英文）')
-    hot_guideline = Column(String(64), nullable=True, server_default="''", comment='重点推荐规范代号')
+    # 代号快照，程序不按它匹配：规范代号在后台可改，按字符串挂的话一改名就全部指空（sql/048）
+    hot_guideline = Column(String(64), nullable=True, server_default="''", comment='重点推荐规范代号（快照）')
+    hot_guideline_id = Column(Integer, nullable=True, comment='重点推荐规范id（决定第二步展开哪份 checklist）')
     sort_num = Column(Integer, nullable=True, server_default='0', comment='显示顺序')
     status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
     tip_zh = Column(String(1000), nullable=True, server_default="''", comment='专属提示（中文）')

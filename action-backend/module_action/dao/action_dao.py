@@ -1297,6 +1297,66 @@ class StudyTypeDao:
             .all()
         )
     @classmethod
+    async def get_hot_guidelines_by_ids(cls, db: AsyncSession, guideline_ids: list[int]) -> list[ActionGuideline]:
+        """
+        批量取重点推荐规范（未删除的），供按 id 换成当前代号
+
+        :param db: orm对象
+        :param guideline_ids: 规范id列表
+        :return: 规范列表
+        """
+        if not guideline_ids:
+            return []
+
+        return list(
+            (
+                await db.execute(
+                    select(ActionGuideline).where(
+                        ActionGuideline.guideline_id.in_(guideline_ids), ActionGuideline.del_flag == '0'
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def get_type_keys_by_hot_guideline_ids(cls, db: AsyncSession, guideline_ids: list[int]) -> list[str]:
+        """
+        取把这几份规范挂作重点推荐规范的研究类型标识（删规范前拦截用）
+
+        :param db: orm对象
+        :param guideline_ids: 规范id列表
+        :return: 类型标识列表
+        """
+        if not guideline_ids:
+            return []
+
+        return list(
+            (
+                await db.execute(
+                    select(ActionStudyType.type_key).where(ActionStudyType.hot_guideline_id.in_(guideline_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def sync_hot_guideline_code_dao(cls, db: AsyncSession, guideline_id: int, code: str) -> None:
+        """
+        规范改代号后同步研究类型上的代号快照
+
+        :param db: orm对象
+        :param guideline_id: 规范id
+        :param code: 新代号
+        :return: None
+        """
+        await db.execute(
+            update(ActionStudyType).where(ActionStudyType.hot_guideline_id == guideline_id).values(hot_guideline=code)
+        )
+
+    @classmethod
     async def get_study_type_by_key(cls, db: AsyncSession, type_key: str) -> ActionStudyType | None:
         """
         按标识取一行研究类型（判重用）
