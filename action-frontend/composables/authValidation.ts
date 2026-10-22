@@ -69,7 +69,7 @@ export function isHeaderSafeToken(value: string): boolean {
 }
 
 /** 鉴权页自身不能作为登录后的跳转目标 */
-const AUTH_PAGE_PATHS = ['/login', '/register']
+const AUTH_PAGE_PATHS = ['/login', '/register', '/forgot-password']
 
 /**
  * 校验并归一化登录后的跳转目标。
@@ -77,7 +77,7 @@ const AUTH_PAGE_PATHS = ['/login', '/register']
  * 只接受站内相对路径：必须以 `/` 开头，且不能以 `//` 或 `/\` 开头（浏览器会把
  * `/\evil.com` 当协议相对 URL 解析）——否则就是一个开放重定向。
  *
- * 另外排除 `/login` 与 `/register` 自身：`?redirect=%2Flogin` 会让登录成功后的
+ * 另外排除 `/login`、`/register`、`/forgot-password` 自身：`?redirect=%2Flogin` 会让登录成功后的
  * `router.push('/login')` 变成同址导航（路由不动，用户停在原地），`redirect=/register`
  * 更糟——把刚登录成功的人送进注册表单。
  *
@@ -121,6 +121,9 @@ export const BACKEND_MESSAGE_KEYS: Readonly<Record<string, string>> = {
   '发送过于频繁，请稍后再试': 'auth.err.tooFrequent',
   '两次输入的密码不一致': 'auth.err.passwordMismatch',
   '请提供验证码或密码其中一项': 'auth.err.credentialRequired',
+  '原密码错误': 'auth.err.oldPasswordWrong',
+  '资料保存失败，请稍后重试': 'auth.err.profileSaveFailed',
+  '密码修改失败，请稍后重试': 'auth.err.passwordSaveFailed',
   // --- VO 层（action_vo.py:488-495）---
   '用户名不能包含脚本字符': 'auth.err.usernameXss',
   '所属机构不能包含脚本字符': 'auth.err.institutionXss',
@@ -138,7 +141,7 @@ export const BACKEND_MESSAGE_KEYS: Readonly<Record<string, string>> = {
  *
  * 「密码长度不能超过72个字节」里的字段名是变量（`action_vo.py` 的
  * `f'{field_label}长度不能超过{BCRYPT_MAX_PASSWORD_BYTES}个字节'`，实参有「密码」
- * 与「确认密码」两种），完整字符串匹配不住，只能按后缀匹配这一条。
+ * 「确认密码」「原密码」三种），完整字符串匹配不住，只能按后缀匹配这一条。
  */
 export const BACKEND_MESSAGE_SUFFIXES: ReadonlyArray<readonly [string, string]> = [
   ['长度不能超过72个字节', 'auth.err.passwordTooLong'],
@@ -305,6 +308,88 @@ export function validateLoginForm(mode: LoginMode, form: LoginFormInput): string
   if (mode === 'code') return validateVerifyCode(form.code)
   if (!form.password) return 'auth.v.passwordRequired'
   if (utf8ByteLength(form.password) > AUTH_LIMITS.passwordMaxBytes) return 'auth.v.passwordBytes'
+
+  return null
+}
+
+/** 找回密码表单原始输入 */
+export interface ResetFormInput {
+  email: string
+  code: string
+  password: string
+  confirm: string
+}
+
+/**
+ * 找回密码整表校验（新密码规则同注册）
+ *
+ * @param form 表单原始输入
+ * @returns 第一条不通过规则的 i18n key；全部通过返回 null
+ */
+export function validateResetForm(form: ResetFormInput): string | null {
+  const emailError = validateEmail(form.email)
+  if (emailError) return emailError
+  const codeError = validateVerifyCode(form.code)
+  if (codeError) return codeError
+  const passwordError = validateNewPassword(form.password)
+  if (passwordError) return passwordError
+  if (form.password !== form.confirm) return 'auth.v.passwordMismatch'
+
+  return null
+}
+
+/** 资料表单原始输入 */
+export interface ProfileFormInput {
+  username: string
+  institution: string
+  position: string
+}
+
+/**
+ * 资料表单校验，规则与注册时那三项逐条一致
+ *
+ * @param form 表单原始输入
+ * @returns 第一条不通过规则的 i18n key；全部通过返回 null
+ */
+export function validateProfileForm(form: ProfileFormInput): string | null {
+  const username = form.username.trim()
+  if (!username) return 'auth.v.usernameRequired'
+  const usernameError = validateFreeText(
+    username, AUTH_LIMITS.username, 'auth.v.usernameTooLong', 'auth.v.usernameNoAngle',
+  )
+  if (usernameError) return usernameError
+  const institutionError = validateFreeText(
+    form.institution.trim(), AUTH_LIMITS.institution, 'auth.v.institutionTooLong', 'auth.v.institutionNoAngle',
+  )
+  if (institutionError) return institutionError
+
+  return validateFreeText(
+    form.position.trim(), AUTH_LIMITS.position, 'auth.v.positionTooLong', 'auth.v.positionNoAngle',
+  )
+}
+
+/** 修改密码表单原始输入 */
+export interface PasswordChangeFormInput {
+  old: string
+  password: string
+  confirm: string
+}
+
+/**
+ * 修改密码表单校验。
+ *
+ * 原密码只查「填了」与 72 字节（同登录侧：老账号的密码规则可能变过）；
+ * 新密码走注册那套规则。
+ *
+ * @param form 表单原始输入
+ * @returns 第一条不通过规则的 i18n key；全部通过返回 null
+ */
+export function validatePasswordChangeForm(form: PasswordChangeFormInput): string | null {
+  if (!form.old) return 'auth.v.oldPasswordRequired'
+  if (utf8ByteLength(form.old) > AUTH_LIMITS.passwordMaxBytes) return 'auth.v.passwordBytes'
+  const passwordError = validateNewPassword(form.password)
+  if (passwordError) return passwordError
+  if (form.password !== form.confirm) return 'auth.v.passwordMismatch'
 
   return null
 }

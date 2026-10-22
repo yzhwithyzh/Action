@@ -3,6 +3,8 @@
  * implementation.html 迁移而来。
  * 模板与样式保持原状；样式已加 .page-implementation 命名空间，避免 SPA 路由切换时跨页污染。
  */
+import type { CfirElement } from '~/components/implementation/CfirElements.vue'
+
 const { t } = useI18n()
 
 interface CfirStrategy {
@@ -21,7 +23,15 @@ interface CfirConstruct {
   nameEn: string | null
   hintZh: string | null
   hintEn: string | null
+  conceptZh: string | null
+  conceptEn: string | null
+  exampleZh: string | null
+  exampleEn: string | null
+  originZh: string | null
+  originEn: string | null
+  source: string | null
   severity: 'h' | 'm' | 'l' | null
+  elements: CfirElement[]
   strategies: CfirStrategy[]
 }
 interface CfirDomain {
@@ -29,8 +39,11 @@ interface CfirDomain {
   seq: number
   nameZh: string | null
   nameEn: string | null
+  introZh: string | null
+  introEn: string | null
   constructs: CfirConstruct[]
 }
+interface CfirReference { refNo: number; citation: string }
 interface EricCategory { catKey: string; nameZh: string | null; nameEn: string | null }
 interface EricStrategy {
   ericId: number
@@ -68,11 +81,26 @@ const { data: ericRes } = await useSiteObject<{ categories: EricCategory[]; stra
   'impl-eric',
 )
 const { data: reaimRes } = await useSiteObject<ReaimDim[]>('/implementation/reaim', 'impl-reaim')
+const { data: refsRes } = await useSiteObject<CfirReference[]>('/implementation/cfir-references', 'impl-cfir-refs')
 
 const domains = computed<CfirDomain[]>(() => cfirRes.value?.data ?? [])
 const ericCats = computed<EricCategory[]>(() => ericRes.value?.data?.categories ?? [])
 const ericAll = computed<EricStrategy[]>(() => ericRes.value?.data?.strategies ?? [])
 const reaimDims = computed<ReaimDim[]>(() => reaimRes.value?.data ?? [])
+const cfirRefs = computed<CfirReference[]>(() => refsRes.value?.data ?? [])
+
+/* ---------- 构念详情（概念 / 示例 / 子条目树，数据源 tools/cfir_acu_framework.py） ---------- */
+/** 示例一行一条 */
+const conExamples = (c: CfirConstruct) => (pick(c, 'example') || '').split('\n').filter(Boolean)
+const hasDetail = (c: CfirConstruct) => !!(pick(c, 'concept') || c.elements?.length)
+/** 报告里的「研判要点」：第一级子条目名，有下一级的在括号里带上 */
+const conPoints = (c: CfirConstruct) =>
+  (c.elements ?? []).map((e) => {
+    const name = `${e.label ?? ''} ${pick(e, 'name')}`
+    const sub = (e.children ?? []).map((x) => pick(x, 'name')).join(t('implementation.pointSep'))
+
+    return sub ? t('implementation.pointSub', { name, sub }) : name
+  })
 
 /* ---------- ERIC 分类筛选（分类条本身也由接口数据生成，渲染了就得能点） ---------- */
 const ericCat = ref('all')
@@ -170,16 +198,33 @@ useReveal()
                   <small>{{ t('implementation.lblDomain') }} {{ d.seq }}</small>
                 </div>
               </div>
+              <p v-if="pick(d, 'intro')" class="cd-intro">{{ pick(d, 'intro') }}</p>
               <div class="cons">
-                <label v-for="c in d.constructs" :key="c.constructId" class="con" :class="{ sel: selected.has(c.constructId) }">
-                  <input
-                    type="checkbox"
-                    :data-id="c.constructId"
-                    :checked="selected.has(c.constructId)"
-                    @change="toggle(c.constructId, ($event.target as HTMLInputElement).checked)"
-                  />
-                  <span class="ct"><b>{{ pick(c, 'name') }}</b><span>{{ pick(c, 'hint') }}</span></span>
-                </label>
+                <div v-for="c in d.constructs" :key="c.constructId" class="con-row">
+                  <label class="con" :class="{ sel: selected.has(c.constructId) }">
+                    <input
+                      type="checkbox"
+                      :data-id="c.constructId"
+                      :checked="selected.has(c.constructId)"
+                      @change="toggle(c.constructId, ($event.target as HTMLInputElement).checked)"
+                    />
+                    <span class="ct"><b>{{ pick(c, 'name') }}</b><span>{{ pick(c, 'hint') }}</span></span>
+                  </label>
+                  <details v-if="hasDetail(c)" class="con-more">
+                    <summary>
+                      {{ c.elements?.length ? t('implementation.moreItems', { n: c.elements.length }) : t('implementation.moreDef') }}
+                    </summary>
+                    <div class="con-detail">
+                      <p v-if="pick(c, 'concept')" class="el-c">{{ pick(c, 'concept') }}</p>
+                      <p v-for="(x, i) in conExamples(c)" :key="i" class="el-x"><i>{{ t('implementation.lblExample') }}</i>{{ x }}</p>
+                      <div v-if="c.source || pick(c, 'origin')" class="el-meta">
+                        <span v-if="c.source" class="el-src">{{ t('implementation.lblSource') }} {{ c.source }}</span>
+                        <span v-if="pick(c, 'origin')" class="el-org">{{ pick(c, 'origin') }}</span>
+                      </div>
+                      <ImplementationCfirElements v-if="c.elements?.length" :items="c.elements" />
+                    </div>
+                  </details>
+                </div>
               </div>
             </div>
           </div>
@@ -247,7 +292,11 @@ useReveal()
                           <span class="sev" :class="SEV_CLASS[row.construct.severity ?? 'm']">
                             {{ t(SEV_LABEL[row.construct.severity ?? 'm']) }}
                           </span>
-                          <div style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5">{{ pick(row.construct, 'hint') }}</div>
+                          <div style="font-size:12px;color:var(--muted);margin-top:6px;line-height:1.5">{{ pick(row.construct, 'concept') || pick(row.construct, 'hint') }}</div>
+                          <div v-if="row.construct.elements?.length" class="rep-pts">
+                            <b>{{ t('implementation.lblPoints') }}</b>
+                            <span v-for="(pt, i) in conPoints(row.construct)" :key="i">{{ pt }}</span>
+                          </div>
                         </td>
                         <td>
                           <div class="strat">
@@ -266,6 +315,13 @@ useReveal()
             </div>
           </div>
         </div>
+
+        <details v-if="cfirRefs.length" class="cfir-refs">
+          <summary>{{ t('implementation.refsTitle', { n: cfirRefs.length }) }}</summary>
+          <ol>
+            <li v-for="r in cfirRefs" :key="r.refNo" :value="r.refNo">{{ r.citation }}</li>
+          </ol>
+        </details>
       </div>
     </section>
     <!-- ===================== ERIC ===================== -->
@@ -389,6 +445,35 @@ useReveal()
 .page-implementation .con .ct b{display:block;font-size:13.5px;font-weight:600;color:var(--ink);font-family:"Source Sans 3","Noto Sans SC",sans-serif}
 .page-implementation .con .ct span{display:block;font-size:11.5px;color:var(--muted);line-height:1.4;margin-top:1px}
 .page-implementation .con.sel{background:var(--indigo-100)}
+.page-implementation .cfir-grid{align-items:start}
+.page-implementation .cd-intro{font-size:12px;color:var(--muted);line-height:1.5;margin:-4px 0 10px}
+.page-implementation .con-more{margin:0 0 4px 38px}
+.page-implementation .con-more>summary{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;font-weight:600;color:var(--indigo-600);cursor:pointer;list-style:none;padding:2px 0;border-radius:4px}
+.page-implementation .con-more>summary::-webkit-details-marker{display:none}
+.page-implementation .con-more>summary::before{content:"";border-left:4.5px solid currentColor;border-top:3.5px solid transparent;border-bottom:3.5px solid transparent;transition:transform .2s var(--ease)}
+.page-implementation .con-more[open]>summary::before{transform:rotate(90deg)}
+.page-implementation .con-more>summary:hover{color:var(--cinnabar-d)}
+.page-implementation .con-more>summary:focus-visible{outline:2px solid var(--indigo-500);outline-offset:2px}
+.page-implementation .con-detail{margin-top:8px;padding:12px 13px;background:var(--paper);border:1px solid var(--line);border-radius:10px;font-size:12.5px;line-height:1.6;color:var(--ink)}
+.page-implementation .el-c{margin:0}
+.page-implementation .el-x{margin:4px 0 0;color:var(--muted)}
+.page-implementation .el-x i{font-style:normal;font-weight:700;color:var(--indigo-600);margin-right:6px}
+.page-implementation .el-meta{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.page-implementation .el-src,.page-implementation .el-org{font-size:10.5px;font-weight:600;padding:1px 8px;border-radius:999px}
+.page-implementation .el-src{color:var(--info);background:var(--info-bg)}
+.page-implementation .el-org{color:var(--muted);background:var(--paper-2);border:1px solid var(--line)}
+.page-implementation .cfir-els{list-style:none;margin:10px 0 0;padding:0;display:flex;flex-direction:column;gap:10px}
+.page-implementation .cfir-els .cfir-els{margin-top:8px;padding-left:12px;border-left:2px solid var(--indigo-100)}
+.page-implementation .el-h{display:flex;align-items:baseline;gap:6px}
+.page-implementation .el-h b{font-size:13px;color:var(--indigo-900)}
+.page-implementation .el-no{flex-shrink:0;font-family:"Spectral",serif;font-weight:700;font-size:12px;color:var(--cinnabar-d)}
+.page-implementation .cfir-els .el-c{margin-top:2px}
+.page-implementation .rep-pts{margin-top:8px;font-size:12px;line-height:1.5;color:var(--ink)}
+.page-implementation .rep-pts b{display:block;color:var(--indigo-700);margin-bottom:2px}
+.page-implementation .rep-pts span{display:block}
+.page-implementation .cfir-refs{margin-top:clamp(22px,3vw,30px);border-top:1px solid var(--line);padding-top:16px}
+.page-implementation .cfir-refs>summary{font-size:13.5px;font-weight:700;color:var(--indigo-800);cursor:pointer}
+.page-implementation .cfir-refs ol{margin:12px 0 0;padding-left:2.4em;font-size:12.5px;line-height:1.6;color:var(--muted);display:flex;flex-direction:column;gap:5px}
 .page-implementation .selbar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-top:22px;padding:16px 20px;background:var(--indigo-900);border-radius:14px;color:#fff}
 .page-implementation .selbar .sb-n{font-size:14px;color:rgba(233,238,247,.86)}
 .page-implementation .selbar .sb-n b{color:#fff;font-family:"Spectral",serif;font-size:1.15rem;margin:0 3px}

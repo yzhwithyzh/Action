@@ -37,8 +37,23 @@ const row = computed<NewsRow | null>(() => res.value?.data ?? null)
 
 const title = computed(() => pick(row.value, 'title'))
 const summary = computed(() => pick(row.value, 'summary'))
-/** 正文缺失时退到摘要 —— 现存 11 条种子数据的 content_zh/content_en 全为空 */
-const content = computed(() => pick(row.value, 'content'))
+/**
+ * 段首的 Tab / 全角空格 → `data-indent` 标记，由 CSS 渲染成首行缩进 2 字。
+ *
+ * 【为什么要转】后台录入时习惯敲一个 Tab 做首行缩进，在编辑器里看着是对的
+ * （`Editor` 组件给自己加了 `white-space: pre-wrap`，保留了 Tab 的宽度），
+ * 但 HTML 的默认 `white-space: normal` 会把 Tab **折叠成一个普通空格** ——
+ * 于是发到官网缩进就没了。两边的 `white-space` 不一致，这是唯一的原因。
+ *
+ * 【为什么不给所有 `<p>` 一律加缩进】**哪一段要缩进是录入者定的**。
+ * 实测线上那条新闻的英文正文：电头 `GUANGZHOU, China – August 22, 2026 –`
+ * 没敲 Tab，后面 6 个正文段都敲了 —— 一律缩进会把电头也顶进去。
+ * 按语言分（中文缩进、英文不缩进）同样是错的：这条新闻中英文都敲了 Tab。
+ */
+const INDENT_AT_PARAGRAPH_START = /(<p\b[^>]*)>[\s　]+/g
+const content = computed(() =>
+  pick(row.value, 'content').replace(INDENT_AT_PARAGRAPH_START, '$1 data-indent>'),
+)
 
 useHead({
   title: computed(() => (title.value ? `${title.value} | ACTION` : t('newsDetail.notFound'))),
@@ -128,6 +143,39 @@ useReveal()
 .page-news-detail .art-body table{width:100%;border-collapse:collapse;margin:1.3em 0;font-size:14.5px}
 .page-news-detail .art-body th,.page-news-detail .art-body td{border:1px solid var(--line);padding:9px 12px;text-align:left}
 .page-news-detail .art-body th{background:var(--paper);font-weight:600;color:var(--indigo-900)}
+/* 首行缩进 2 字。**只缩进录入时敲了 Tab 的那些段落**（script 里把段首的
+   Tab / 全角空格转成了 data-indent）—— HTML 的默认 white-space 会把 Tab 折叠成
+   一个普通空格，编辑器里看着有缩进、发到官网就没了（编辑器给自己开了
+   white-space:pre-wrap，两边不一致），所以缩进要由样式来做、但**由内容来决定**。
+   中英文一视同仁：实测那条新闻中英文正文都敲了 Tab，按语言分是错的。 */
+.page-news-detail .art-body>p[data-indent]{text-indent:2em}
+/* ---- 以下是 Quill 2 生成的内容类。官网没引 quill 的 CSS，不补这些就全是死类 ---- */
+/* 对齐 */
+.page-news-detail .art-body .ql-align-center{text-align:center;text-indent:0}
+.page-news-detail .art-body .ql-align-right{text-align:right;text-indent:0}
+.page-news-detail .art-body .ql-align-justify{text-align:justify}
+/* 字号（与 quill.snow.css 的取值一致，改了两边会对不上） */
+.page-news-detail .art-body .ql-size-small{font-size:.75em}
+.page-news-detail .art-body .ql-size-large{font-size:1.5em}
+.page-news-detail .art-body .ql-size-huge{font-size:2.5em}
+.page-news-detail .art-body .ql-font-serif{font-family:"Spectral","Noto Serif SC",serif}
+.page-news-detail .art-body .ql-font-monospace{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+/* 工具栏的「缩进」按钮：Quill 给的是整段左缩进，每级 3em（li 上另算，见下） */
+.page-news-detail .art-body .ql-indent-1{padding-left:3em}
+.page-news-detail .art-body .ql-indent-2{padding-left:6em}
+.page-news-detail .art-body .ql-indent-3{padding-left:9em}
+.page-news-detail .art-body .ql-indent-4{padding-left:12em}
+/* 列表。**Quill 2 的无序列表也是 <ol>**，靠 li[data-list] 区分，项目符号由
+   <span class="ql-ui"> 的 ::before 生成 —— 不补这一段，无序列表会被浏览器
+   按 ol 的默认样式渲染成「1. 2. 3.」，而那个 span 是空的、什么都不显示。 */
+.page-news-detail .art-body li{list-style-type:none;padding-left:1.5em;position:relative;text-indent:0}
+.page-news-detail .art-body li>.ql-ui:before{display:inline-block;margin-left:-1.5em;margin-right:.3em;text-align:right;white-space:nowrap;width:1.2em;color:var(--muted)}
+.page-news-detail .art-body li[data-list=bullet]>.ql-ui:before{content:"\2022"}
+.page-news-detail .art-body ol{counter-reset:ql-list}
+.page-news-detail .art-body li[data-list=ordered]{counter-increment:ql-list}
+.page-news-detail .art-body li[data-list=ordered]>.ql-ui:before{content:counter(ql-list) ". "}
+/* 代码块 */
+.page-news-detail .art-body pre{background:var(--paper);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:1.3em 0;overflow-x:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13.5px;line-height:1.7;text-indent:0;white-space:pre-wrap}
 .page-news-detail .art-empty{margin-top:clamp(22px,3vw,32px);font-size:14.5px;color:var(--muted)}
 .page-news-detail .art-origin{margin-top:clamp(24px,3.4vw,36px)}
 .page-news-detail .art-origin .btn{display:inline-flex;align-items:center;gap:9px;padding:12px 22px;border-radius:999px;font-weight:600;font-size:14.5px;border:1.5px solid var(--indigo-300);color:var(--indigo-700);background:var(--surface);transition:.22s var(--ease)}

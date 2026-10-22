@@ -53,6 +53,8 @@ header#top{position:sticky;top:0;z-index:var(--z-sticky,100);background:rgba(242
   .auth-link svg{width:15px;height:15px;opacity:.7}
   .auth-name{display:inline-flex;align-items:center;min-height:42px;padding:9px 15px;border:1.5px solid var(--indigo-200);border-radius:999px;background:var(--indigo-100);font-size:13.5px;font-weight:600;color:var(--indigo-800)}
   .auth-name>span{display:block;max-width:9em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  a.auth-name{cursor:pointer;transition:border-color .2s,background .2s}
+  a.auth-name:hover,a.auth-name[aria-current="page"]{border-color:var(--indigo-500)}
   .burger{display:none;width:44px;height:44px;border:1.5px solid var(--line);border-radius:11px;background:transparent;cursor:pointer;align-items:center;justify-content:center;flex-direction:column;gap:5px}
   .burger span{width:19px;height:2px;background:var(--indigo-800);transition:.3s var(--ease)}
   .mobile-menu{display:none}

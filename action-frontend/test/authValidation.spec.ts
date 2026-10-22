@@ -12,7 +12,10 @@ import {
   validateEmail,
   validateLoginForm,
   validateNewPassword,
+  validatePasswordChangeForm,
+  validateProfileForm,
   validateRegisterForm,
+  validateResetForm,
   validateVerifyCode,
   type RegisterFormInput,
 } from '../composables/authValidation'
@@ -291,5 +294,46 @@ describe('isHeaderSafeToken', () => {
     expect(isHeaderSafeToken('abc\ndef')).toBe(false)
     expect(isHeaderSafeToken('')).toBe(false)
     expect(isHeaderSafeToken('tok🔑en')).toBe(false)
+  })
+})
+
+describe('找回密码 / 资料 / 改密码', () => {
+  it('找回密码页自身不作为跳转目标', () => {
+    expect(resolveRedirect('/forgot-password')).toBe('/')
+    expect(resolveRedirect('/forgot-password?redirect=%2Faccount')).toBe('/')
+    expect(resolveRedirect('/account')).toBe('/account')
+  })
+
+  it('validateResetForm 按 邮箱 → 验证码 → 新密码 → 确认 的顺序报', () => {
+    const ok = { email: 'a@b.cn', code: '123456', password: 'secret1', confirm: 'secret1' }
+    expect(validateResetForm(ok)).toBeNull()
+    expect(validateResetForm({ ...ok, email: '' })).toBe('auth.v.emailRequired')
+    expect(validateResetForm({ ...ok, code: '12' })).toBe('auth.v.codeRequired')
+    expect(validateResetForm({ ...ok, password: '123', confirm: '123' })).toBe('auth.v.passwordLength')
+    expect(validateResetForm({ ...ok, confirm: 'secret2' })).toBe('auth.v.passwordMismatch')
+  })
+
+  it('validateProfileForm 与注册时那三项同一套规则', () => {
+    const ok = { username: '张三', institution: '', position: '' }
+    expect(validateProfileForm(ok)).toBeNull()
+    expect(validateProfileForm({ ...ok, username: '   ' })).toBe('auth.v.usernameRequired')
+    expect(validateProfileForm({ ...ok, institution: 'Dept. <Neurology>' })).toBe('auth.v.institutionNoAngle')
+    expect(validateProfileForm({ ...ok, position: 'x'.repeat(AUTH_LIMITS.position + 1) })).toBe('auth.v.positionTooLong')
+  })
+
+  it('validatePasswordChangeForm：原密码只查必填与字节上限，新密码走注册规则', () => {
+    const ok = { old: '1', password: 'secret1', confirm: 'secret1' }
+    // 原密码不卡 6 位下限：老账号的密码规则可能变过
+    expect(validatePasswordChangeForm(ok)).toBeNull()
+    expect(validatePasswordChangeForm({ ...ok, old: '' })).toBe('auth.v.oldPasswordRequired')
+    expect(validatePasswordChangeForm({ ...ok, old: '密'.repeat(25) })).toBe('auth.v.passwordBytes')
+    expect(validatePasswordChangeForm({ ...ok, confirm: 'x' })).toBe('auth.v.passwordMismatch')
+  })
+
+  it('新增的后端文案都有映射，原密码超长走后缀规则', () => {
+    expect(backendMessageKey('原密码错误')).toBe('auth.err.oldPasswordWrong')
+    expect(backendMessageKey('资料保存失败，请稍后重试')).toBe('auth.err.profileSaveFailed')
+    expect(backendMessageKey('密码修改失败，请稍后重试')).toBe('auth.err.passwordSaveFailed')
+    expect(backendMessageKey('原密码长度不能超过72个字节')).toBe('auth.err.passwordTooLong')
   })
 })

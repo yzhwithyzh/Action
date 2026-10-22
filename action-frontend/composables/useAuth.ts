@@ -64,6 +64,28 @@ export interface RegisterPayload {
   confirmPassword: string
 }
 
+/** 找回密码入参（与后端 GuestPasswordResetModel 的驼峰别名一致） */
+export interface ResetPasswordPayload {
+  email: string
+  code: string
+  password: string
+  confirmPassword: string
+}
+
+/** 资料入参：邮箱是登录标识，不在这里改 */
+export interface ProfilePayload {
+  username: string
+  institution: string | null
+  position: string | null
+}
+
+/** 修改密码入参 */
+export interface ChangePasswordPayload {
+  oldPassword: string
+  password: string
+  confirmPassword: string
+}
+
 /** 登录入参：`code` 与 `password` 二选一，两个都传会被后端的 model_validator 拒 */
 export interface LoginPayload {
   email: string
@@ -89,13 +111,23 @@ const REQUEST_TIMEOUT = 15000
 const DOWNLOAD_TIMEOUT = 60000
 
 /**
+ * 上传类请求（body 是 FormData）的上限。
+ *
+ * 超时从发出请求算起、**包含上传本身**：SRD 一次传两份 PDF（各至多 30MB），
+ * 套 15 秒的话上行稍慢就传不完，表现是提交口报「请求超时」而后端压根没收全。
+ * 后端收齐之后只是落盘 + 入队，是秒级的，慢的只有上传这一段。
+ * 线上实测 180 秒仍有传不完的（Nginx 日志核过，是上传没传完、不是后端卡住），放到 10 分钟。
+ */
+const UPLOAD_TIMEOUT = 600000
+
+/**
  * 匿名接口：**不能**带 `Authorization`。
  *
- * 这三个接口后端本来就不看 header，但只要带上，一个被篡改成含非 Latin-1 字符的
+ * 这几个接口后端本来就不看 header，但只要带上，一个被篡改成含非 Latin-1 字符的
  * cookie 就会在 `new Headers()` 处抛 `TypeError`，把登录/注册一起锁死——用户连
  * 自救的入口都没有。
  */
-const ANONYMOUS_PATHS = ['/auth/login', '/auth/register', '/auth/email-code']
+const ANONYMOUS_PATHS = ['/auth/login', '/auth/register', '/auth/email-code', '/auth/password-reset']
 
 /**
  * Redis 不可用时后端也走 401。
@@ -214,7 +246,7 @@ export function useAuth() {
         method,
         body,
         headers,
-        timeout: REQUEST_TIMEOUT,
+        timeout: body instanceof FormData ? UPLOAD_TIMEOUT : REQUEST_TIMEOUT,
       })
       if (res?.code === UNAUTHORIZED) {
         if ((res.msg ?? '').trim() === SERVICE_UNAVAILABLE_MSG) return { ok: false, message: translate(res.msg) }
@@ -322,10 +354,14 @@ export function useAuth() {
    * 发送邮箱验证码
    *
    * @param email 邮箱
-   * @param scene 场景（register 注册 / login 登录）
+   * @param scene 场景（register 注册 / login 登录 / reset 找回密码）
    * @param sourceLang 邮件正文语言
    */
-  const sendCode = async (email: string, scene: 'register' | 'login', sourceLang: string): Promise<AuthResult> => {
+  const sendCode = async (
+    email: string,
+    scene: 'register' | 'login' | 'reset',
+    sourceLang: string,
+  ): Promise<AuthResult> => {
     return await call('/auth/email-code', 'POST', { email, scene, sourceLang })
   }
 
@@ -340,6 +376,35 @@ export function useAuth() {
   /** 登录；成功即写入登录态 */
   const login = async (payload: LoginPayload): Promise<AuthResult> => {
     const res = await call('/auth/login', 'POST', payload)
+    if (res.ok && !applyAuth(res.envelope)) return { ok: false, message: t('auth.err.unknown') }
+
+    return res
+  }
+
+  /** 找回密码：验证码 + 新密码；成功即写入登录态（后端直接签发新令牌） */
+  const resetPassword = async (payload: ResetPasswordPayload): Promise<AuthResult> => {
+    const res = await call('/auth/password-reset', 'POST', payload)
+    if (res.ok && !applyAuth(res.envelope)) return { ok: false, message: t('auth.err.unknown') }
+
+    return res
+  }
+
+  /** 修改资料；成功后用出参刷新顶栏那份访客信息（`data` 里） */
+  const updateProfile = async (payload: ProfilePayload): Promise<AuthResult> => {
+    const res = await call('/auth/profile', 'PUT', payload)
+    if (res.ok && res.envelope?.data) guest.value = res.envelope.data
+
+    return res
+  }
+
+  /**
+   * 修改密码。
+   *
+   * 后端改完会让此前签发的令牌全部作废（包括这次请求带的这张），并在出参里换发一张新的
+   * —— **必须写回 cookie**，不写的话下一个请求就 401、用户被踢出去。
+   */
+  const changePassword = async (payload: ChangePasswordPayload): Promise<AuthResult> => {
+    const res = await call('/auth/password', 'PUT', payload)
     if (res.ok && !applyAuth(res.envelope)) return { ok: false, message: t('auth.err.unknown') }
 
     return res
@@ -376,5 +441,18 @@ export function useAuth() {
    * 暴露 `call` 是给报告助手这类「需要访客身份的业务接口」用的（如第三步的 checklist 校验）：
    * 401 清理、限流提示、FastAPI 422 字段错误、超时文案这几件事只该有一份实现。
    */
-  return { guest, isLoggedIn, sendCode, register, login, logout, fetchMe, authedCall: call, authedBlob }
+  return {
+    guest,
+    isLoggedIn,
+    sendCode,
+    register,
+    login,
+    resetPassword,
+    updateProfile,
+    changePassword,
+    logout,
+    fetchMe,
+    authedCall: call,
+    authedBlob,
+  }
 }

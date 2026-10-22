@@ -410,12 +410,32 @@ async function removeHistory(row: SrdHistoryRow) {
   }
 }
 
+/**
+ * 落地时 URL 指名要打开的评估（`?assessment=`，来自「我的账号」页的「查看结果」）。
+ * 要登录才取得到，而登录态水合后才知道，所以挂载时与登录态变化时各试一次，打开过就清掉
+ */
+let wantAssessmentId: number | null = null
+
+async function openWanted() {
+  if (!wantAssessmentId || !isLoggedIn.value) return
+  const id = wantAssessmentId
+  wantAssessmentId = null
+  stopPolling()
+  runError.value = ''
+  await openAssessment(id)
+  if (import.meta.client) document.getElementById('results')?.scrollIntoView({ behavior: 'smooth' })
+}
+
 /** 登录态是水合后才知道的（全站预渲染），所以历史只能在客户端挂载后取 */
 onMounted(() => {
+  const wanted = Number(typeof route.query.assessment === 'string' ? route.query.assessment : '')
+  if (Number.isInteger(wanted) && wanted > 0) wantAssessmentId = wanted
   void loadHistory()
+  void openWanted()
 })
 watch(isLoggedIn, () => {
   void loadHistory()
+  void openWanted()
 })
 
 const stamp = (iso: string | null) => {

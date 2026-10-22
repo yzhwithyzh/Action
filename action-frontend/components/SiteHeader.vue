@@ -36,8 +36,8 @@ const isCurrent = (item: NavItem) => route.path === item.match
 
 const { guest, isLoggedIn, logout, fetchMe } = useAuth()
 
-/** 登录/注册两页自身不作为跳回目标，改为透传它们已经带着的 redirect */
-const AUTH_PATHS = ['/login', '/register']
+/** 登录/注册/找回密码这几页自身不作为跳回目标，改为透传它们已经带着的 redirect */
+const AUTH_PATHS = ['/login', '/register', '/forgot-password']
 const authRedirect = computed(() => {
   if (!AUTH_PATHS.includes(route.path)) return route.fullPath
   const raw = route.query.redirect
@@ -150,7 +150,10 @@ const onLogout = async () => {
         <ClientOnly>
           <span class="auth-group" role="group" :aria-label="t('nav.accountAria')">
             <template v-if="isLoggedIn">
-              <span class="auth-name" :title="guest?.username"><span>{{ guest?.username }}</span></span>
+              <NuxtLink
+                class="auth-name" to="/account" :title="t('nav.accountLink')"
+                :aria-current="route.path === '/account' ? 'page' : undefined"
+              ><span>{{ guest?.username }}</span></NuxtLink>
               <button type="button" class="auth-link" @click="onLogout">{{ t('nav.logout') }}</button>
             </template>
             <NuxtLink v-else class="auth-link" :to="loginLink">
@@ -180,6 +183,7 @@ const onLogout = async () => {
     <ClientOnly>
       <template v-if="isLoggedIn">
         <span class="mm-user">{{ t('auth.loggedInAs', { name: guest?.username ?? '' }) }}</span>
+        <NuxtLink to="/account">{{ t('nav.accountLink') }}</NuxtLink>
         <button type="button" class="mm-auth" @click="onLogout">{{ t('nav.logout') }}</button>
       </template>
       <template v-else>

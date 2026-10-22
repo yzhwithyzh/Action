@@ -90,6 +90,12 @@ const registerLink = computed(() => {
 
   return target === '/' ? '/register' : `/register?redirect=${encodeURIComponent(target)}`
 })
+/** 找回密码成功即登录，所以同样把 redirect 透传过去，找回完直接落回原来要去的页 */
+const forgotLink = computed(() => {
+  const target = redirectTarget.value
+
+  return target === '/' ? '/forgot-password' : `/forgot-password?redirect=${encodeURIComponent(target)}`
+})
 
 const fail = (text: string) => {
   msgOk.value = false
@@ -206,6 +212,7 @@ useReveal()
                 id="lg-password" v-model="form.password" class="inp" type="password" autocomplete="current-password"
                 :placeholder="t('auth.phPassword')" :maxlength="MAXLEN.password" required
               />
+              <NuxtLink class="forgot" :to="forgotLink">{{ t('auth.forgot.link') }}</NuxtLink>
             </div>
 
             <div v-else class="frow" style="margin-bottom:14px">
@@ -271,6 +278,8 @@ useReveal()
 .page-login .inp{width:100%;border:1.5px solid var(--line);border-radius:10px;padding:11px 13px;font-family:inherit;font-size:14px;color:var(--ink);background:var(--paper)}
 .page-login .inp:focus{outline:none;border-color:var(--indigo-500);box-shadow:0 0 0 4px var(--indigo-100);background:var(--surface)}
 .page-login .inp::placeholder{color:#8895a8}
+.page-login .forgot{display:inline-block;margin-top:8px;font-size:12.5px;font-weight:600;color:var(--indigo-600);text-decoration:underline;text-underline-offset:3px}
+.page-login .forgot:hover{color:var(--cinnabar)}
 .page-login .code-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center}
 .page-login .code-row .btn{padding:11px 18px;font-size:14px;min-width:9.5em}
 .page-login .cform-foot{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-top:6px}
