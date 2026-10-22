@@ -12,15 +12,23 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.constant import CommonConstant
 from common.enums import RedisInitKeyConfig
+from common.vo import CrudResponseModel, PageModel
 from config.env import JwtConfig
 from exceptions.exception import ServiceException
 from module_action.dao.action_dao import GUEST_USER_TYPE, GuestProfileDao
 from module_action.entity.do.action_do import ActionGuestProfile
 from module_action.entity.vo.action_vo import (
+    GuestAdminModel,
+    GuestAdminPageQueryModel,
     GuestEmailCodeModel,
     GuestInfoModel,
     GuestLoginModel,
+    GuestPasswordChangeModel,
+    GuestPasswordResetModel,
+    GuestProfileUpdateModel,
+    GuestPublicInfoModel,
     GuestRegisterModel,
+    GuestStatusModel,
     GuestTokenModel,
 )
 from module_action.service.mail_service import MailService
@@ -30,6 +38,7 @@ from module_admin.entity.vo.user_vo import AddUserModel, UserModel
 from module_admin.service.login_service import LoginService
 from module_admin.service.user_service import UserService
 from utils.client_ip_util import ClientIPUtil
+from utils.common_util import CamelCaseUtil
 from utils.log_util import logger
 from utils.pwd_util import PwdUtil
 
@@ -51,6 +60,9 @@ EMAIL_REGISTERED_MESSAGE = '该邮箱已注册'
 EMAIL_CODE_INVALID_MESSAGE = '验证码错误或已过期'
 REGISTER_FAILED_MESSAGE = '注册失败，请稍后重试'
 REGISTER_COMPENSATE_FAILED_MESSAGE = '注册未完成，请联系管理员'
+# 已登录改密码时原密码不对。这里不用防枚举（调用方已经持有这个账号的会话），
+# 但同样要计数锁定：被盗的会话不该能拿来无限次试原密码
+OLD_PASSWORD_WRONG_MESSAGE = '原密码错误'
 MAIL_SEND_FAILED_MESSAGE = '验证码发送失败，请稍后重试'
 # 登出统一文案。登出是幂等操作，成功与「本来就没有会话可撤销」共用同一句
 LOGOUT_MESSAGE = '退出成功'
@@ -63,6 +75,8 @@ COMPENSATE_FAILED_TAG = 'GUEST_REGISTER_COMPENSATE_FAILED'
 # NULL 与 '0' 都放行——两处判定一个写 '== 1' 一个写 '!= 0' 时，status 为 NULL 的
 # 账号会「登录成功拿到 token，下一个请求就 401」，用户陷入死循环。
 GUEST_DISABLED_STATUS = '1'
+# 凭据失败计数/锁定的场景。键里带 scene，互不牵连（理由见 _auth_fail_key）
+AuthScene = Literal['register', 'login', 'reset', 'password']
 # 捕获 redis-py 的异常基类，而不只是 ConnectionError/TimeoutError：
 # OutOfMemoryError、ReadOnlyError、NoPermissionError、ClusterDownError 都继承自
 # ResponseError(RedisError)，与 ConnectionError 无继承关系。只捕连接类异常时，
@@ -104,6 +118,8 @@ class GuestSnapshot:
     nick_name: str
     institution: str | None = None
     position: str | None = None
+    # 密码最后更新时间，签进令牌的 `pwd_at`：改过密码之后，早于它签发的令牌一律作废
+    pwd_update_date: datetime | None = None
 
     @classmethod
     def of(cls, user: SysUser, profile: ActionGuestProfile | None = None) -> 'GuestSnapshot':
@@ -121,7 +137,37 @@ class GuestSnapshot:
             nick_name=user.nick_name or '',
             institution=profile.institution if profile else None,
             position=profile.position if profile else None,
+            pwd_update_date=user.pwd_update_date,
         )
+
+
+def pwd_stamp(pwd_update_date: datetime | None) -> int:
+    """
+    密码版本戳（秒级时间戳），令牌的 `pwd_at` 与身份依赖的比对共用这一个口径
+
+    :param pwd_update_date: 密码最后更新时间
+    :return: 秒级时间戳，从未设置过返回0
+    """
+    return int(pwd_update_date.timestamp()) if pwd_update_date else 0
+
+
+def is_token_before_password_change(pwd_at: int | None, pwd_update_date: datetime | None) -> bool:
+    """
+    判定令牌是否签发于最近一次改密码之前（是则作废）
+
+    会话在 Redis 里按 session_id 存，没有「某个人的全部会话」这个索引，改密码时没法逐个撤销；
+    所以反过来在令牌里记下签发时的密码版本，由身份依赖每次比对。
+    令牌里没有 `pwd_at`（这个字段上线之前签发的）一律放行，等它自然过期：
+    否则上线那一刻全体访客会被同时踢下线。
+
+    :param pwd_at: 令牌里的密码版本戳
+    :param pwd_update_date: 库里的密码最后更新时间
+    :return: 应作废返回True
+    """
+    if pwd_at is None:
+        return False
+
+    return pwd_at < pwd_stamp(pwd_update_date)
 
 
 class GuestAuthService:
@@ -376,13 +422,209 @@ class GuestAuthService:
 
         return str(session_id) if session_id else None
 
+    # ------------------------------------------------------------ 找回密码 / 资料 / 改密码
+
+    @classmethod
+    async def reset_password(
+        cls, request: Request, query_db: AsyncSession, reset_model: GuestPasswordResetModel
+    ) -> GuestTokenModel:
+        """
+        找回密码service（凭邮箱验证码重设密码，成功后直接登录）
+
+        防枚举口径与登录一致：发码时邮箱不存在静默成功（`send_email_code` 的 reset 场景
+        与 login 走同一条分支），这里邮箱不存在、验证码错、验证码过期、失败次数超限
+        一律回同一句「验证码错误或已过期」。
+
+        重设成功后 `pwd_update_date` 前移，此前签发的令牌全部作废（见
+        `is_token_before_password_change`）—— 找回密码的典型场景正是「怀疑被盗」，
+        只换密码不踢会话等于没换。
+
+        :param request: Request对象
+        :param query_db: orm对象
+        :param reset_model: 找回密码请求对象
+        :return: 访客令牌信息
+        """
+        if reset_model.password != reset_model.confirm_password:
+            raise ServiceException(message='两次输入的密码不一致')
+        email = reset_model.email.lower()
+        if await cls._is_auth_locked(request, 'reset', email):
+            logger.warning(f'邮箱{email}找回密码验证码失败次数超限，处于锁定期')
+            raise ServiceException(message=EMAIL_CODE_INVALID_MESSAGE)
+        # 先消费验证码再查账号：邮箱不存在时根本没发过码，消费必然失败，
+        # 与「码填错了」走同一条分支、同一句文案、同样计数
+        if not await cls._consume_email_code(request, 'reset', email, reset_model.code):
+            await cls._record_auth_failure(request, 'reset', email)
+            raise ServiceException(message=EMAIL_CODE_INVALID_MESSAGE)
+        await cls._clear_auth_failure(request, 'reset', email)
+        guest_row = await GuestProfileDao.get_guest_by_email(query_db, email)
+        if guest_row is None:
+            # 发码之后、重设之前账号被删了。码已证明邮箱归属，这里报错不构成枚举
+            logger.warning(f'邮箱{email}验证码有效但访客账号已不存在，找回密码失败')
+            raise ServiceException(message=EMAIL_CODE_INVALID_MESSAGE)
+        user: SysUser = guest_row[0]
+        # 停用判断放在验证码之后：持有验证码 = 证明了邮箱归属，此时告知停用不泄露任何东西
+        if is_guest_account_disabled(user):
+            raise ServiceException(message=ACCOUNT_DISABLED_MESSAGE)
+        snapshot = GuestSnapshot.of(user, guest_row[1])
+        snapshot = await cls._write_password(query_db, snapshot, reset_model.password, 'guest_reset')
+        # 登录侧的失败计数与锁定一并清掉：用户多半正是输错几次密码才来找回的，
+        # 重设完回头登录却被锁 10 分钟，这条路就白走了
+        await cls._clear_auth_failure(request, 'login', email)
+        await cls._redis_delete(request, cls._auth_lock_key('login', email))
+        token = await cls._create_guest_token(request, snapshot)
+        logger.info(f'访客{snapshot.user_name}已通过邮箱验证码重设密码')
+
+        return GuestTokenModel(token=token, guest=cls._build_guest_info(snapshot).to_public())
+
+    @classmethod
+    async def update_profile(
+        cls, query_db: AsyncSession, current_guest: GuestInfoModel, profile_model: GuestProfileUpdateModel
+    ) -> GuestPublicInfoModel:
+        """
+        修改资料service（用户名 / 所属机构 / 职位）
+
+        用户名在 sys_user.nick_name，机构与职位在 action_guest_profile，两张表同一个事务。
+        档案行可能缺失（注册补偿中途、历史数据），缺了就补一行，而不是让保存静默落空。
+
+        :param query_db: orm对象
+        :param current_guest: 当前访客
+        :param profile_model: 资料入参
+        :return: 修改后的对外访客信息
+        """
+        now = datetime.now()
+        institution = profile_model.institution or ''
+        position = profile_model.position or ''
+        try:
+            await UserDao.edit_user_dao(
+                query_db,
+                {
+                    'user_id': current_guest.user_id,
+                    'nick_name': profile_model.username,
+                    'update_by': 'guest_profile',
+                    'update_time': now,
+                },
+            )
+            if await GuestProfileDao.get_profile_by_user_id(query_db, current_guest.user_id):
+                await GuestProfileDao.edit_guest_profile_dao(
+                    query_db,
+                    current_guest.user_id,
+                    {'institution': institution, 'position': position, 'update_time': now},
+                )
+            else:
+                await GuestProfileDao.add_guest_profile_dao(
+                    query_db,
+                    {
+                        'user_id': current_guest.user_id,
+                        'institution': institution,
+                        'position': position,
+                        'del_flag': '0',
+                        'create_time': now,
+                        'update_time': now,
+                    },
+                )
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            logger.error(f'访客user_id={current_guest.user_id}资料保存失败：{e}')
+            raise ServiceException(message='资料保存失败，请稍后重试') from e
+        logger.info(f'访客user_id={current_guest.user_id}已修改资料')
+
+        # 出参直接用入参拼，不回查：commit 后 ORM 实例全部过期，且入参就是刚写进去的值
+        return GuestPublicInfoModel(
+            email=current_guest.email,
+            username=profile_model.username,
+            institution=profile_model.institution,
+            position=profile_model.position,
+        )
+
+    @classmethod
+    async def change_password(
+        cls,
+        request: Request,
+        query_db: AsyncSession,
+        current_guest: GuestInfoModel,
+        change_model: GuestPasswordChangeModel,
+    ) -> GuestTokenModel:
+        """
+        修改密码service（已登录，凭原密码）
+
+        改完给当前会话换发一张新令牌：旧令牌因 `pwd_at` 早于新的 `pwd_update_date` 而作废，
+        其他设备上的会话随之一并下线 —— 这正是改密码该有的效果。当前会话那个 Redis 键
+        顺手删掉，免得留一个永远用不上的键等 TTL。
+
+        :param request: Request对象
+        :param query_db: orm对象
+        :param current_guest: 当前访客
+        :param change_model: 改密码入参
+        :return: 新的访客令牌信息
+        """
+        if change_model.password != change_model.confirm_password:
+            raise ServiceException(message='两次输入的密码不一致')
+        email = current_guest.email.lower()
+        if await cls._is_auth_locked(request, 'password', email):
+            logger.warning(f'访客user_id={current_guest.user_id}原密码失败次数超限，处于锁定期')
+            raise ServiceException(message=OLD_PASSWORD_WRONG_MESSAGE)
+        guest_row = await GuestProfileDao.get_guest_by_user_id(query_db, current_guest.user_id)
+        if guest_row is None:
+            raise ServiceException(message=OLD_PASSWORD_WRONG_MESSAGE)
+        user: SysUser = guest_row[0]
+        if not PwdUtil.verify_password(change_model.old_password, user.password or ''):
+            await cls._record_auth_failure(request, 'password', email)
+            raise ServiceException(message=OLD_PASSWORD_WRONG_MESSAGE)
+        await cls._clear_auth_failure(request, 'password', email)
+        snapshot = GuestSnapshot.of(user, guest_row[1])
+        snapshot = await cls._write_password(query_db, snapshot, change_model.password, 'guest_password')
+        old_session = cls._extract_session_id(request)
+        if old_session:
+            await cls._redis_delete(request, f'{RedisInitKeyConfig.ACCESS_TOKEN.key}:{old_session}')
+        token = await cls._create_guest_token(request, snapshot)
+        logger.info(f'访客{snapshot.user_name}已修改密码')
+
+        return GuestTokenModel(token=token, guest=cls._build_guest_info(snapshot).to_public())
+
+    @classmethod
+    async def _write_password(
+        cls, query_db: AsyncSession, snapshot: GuestSnapshot, password: str, operator: str
+    ) -> GuestSnapshot:
+        """
+        写入新密码并前移密码更新时间
+
+        `pwd_update_date` 取整到秒再写：令牌里的 `pwd_at` 是秒级的，新令牌与库里的值
+        必须相等才放行；库若保留了微秒，令牌取整后反而「早于」它，刚换发的令牌当场作废。
+
+        :param query_db: orm对象
+        :param snapshot: 访客快照（commit 之前取好的）
+        :param password: 新密码明文
+        :param operator: 写进 update_by 的来源标记
+        :return: 带新密码时间的快照
+        """
+        now = datetime.now().replace(microsecond=0)
+        try:
+            await UserDao.edit_user_dao(
+                query_db,
+                {
+                    'user_id': snapshot.user_id,
+                    'password': PwdUtil.get_password_hash(password),
+                    'pwd_update_date': now,
+                    'update_by': operator,
+                    'update_time': now,
+                },
+            )
+            await query_db.commit()
+        except Exception as e:
+            await query_db.rollback()
+            logger.error(f'访客user_id={snapshot.user_id}密码写入失败：{e}')
+            raise ServiceException(message='密码修改失败，请稍后重试') from e
+
+        return replace(snapshot, pwd_update_date=now)
+
     # ------------------------------------------------------------ 验证码与失败计数
 
     @classmethod
     async def _consume_email_code(
         cls,
         request: Request,
-        scene: Literal['register', 'login'],
+        scene: AuthScene,
         email: str,
         code: str,
     ) -> bool:
@@ -414,7 +656,7 @@ class GuestAuthService:
         return True
 
     @classmethod
-    async def _is_auth_locked(cls, request: Request, scene: Literal['register', 'login'], email: str) -> bool:
+    async def _is_auth_locked(cls, request: Request, scene: AuthScene, email: str) -> bool:
         """
         判断邮箱在指定场景下是否处于凭据失败锁定期
 
@@ -426,7 +668,7 @@ class GuestAuthService:
         return bool(await cls._redis_get(request, cls._auth_lock_key(scene, email)))
 
     @classmethod
-    async def _record_auth_failure(cls, request: Request, scene: Literal['register', 'login'], email: str) -> None:
+    async def _record_auth_failure(cls, request: Request, scene: AuthScene, email: str) -> None:
         """
         记录一次凭据失败，超过阈值则锁定该邮箱的该场景
 
@@ -454,7 +696,7 @@ class GuestAuthService:
             logger.warning(f'邮箱{email}在{LOGIN_FAIL_WINDOW_MINUTES}分钟内{scene}失败超过阈值，已锁定')
 
     @classmethod
-    async def _clear_auth_failure(cls, request: Request, scene: Literal['register', 'login'], email: str) -> None:
+    async def _clear_auth_failure(cls, request: Request, scene: AuthScene, email: str) -> None:
         """
         凭据校验通过后清空失败计数
 
@@ -466,7 +708,7 @@ class GuestAuthService:
         await cls._redis_delete(request, cls._auth_fail_key(scene, email))
 
     @classmethod
-    def _auth_fail_key(cls, scene: Literal['register', 'login'], email: str) -> str:
+    def _auth_fail_key(cls, scene: AuthScene, email: str) -> str:
         """
         构造凭据失败计数的Redis键
 
@@ -480,7 +722,7 @@ class GuestAuthService:
         return f'{RedisInitKeyConfig.GUEST_LOGIN_FAIL.key}:{scene}:{email.lower()}'
 
     @classmethod
-    def _auth_lock_key(cls, scene: Literal['register', 'login'], email: str) -> str:
+    def _auth_lock_key(cls, scene: AuthScene, email: str) -> str:
         """
         构造凭据失败锁定的Redis键
 
@@ -645,6 +887,7 @@ class GuestAuthService:
                 'user_name': snapshot.user_name,
                 'user_type': GUEST_USER_TYPE,
                 'session_id': session_id,
+                'pwd_at': pwd_stamp(snapshot.pwd_update_date),
             },
             expires_delta=timedelta(minutes=JwtConfig.jwt_expire_minutes),
         )
@@ -763,3 +1006,78 @@ class GuestAuthService:
         except REDIS_UNAVAILABLE_ERRORS as e:
             logger.error(f'Redis不可用，删除{key}失败：{e}')
             raise ServiceException(message=REDIS_UNAVAILABLE_MESSAGE) from e
+
+
+class GuestAdminService:
+    """
+    后台「访客管理」服务层
+
+    刻意只有「看」与「停用/启用」，**不提供后台改访客密码**：访客改密要走
+    `GuestAuthService._write_password`（秒级取整的 `pwd_update_date` + 令牌 `pwd_at` 作废旧会话），
+    后台用户管理那套重置密码不认这些，套过来会让访客刚换发的令牌当场失效。
+    访客忘了密码自己走「找回密码」。
+
+    停用即时生效：访客身份依赖（common/aspect/guest_auth.py）每个请求都回库判
+    `is_guest_account_disabled`，不需要去 Redis 里逐个撤会话。
+    """
+
+    @classmethod
+    async def get_guest_list_services(cls, query_db: AsyncSession, query_object: GuestAdminPageQueryModel) -> PageModel:
+        """
+        获取访客分页列表
+
+        :param query_db: orm对象
+        :param query_object: 查询参数对象
+        :return: 分页结果
+        """
+        total, rows = await GuestProfileDao.get_guest_admin_list(query_db, query_object)
+
+        return PageModel[Any](
+            rows=CamelCaseUtil.transform_result(rows),
+            pageNum=query_object.page_num,
+            pageSize=query_object.page_size,
+            total=total,
+            hasNext=query_object.page_num * query_object.page_size < total,
+        )
+
+    @classmethod
+    async def guest_detail_services(cls, query_db: AsyncSession, user_id: int) -> GuestAdminModel:
+        """
+        获取访客详情
+
+        :param query_db: orm对象
+        :param user_id: 用户id
+        :return: 访客信息
+        """
+        row = await GuestProfileDao.get_guest_admin_detail(query_db, user_id)
+        if row is None:
+            raise ServiceException(message='访客不存在')
+
+        return GuestAdminModel(**row)
+
+    @classmethod
+    async def change_guest_status_services(
+        cls, query_db: AsyncSession, status_model: GuestStatusModel, operator: str
+    ) -> CrudResponseModel:
+        """
+        停用 / 启用访客账号
+
+        :param query_db: orm对象
+        :param status_model: 状态参数
+        :param operator: 操作人
+        :return: 操作结果
+        """
+        try:
+            hit = await GuestProfileDao.set_guest_status_dao(
+                query_db,
+                status_model.user_id,
+                {'status': status_model.status, 'update_by': operator, 'update_time': datetime.now()},
+            )
+            if not hit:
+                raise ServiceException(message='访客不存在')
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return CrudResponseModel(is_success=True, message='已停用' if status_model.status == GUEST_DISABLED_STATUS else '已启用')

@@ -1,7 +1,7 @@
 from datetime import datetime, time
 from typing import Any
 
-from sqlalchemy import Row, and_, delete, func, nullslast, select, update
+from sqlalchemy import Row, and_, delete, func, nullslast, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.constant import CommonConstant
@@ -10,6 +10,8 @@ from module_action.entity.do.action_do import (
     ActionBackgroundRun,
     ActionCfirConstruct,
     ActionCfirDomain,
+    ActionCfirElement,
+    ActionCfirReference,
     ActionCfirStrategy,
     ActionCollabRequest,
     ActionConditionDict,
@@ -24,11 +26,13 @@ from module_action.entity.do.action_do import (
     ActionNews,
     ActionPublication,
     ActionReaimDimension,
+    ActionReportAiRun,
     ActionReportDraft,
     ActionReportDraftItem,
     ActionReportDraftSource,
     ActionReportReview,
     ActionReportReviewItem,
+    ActionReportSuggestion,
     ActionReportTrail,
     ActionResourceLink,
     ActionSiteText,
@@ -45,6 +49,7 @@ from module_action.entity.do.action_do import (
 )
 from module_action.entity.vo.action_vo import (
     CollabRequestPageQueryModel,
+    GuestAdminPageQueryModel,
     GuidelineCategoryModel,
     GuidelineCategoryPageQueryModel,
     GuidelineItemModel,
@@ -66,6 +71,17 @@ from utils.page_util import PageUtil
 
 # 官网访客在 sys_user 中的用户类型标记，与后台系统用户（'00'）彻底分开
 GUEST_USER_TYPE = CommonConstant.GUEST_USER_TYPE
+
+
+def parse_id_list(raw: str | None) -> list[int]:
+    """逗号分隔的 id 串 → 去重保序的正整数列表（`action_study_type.alt_guideline_ids` 用）；非法片段跳过"""
+    out: list[int] = []
+    for seg in (raw or '').split(','):
+        seg = seg.strip()
+        if seg.isdigit() and int(seg) > 0 and int(seg) not in out:
+            out.append(int(seg))
+
+    return out
 
 
 class NewsDao:
@@ -1321,9 +1337,37 @@ class StudyTypeDao:
         )
 
     @classmethod
+    async def count_items_by_guideline_ids(cls, db: AsyncSession, guideline_ids: list[int]) -> dict[int, int]:
+        """
+        批量数各规范启用中的 checklist 条目（第二步规范选项上的「条目待录入」据此判）
+
+        :param db: orm对象
+        :param guideline_ids: 规范id列表
+        :return: 规范id -> 条目数（0 条的规范不在字典里）
+        """
+        if not guideline_ids:
+            return {}
+        rows = (
+            await db.execute(
+                select(ActionGuidelineItem.guideline_id, func.count())
+                .where(
+                    ActionGuidelineItem.guideline_id.in_(guideline_ids),
+                    ActionGuidelineItem.status == '0',
+                    ActionGuidelineItem.del_flag == '0',
+                )
+                .group_by(ActionGuidelineItem.guideline_id)
+            )
+        ).all()
+
+        return {int(gid): int(n) for gid, n in rows}
+
+    @classmethod
     async def get_type_keys_by_hot_guideline_ids(cls, db: AsyncSession, guideline_ids: list[int]) -> list[str]:
         """
-        取把这几份规范挂作重点推荐规范的研究类型标识（删规范前拦截用）
+        取把这几份规范挂作重点推荐规范、或挂作第二步可切换规范（sql/056）的研究类型标识（删规范前拦截用）
+
+        `alt_guideline_ids` 是逗号串，按行取回来在内存里判 —— 这张词表十几行，
+        为它写一段字符串拼接的 SQL 匹配不值得
 
         :param db: orm对象
         :param guideline_ids: 规范id列表
@@ -1331,16 +1375,18 @@ class StudyTypeDao:
         """
         if not guideline_ids:
             return []
-
-        return list(
-            (
-                await db.execute(
-                    select(ActionStudyType.type_key).where(ActionStudyType.hot_guideline_id.in_(guideline_ids))
-                )
+        wanted = set(guideline_ids)
+        rows = (
+            await db.execute(
+                select(ActionStudyType.type_key, ActionStudyType.hot_guideline_id, ActionStudyType.alt_guideline_ids)
             )
-            .scalars()
-            .all()
-        )
+        ).all()
+
+        return [
+            key
+            for key, hot_id, alt in rows
+            if hot_id in wanted or wanted & set(parse_id_list(alt))
+        ]
 
     @classmethod
     async def sync_hot_guideline_code_dao(cls, db: AsyncSession, guideline_id: int, code: str) -> None:
@@ -1686,6 +1732,42 @@ class ImplementationDao:
             )
             .scalars()
             .all()
+        )
+
+    @classmethod
+    async def get_cfir_elements(cls, db: AsyncSession, construct_ids: list[int]) -> list[ActionCfirElement]:
+        """
+        批量获取 CFIR 构念下的子条目（各级混在一起，由服务层按 parent_id 组树）
+
+        :param db: orm对象
+        :param construct_ids: 构念id列表
+        :return: 子条目列表
+        """
+        if not construct_ids:
+            return []
+
+        return list(
+            (
+                await db.execute(
+                    select(ActionCfirElement)
+                    .where(ActionCfirElement.construct_id.in_(construct_ids))
+                    .order_by(ActionCfirElement.construct_id, ActionCfirElement.sort_num, ActionCfirElement.element_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def get_cfir_references(cls, db: AsyncSession) -> list[ActionCfirReference]:
+        """
+        获取 CFIR 针刺版框架参考文献
+
+        :param db: orm对象
+        :return: 参考文献列表
+        """
+        return list(
+            (await db.execute(select(ActionCfirReference).order_by(ActionCfirReference.ref_no))).scalars().all()
         )
 
     @classmethod
@@ -2276,6 +2358,159 @@ class GuestProfileDao:
 
         return db_profile
 
+    @classmethod
+    async def edit_guest_profile_dao(cls, db: AsyncSession, user_id: int, values: dict[str, Any]) -> None:
+        """
+        按用户id修改访客档案（只改未删除的那一行）
+
+        :param db: orm对象
+        :param user_id: 用户id
+        :param values: 要更新的字段字典
+        :return: None
+        """
+        await db.execute(
+            update(ActionGuestProfile)
+            .where(ActionGuestProfile.user_id == user_id, ActionGuestProfile.del_flag == '0')
+            .values(**values)
+        )
+
+    # ---------------------------------------------------------------- 后台「访客管理」
+
+    @classmethod
+    def _work_count(cls, model: Any) -> Any:
+        """
+        某访客名下未删除的工作数（相关子查询，列表与详情共用）
+
+        :param model: 带 user_id / del_flag 的工作表
+        :return: 标量子查询
+        """
+        return (
+            select(func.count())
+            .select_from(model)
+            .where(model.user_id == SysUser.user_id, model.del_flag == '0')
+            .correlate(SysUser)
+            .scalar_subquery()
+        )
+
+    @classmethod
+    def _admin_columns(cls) -> list[Any]:
+        """
+        后台访客行的列。逐列挑而不是 select(SysUser)：password 哈希不该被查出来
+
+        :return: 列清单
+        """
+        return [
+            SysUser.user_id,
+            SysUser.email,
+            SysUser.nick_name,
+            ActionGuestProfile.institution,
+            ActionGuestProfile.position,
+            SysUser.status,
+            SysUser.login_ip,
+            SysUser.login_date,
+            SysUser.pwd_update_date,
+            SysUser.create_time,
+            cls._work_count(ActionReportDraft).label('draft_count'),
+            cls._work_count(ActionSrdAssessment).label('srd_count'),
+            cls._work_count(ActionReportReview).label('review_count'),
+            cls._work_count(ActionBackgroundRun).label('background_count'),
+        ]
+
+    @classmethod
+    async def get_guest_admin_list(
+        cls, db: AsyncSession, query_object: GuestAdminPageQueryModel
+    ) -> tuple[int, list[dict[str, Any]]]:
+        """
+        后台访客分页列表
+
+        **`user_type='01'` 是这个查询的全部意义**：后台用户管理把访客排除在外，
+        这里反过来只取访客，两边恰好互补、互不越界。
+
+        :param db: orm对象
+        :param query_object: 查询参数对象
+        :return: (总数, 当前页行)
+        """
+        conditions: list[Any] = [SysUser.del_flag == '0', SysUser.user_type == GUEST_USER_TYPE]
+        if query_object.keyword:
+            kw = f'%{query_object.keyword.strip().lower()}%'
+            conditions.append(
+                func.lower(SysUser.email).like(kw)
+                | func.lower(SysUser.nick_name).like(kw)
+                | func.lower(ActionGuestProfile.institution).like(kw)
+                | func.lower(ActionGuestProfile.position).like(kw)
+            )
+        if query_object.status == '1':
+            conditions.append(SysUser.status == '1')
+        elif query_object.status == '0':
+            # 与 is_guest_account_disabled 同一口径：只有明确的 '1' 算停用，NULL 按正常
+            conditions.append(or_(SysUser.status.is_(None), SysUser.status != '1'))
+        if query_object.begin_time:
+            conditions.append(
+                SysUser.create_time >= datetime.combine(datetime.strptime(query_object.begin_time, '%Y-%m-%d'), time(0, 0, 0))
+            )
+        if query_object.end_time:
+            conditions.append(
+                SysUser.create_time <= datetime.combine(datetime.strptime(query_object.end_time, '%Y-%m-%d'), time(23, 59, 59))
+            )
+
+        base = (
+            select(SysUser.user_id)
+            .join(ActionGuestProfile, cls._guest_profile_join_condition(), isouter=True)
+            .where(*conditions)
+        )
+        total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0
+        query = (
+            select(*cls._admin_columns())
+            .join(ActionGuestProfile, cls._guest_profile_join_condition(), isouter=True)
+            .where(*conditions)
+            .order_by(SysUser.create_time.desc(), SysUser.user_id.desc())
+            .offset((query_object.page_num - 1) * query_object.page_size)
+            .limit(query_object.page_size)
+        )
+        rows = [dict(row._mapping) for row in await db.execute(query)]
+
+        return total, rows
+
+    @classmethod
+    async def get_guest_admin_detail(cls, db: AsyncSession, user_id: int) -> dict[str, Any] | None:
+        """
+        后台访客详情（列同列表）
+
+        :param db: orm对象
+        :param user_id: 用户id
+        :return: 访客行，不存在或不是访客时返回None
+        """
+        row = (
+            await db.execute(
+                select(*cls._admin_columns())
+                .join(ActionGuestProfile, cls._guest_profile_join_condition(), isouter=True)
+                .where(SysUser.del_flag == '0', SysUser.user_type == GUEST_USER_TYPE, SysUser.user_id == user_id)
+            )
+        ).first()
+
+        return dict(row._mapping) if row else None
+
+    @classmethod
+    async def set_guest_status_dao(cls, db: AsyncSession, user_id: int, values: dict[str, Any]) -> int:
+        """
+        改访客账号状态
+
+        where 里那道 `user_type='01'` 不能省：这个口收的是任意 user_id，
+        少了它就能从「访客管理」页停掉后台管理员账号。
+
+        :param db: orm对象
+        :param user_id: 用户id
+        :param values: 要更新的字段字典
+        :return: 命中行数（0 = 不存在或不是访客）
+        """
+        result = await db.execute(
+            update(SysUser)
+            .where(SysUser.user_id == user_id, SysUser.user_type == GUEST_USER_TYPE, SysUser.del_flag == '0')
+            .values(**values)
+        )
+
+        return result.rowcount
+
 
 class ReportDraftDao:
     """
@@ -2302,6 +2537,24 @@ class ReportDraftDao:
             conditions.append(ActionReportDraft.del_flag == '0')
 
         return select(ActionReportDraft.draft_id).where(*conditions)
+
+    @classmethod
+    async def lock_draft_dao(cls, db: AsyncSession, draft_id: int, user_id: int) -> None:
+        """
+        锁住草稿主表那一行直到本事务结束（`select … for update`）。
+
+        「读正文 → 核对 → 写回」要在锁里做：保存是先 update 主表（同一把行锁）再整体覆盖条目，
+        先拿到锁的一方做完、提交，另一方才读得到它的结果。SQLite 不认 for update，会被方言忽略
+        """
+        await db.execute(
+            select(ActionReportDraft.draft_id)
+            .where(
+                ActionReportDraft.draft_id == draft_id,
+                ActionReportDraft.user_id == user_id,
+                ActionReportDraft.del_flag == '0',
+            )
+            .with_for_update()
+        )
 
     @classmethod
     async def get_draft_by_id(cls, db: AsyncSession, draft_id: int, user_id: int) -> ActionReportDraft | None:
@@ -2583,6 +2836,27 @@ class ReportDraftDao:
         ).all()
 
         return {row[0]: (row[1] or '0') for row in rows}
+
+    @classmethod
+    async def get_item_part_map(cls, db: AsyncSession, guideline_id: int) -> dict[int, int]:
+        """
+        取某份规范全部启用条目所在的清单表序号（草稿按 `parts` 圈定范围时用）
+
+        :param db: orm对象
+        :param guideline_id: 规范id
+        :return: 条目id -> part_no（库里为空时按 1 算，与列的 server_default 一致）
+        """
+        rows = (
+            await db.execute(
+                select(ActionGuidelineItem.item_id, ActionGuidelineItem.part_no).where(
+                    ActionGuidelineItem.guideline_id == guideline_id,
+                    ActionGuidelineItem.status == '0',
+                    ActionGuidelineItem.del_flag == '0',
+                )
+            )
+        ).all()
+
+        return {row[0]: (row[1] or 1) for row in rows}
 
 
 class ReportReviewDao:
@@ -3380,4 +3654,257 @@ class BackgroundRunDao:
                 ActionBackgroundRun.run_id.notin_(keep_ids),
             )
             .values(del_flag='2', topic='', result_json=None, corpus_snapshot=None)
+        )
+
+
+class ReportAiDao:
+    """
+    报告助手第四步：AI 任务台账（`action_report_ai_run`）与逐条建议（`action_report_suggestion`），sql/053
+
+    **每个查询都带 user_id**：不带的话换个 session_id / 建议id 就能读写别人的草稿。
+    """
+
+    _ACTIVE = ('pending', 'running')
+
+    # ------------------------------------------------------------------ 任务台账
+
+    @classmethod
+    async def add_run_dao(cls, db: AsyncSession, run: ActionReportAiRun) -> ActionReportAiRun:
+        """新增台账（flush 后主键可用）"""
+        db.add(run)
+        await db.flush()
+
+        return run
+
+    @classmethod
+    async def edit_run_dao(cls, db: AsyncSession, run_id: int, values: dict[str, Any]) -> None:
+        """更新台账字段"""
+        await db.execute(update(ActionReportAiRun).where(ActionReportAiRun.run_id == run_id).values(**values))
+
+    @classmethod
+    async def get_run_by_session(cls, db: AsyncSession, session_id: str, user_id: int) -> ActionReportAiRun | None:
+        """按 worker 任务id 取（限本人）"""
+        return (
+            (
+                await db.execute(
+                    select(ActionReportAiRun).where(
+                        ActionReportAiRun.session_id == session_id,
+                        ActionReportAiRun.user_id == user_id,
+                        ActionReportAiRun.del_flag == '0',
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def list_active_dao(cls, db: AsyncSession, user_id: int, draft_id: int | None = None) -> list[ActionReportAiRun]:
+        """本人还没到终态的任务（可限某份草稿），新的在前"""
+        conds = [
+            ActionReportAiRun.user_id == user_id,
+            ActionReportAiRun.del_flag == '0',
+            ActionReportAiRun.run_status.in_(cls._ACTIVE),
+        ]
+        if draft_id is not None:
+            conds.append(ActionReportAiRun.draft_id == draft_id)
+
+        return list(
+            (await db.execute(select(ActionReportAiRun).where(*conds).order_by(ActionReportAiRun.run_id.desc())))
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def get_latest_render_dao(cls, db: AsyncSession, draft_id: int, user_id: int) -> ActionReportAiRun | None:
+        """
+        最近一次**跑完**的整篇成文。必须过滤 completed：排队中、跑挂了的行没有结果，
+        取到它们页面就会显示一份空成文，和「还没生成过」长得一样
+        """
+        return (
+            (
+                await db.execute(
+                    select(ActionReportAiRun)
+                    .where(
+                        ActionReportAiRun.draft_id == draft_id,
+                        ActionReportAiRun.user_id == user_id,
+                        ActionReportAiRun.kind == 'render',
+                        ActionReportAiRun.run_status == 'completed',
+                        ActionReportAiRun.del_flag == '0',
+                    )
+                    .order_by(ActionReportAiRun.run_id.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    @classmethod
+    async def edit_active_run_dao(cls, db: AsyncSession, run_id: int, values: dict[str, Any]) -> bool:
+        """只更新还没到终态的任务，返回是否改到了（已是终态的不动 —— 见 `ReportAiService._commit_values`）"""
+        result = await db.execute(
+            update(ActionReportAiRun)
+            .where(ActionReportAiRun.run_id == run_id, ActionReportAiRun.run_status.in_(cls._ACTIVE))
+            .values(**values)
+        )
+
+        return bool(result.rowcount)
+
+    @classmethod
+    async def claim_terminal_dao(cls, db: AsyncSession, run_id: int, status: str) -> bool:
+        """
+        把一条还没到终态的任务标成终态，返回「是不是我这次标上的」
+
+        **落库的幂等闸**：两个标签页同时轮询、或轮询撞上对账，都会走到「看到终态 → 落结果」。
+        条件更新 + 看影响行数，保证只有一方拿到落库权，另一方直接放弃 —— 不这样的话
+        一键优化的建议会插两份、`rendered` 留痕记两次。PostgreSQL 下第二个 UPDATE 会等第一个
+        事务提交后重读行，看到已是终态，影响 0 行。
+        """
+        result = await db.execute(
+            update(ActionReportAiRun)
+            .where(ActionReportAiRun.run_id == run_id, ActionReportAiRun.run_status.in_(cls._ACTIVE))
+            .values(run_status=status)
+        )
+
+        return bool(result.rowcount)
+
+    @classmethod
+    async def trim_runs_dao(cls, db: AsyncSession, draft_id: int, keep: int) -> None:
+        """
+        每份草稿**每种任务**只留最近 keep 次已结束的（成文那一行挂着整篇正文）
+
+        **按 kind 分开修剪，且最近一次跑完的整篇成文永远保留**：不分 kind 的话，成文之后
+        再跑几次一键优化就会把唯一那份成文物理删掉 —— 第四步显示「还没生成」、第五步导不出来，
+        而用户什么都没删
+        """
+        latest_render = (
+            await db.execute(
+                select(ActionReportAiRun.run_id)
+                .where(
+                    ActionReportAiRun.draft_id == draft_id,
+                    ActionReportAiRun.kind == 'render',
+                    ActionReportAiRun.run_status == 'completed',
+                )
+                .order_by(ActionReportAiRun.run_id.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        for kind in ('refine', 'render'):
+            ids = (
+                await db.execute(
+                    select(ActionReportAiRun.run_id)
+                    .where(
+                        ActionReportAiRun.draft_id == draft_id,
+                        ActionReportAiRun.kind == kind,
+                        ActionReportAiRun.run_status.notin_(cls._ACTIVE),
+                    )
+                    .order_by(ActionReportAiRun.run_id.desc())
+                    .offset(keep)
+                )
+            ).scalars().all()
+            ids = [i for i in ids if i != latest_render]
+            if ids:
+                await db.execute(delete(ActionReportAiRun).where(ActionReportAiRun.run_id.in_(ids)))
+
+    # ------------------------------------------------------------------ 逐条建议
+
+    @classmethod
+    async def add_suggestions_dao(cls, db: AsyncSession, rows: list[ActionReportSuggestion]) -> list[ActionReportSuggestion]:
+        """批量新增建议（flush 后主键可用）"""
+        db.add_all(rows)
+        await db.flush()
+
+        return rows
+
+    @classmethod
+    async def list_suggestions_dao(cls, db: AsyncSession, draft_id: int, user_id: int) -> list[ActionReportSuggestion]:
+        """这份草稿的建议（不含已放弃的），旧的在前"""
+        return list(
+            (
+                await db.execute(
+                    select(ActionReportSuggestion)
+                    .where(
+                        ActionReportSuggestion.draft_id == draft_id,
+                        ActionReportSuggestion.user_id == user_id,
+                        ActionReportSuggestion.status != 'discarded',
+                    )
+                    .order_by(ActionReportSuggestion.suggestion_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def get_suggestions_dao(
+        cls, db: AsyncSession, draft_id: int, user_id: int, ids: list[int]
+    ) -> list[ActionReportSuggestion]:
+        """按id 取（限本人、限这份草稿）"""
+        return list(
+            (
+                await db.execute(
+                    select(ActionReportSuggestion)
+                    .where(
+                        ActionReportSuggestion.draft_id == draft_id,
+                        ActionReportSuggestion.user_id == user_id,
+                        ActionReportSuggestion.suggestion_id.in_(ids),
+                    )
+                    .order_by(ActionReportSuggestion.suggestion_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    @classmethod
+    async def set_suggestion_status_dao(
+        cls, db: AsyncSession, draft_id: int, user_id: int, ids: list[int], status: str
+    ) -> None:
+        """改建议状态（限本人、限这份草稿）"""
+        if not ids:
+            return
+        await db.execute(
+            update(ActionReportSuggestion)
+            .where(
+                ActionReportSuggestion.draft_id == draft_id,
+                ActionReportSuggestion.user_id == user_id,
+                ActionReportSuggestion.suggestion_id.in_(ids),
+            )
+            .values(status=status, update_time=datetime.now())
+        )
+
+    @classmethod
+    async def trim_suggestions_dao(cls, db: AsyncSession, draft_id: int, item_ids: list[int], keep: int) -> None:
+        """每条只留最近 keep 条建议 —— 每行挂着一段正文，反复点「重新优化」不该把库撑大"""
+        for item_id in set(item_ids):
+            ids = (
+                await db.execute(
+                    select(ActionReportSuggestion.suggestion_id)
+                    .where(ActionReportSuggestion.draft_id == draft_id, ActionReportSuggestion.item_id == item_id)
+                    .order_by(ActionReportSuggestion.suggestion_id.desc())
+                    .offset(keep)
+                )
+            ).scalars().all()
+            if ids:
+                await db.execute(delete(ActionReportSuggestion).where(ActionReportSuggestion.suggestion_id.in_(ids)))
+
+    @classmethod
+    async def delete_by_draft_dao(cls, db: AsyncSession, draft_id: int, user_id: int) -> None:
+        """
+        删草稿时**物理删除**它的任务台账与建议：成文与建议里都是稿件正文与模型改写，
+        与「删除即真删正文」同一口径。
+
+        **先删台账、后删建议，顺序不能换**：轮询落库是先 claim 台账那一行（持行锁）再插建议、最后提交。
+        先删建议的话，那条语句在对方提交之前就跑完了，对方随后插进来的建议成了已删草稿名下的孤儿；
+        先删台账则会等在那把行锁上，等到时对方的建议已提交，后一条删除语句看得见它们
+        （对方要是还没 claim，台账已删，它的 claim 改不到行、不会再插）
+        """
+        await db.execute(
+            delete(ActionReportAiRun).where(ActionReportAiRun.draft_id == draft_id, ActionReportAiRun.user_id == user_id)
+        )
+        await db.execute(
+            delete(ActionReportSuggestion).where(
+                ActionReportSuggestion.draft_id == draft_id, ActionReportSuggestion.user_id == user_id
+            )
         )

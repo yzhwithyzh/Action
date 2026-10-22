@@ -38,6 +38,7 @@ PAGE_LABELS: dict[str, str] = {
     'footer': '页脚',
     'common': '通用',
     'auth': '登录注册',
+    'account': '我的账号',
     'index': '首页',
     'about': '关于我们',
     'assistant': '报告助手',

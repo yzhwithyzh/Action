@@ -257,8 +257,12 @@ class ApiNamespace:
     ACTION_GUEST_LOGIN: 官网访客登录接口命名空间
     ACTION_GUEST_ME: 官网访客当前用户信息接口命名空间
     ACTION_GUEST_LOGOUT: 官网访客登出接口命名空间
+    ACTION_GUEST_PASSWORD_RESET: 官网访客找回密码接口命名空间
+    ACTION_GUEST_PROFILE: 官网访客修改资料接口命名空间
+    ACTION_GUEST_PASSWORD: 官网访客修改密码接口命名空间
     ACTION_CHECKLIST_REVIEW: 官网报告助手 checklist 逐条校验接口命名空间
     ACTION_BACKGROUND_GEN: 官网报告助手研究背景智能生成提交接口命名空间
+    ACTION_REPORT_AI: 官网报告助手一键优化 / 整篇成文提交接口命名空间
     ACTION_REPORT_DRAFT: 官网报告助手报告草稿读写接口命名空间
     ACTION_SRD_ASSESS: 官网 SRD 系统综述重复性评估提交接口命名空间
     ACTION_SRD_EXPORT: 官网 SRD 评估结果导出 Excel 接口命名空间
@@ -382,8 +386,12 @@ class ApiNamespace:
     ACTION_GUEST_LOGIN = 'action:guest:login'
     ACTION_GUEST_ME = 'action:guest:me'
     ACTION_GUEST_LOGOUT = 'action:guest:logout'
+    ACTION_GUEST_PASSWORD_RESET = 'action:guest:password-reset'
+    ACTION_GUEST_PROFILE = 'action:guest:profile'
+    ACTION_GUEST_PASSWORD = 'action:guest:password'
     ACTION_CHECKLIST_REVIEW = 'action:checklist:review'
     ACTION_BACKGROUND_GEN = 'action:background:gen'
+    ACTION_REPORT_AI = 'action:report:ai'
     ACTION_REPORT_DRAFT = 'action:report:draft'
     ACTION_SRD_ASSESS = 'action:srd:assess'
     ACTION_SRD_EXPORT = 'action:srd:export'

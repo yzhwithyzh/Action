@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import io
 import json
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -70,6 +71,8 @@ _T = {
         'placeholder': '【待补充：条目 {no}】',
         'meta': '规范：{code} · 条目 {n} 条 · 已填写 {filled} 条',
         'sheet': '规范对照表',
+        'partN': '清单表 {n}',
+        'renderFailed': '【本章未能生成，请在报告助手第四步重新生成这一章】',
         'verdicts': {'reported': '已报告', 'vague': '描述模糊', 'missing': '未报告'},
     },
     EN: {
@@ -89,6 +92,8 @@ _T = {
         'placeholder': '[To be completed: item {no}]',
         'meta': 'Guideline: {code} · {n} items · {filled} completed',
         'sheet': 'Checklist',
+        'partN': 'Checklist table {n}',
+        'renderFailed': '[This section could not be generated. Regenerate it in step 4 of the reporting assistant.]',
         'verdicts': {'reported': 'Reported', 'vague': 'Vague', 'missing': 'Not reported'},
     },
 }
@@ -108,6 +113,10 @@ class ExportItem:
     content: str = ''
     #: 第三步对这一条的判定（reported / vague / missing / 空=没判过）
     verdict: str = ''
+    #: 所在清单表（RCT = CONSORT 主表 + 摘要表 + STRICTA 表）。对照表按它分表：
+    #: 期刊要的正是分开的几张表，拼成一张的话编辑得自己再拆
+    part_no: int = 1
+    part_title: str = ''
 
 
 @dataclass(frozen=True)
@@ -127,6 +136,20 @@ class ExportDraft:
 
 def _lang(locale: str) -> str:
     return EN if locale == EN else ZH
+
+
+def _parts(draft: ExportDraft) -> list[tuple[str, list[ExportItem]]]:
+    """
+    按清单表分组：[(表标题, 条目)]，表的先后取条目里首次出现的顺序（条目本身已按 sort_num 排好）
+
+    只按 `part_no` 分，不按标题 —— 后台新加一张同名的表（修订版）时标题会撞、序号不会。
+    """
+    groups: dict[int, tuple[str, list[ExportItem]]] = {}
+    for it in draft.items:
+        _title, rows = groups.setdefault(it.part_no, (it.part_title, []))
+        rows.append(it)
+
+    return list(groups.values())
 
 
 def _stats(draft: ExportDraft) -> tuple[int, int]:
@@ -222,24 +245,76 @@ def build_docx_on(body_docx: bytes, draft: ExportDraft, locale: str = ZH) -> byt
     return _append_appendix(doc, draft, _T[_lang(locale)])
 
 
+def build_docx_render(
+    sections: Sequence[dict[str, Any]], draft: ExportDraft, locale: str = ZH, paper_title: str = ''
+) -> bytes:
+    """
+    导出稿件（.docx），正文是第四步「整篇成文」的那一份
+
+    题目用成文里照录的题目条目，没有才用草稿名。2026-10 起每节带 `part`（一级部分，如「2 方法」）：
+    部分名出一级标题、小节标题出二级标题，不分小节的部分只出一级；改版前的成文没有 `part`，按节出一级标题。
+    段落上的条目标注（`itemIds`）是给页面「去改对应条目」用的，不进文档。没写成的小节（模型调用失败）
+    留一行说明而不是悄悄跳过 —— 少一节的论文看起来和完整的一模一样。附录对照表照旧接在最后。
+
+    :param sections: 整篇成文的各节 [{domain, part, paragraphs: [{text}], error}]
+    :param draft: 草稿（标题与附录要用）
+    :param locale: 语言
+    :param paper_title: 成文里的论文题目
+    :return: docx 字节
+    """
+    lang = _lang(locale)
+    t = _T[lang]
+    doc = Document()
+    doc.add_heading(paper_title.strip() or draft.title.strip() or t['draft'], level=0)
+    last_part = None
+    for sec in sections:
+        domain = str(sec.get('domain') or '').strip()
+        part = str(sec.get('part') or '').strip()
+        if part:
+            if part != last_part:
+                doc.add_heading(part, level=1)
+                last_part = part
+            if domain and domain != part:
+                doc.add_heading(domain, level=2)
+        elif domain:
+            doc.add_heading(domain, level=1)
+        paragraphs = sec.get('paragraphs') or []
+        if not paragraphs and sec.get('error'):
+            doc.add_paragraph(t['renderFailed'])
+        for p in paragraphs:
+            text = str(p.get('text') or '').strip()
+            if text:
+                doc.add_paragraph(text)
+
+    return _append_appendix(doc, draft, t)
+
+
 def _append_appendix(doc: Any, draft: ExportDraft, t: dict[str, str]) -> bytes:
-    """在文档末尾接上 checklist 对照表附录，返回整份 docx 字节"""
+    """
+    在文档末尾接上 checklist 对照表附录，返回整份 docx 字节
+
+    多张清单表时**每张一个小标题 + 一张表**：投稿时 CONSORT 与 STRICTA 是分开交的两张表。
+    """
     # 附录：对照表。这里**才**放要求原文 —— 它以「对照表」而非「稿件」的身份出现
     doc.add_page_break()
     doc.add_heading(t['appendix'], level=1)
-    table = doc.add_table(rows=1, cols=4)
-    table.style = 'Table Grid'
-    for cell, text in zip(table.rows[0].cells, (t['no'], t['req'], t['level'], t['state']), strict=True):
-        cell.text = text
-        for p in cell.paragraphs:
-            for run in p.runs:
-                run.font.bold = True
-    for it in draft.items:
-        row = table.add_row().cells
-        row[0].text = it.item_no or str(it.item_id)
-        row[1].text = it.requirement
-        row[2].text = t['must'] if it.require_level == '0' else t['opt']
-        row[3].text = t['filled'] if it.content.strip() else t['blank']
+    parts = _parts(draft)
+    for n, (title, rows) in enumerate(parts, start=1):
+        if len(parts) > 1:
+            doc.add_heading(title or t['partN'].format(n=n), level=2)
+        table = doc.add_table(rows=1, cols=4)
+        table.style = 'Table Grid'
+        for cell, text in zip(table.rows[0].cells, (t['no'], t['req'], t['level'], t['state']), strict=True):
+            cell.text = text
+            for p in cell.paragraphs:
+                for run in p.runs:
+                    run.font.bold = True
+        for it in rows:
+            row = table.add_row().cells
+            row[0].text = it.item_no or str(it.item_id)
+            row[1].text = it.requirement
+            row[2].text = t['must'] if it.require_level == '0' else t['opt']
+            row[3].text = t['filled'] if it.content.strip() else t['blank']
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -247,9 +322,37 @@ def _append_appendix(doc: Any, draft: ExportDraft, t: dict[str, str]) -> bytes:
     return buf.getvalue()
 
 
+#: Excel 工作表名不许出现的字符，以及长度上限
+_SHEET_BAD = re.compile(r'[\\/?*\[\]:]')
+_SHEET_MAX = 31
+
+
+def _sheet_names(titles: Sequence[str], fallback: str) -> list[str]:
+    r"""
+    清单表标题 → 合法且互不相同的工作表名
+
+    Excel 限 31 个字符、不许 `\ / ? * [ ] :`，重名直接打不开文件。标题截断后很容易撞
+    （「CONSORT 对照检查清单与……」与「CONSORT 对照检查清单与……扩展」），撞了就加序号。
+    """
+    out: list[str] = []
+    for i, raw in enumerate(titles, start=1):
+        base = _SHEET_BAD.sub(' ', raw or '').strip()[:_SHEET_MAX].strip() or f'{fallback} {i}'
+        name, n = base, 2
+        while name.lower() in {x.lower() for x in out}:
+            suffix = f' ({n})'
+            name = base[: _SHEET_MAX - len(suffix)] + suffix
+            n += 1
+        out.append(name)
+
+    return out
+
+
 def build_xlsx(draft: ExportDraft, locale: str = ZH) -> bytes:
     """
     导出 checklist 对照表（.xlsx）—— 投稿时随稿提交的那份表
+
+    **每张清单表一个工作表**（RCT：CONSORT 主表 / 摘要表 / STRICTA 表）。期刊要的是分开的
+    几张表，拼成一张的话编辑得自己再拆；只有一张表时工作表名仍是「规范对照表」。
 
     :param draft: 草稿
     :param locale: 语言
@@ -258,9 +361,21 @@ def build_xlsx(draft: ExportDraft, locale: str = ZH) -> bytes:
     lang = _lang(locale)
     t = _T[lang]
     wb = Workbook()
-    ws = wb.active
-    ws.title = t['sheet']
+    parts = _parts(draft) or [('', [])]
+    names = [t['sheet']] if len(parts) == 1 else _sheet_names([title for title, _ in parts], t['sheet'])
+    for idx, ((_title, rows), name) in enumerate(zip(parts, names, strict=True)):
+        ws = wb.active if idx == 0 else wb.create_sheet()
+        ws.title = name
+        _fill_sheet(ws, rows, t)
 
+    buf = io.BytesIO()
+    wb.save(buf)
+
+    return buf.getvalue()
+
+
+def _fill_sheet(ws: Any, rows: Sequence[ExportItem], t: dict[str, Any]) -> None:
+    """往一张工作表里写表头与条目"""
     head = (t['no'], t['domain'], t['req'], t['level'], t['state'], t['verdict'], t['body'])
     ws.append(list(head))
     fill = PatternFill('solid', fgColor='1D4239')
@@ -270,7 +385,7 @@ def build_xlsx(draft: ExportDraft, locale: str = ZH) -> bytes:
         c.fill = fill
         c.alignment = Alignment(vertical='center')
 
-    for it in draft.items:
+    for it in rows:
         ws.append(
             [
                 it.item_no or str(it.item_id),
@@ -291,11 +406,6 @@ def build_xlsx(draft: ExportDraft, locale: str = ZH) -> bytes:
             cell.alignment = Alignment(wrap_text=True, vertical='top')
     ws.freeze_panes = 'A2'
 
-    buf = io.BytesIO()
-    wb.save(buf)
-
-    return buf.getvalue()
-
 
 def build_json(draft: ExportDraft, locale: str = ZH) -> bytes:
     """
@@ -314,6 +424,8 @@ def build_json(draft: ExportDraft, locale: str = ZH) -> bytes:
         'items': [
             {
                 'itemId': it.item_id,
+                'partNo': it.part_no,
+                'partTitle': it.part_title,
                 'itemNo': it.item_no,
                 'domain': it.domain,
                 'requirement': it.requirement,

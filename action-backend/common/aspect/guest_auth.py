@@ -12,7 +12,7 @@ from config.get_db import get_db
 from exceptions.exception import AuthException
 from module_action.dao.action_dao import GUEST_USER_TYPE, GuestProfileDao
 from module_action.entity.vo.action_vo import GuestInfoModel
-from module_action.service.guest_auth_service import is_guest_account_disabled
+from module_action.service.guest_auth_service import is_guest_account_disabled, is_token_before_password_change
 from utils.log_util import logger
 
 # 与后台 get_current_user 保持一致的对外文案，避免通过报错差异区分两套账号体系
@@ -86,6 +86,9 @@ class GuestUser:
             # int() 必须留在 try 内：payload 被篡改成非数字 user_id 时，
             # 裸的 ValueError 会一路冒到兜底 handler 变成 500
             user_id = int(payload.get('user_id'))
+            # 令牌签发时的密码版本；这个字段上线前签发的令牌没有它，按 None 放行
+            raw_pwd_at = payload.get('pwd_at')
+            pwd_at = int(raw_pwd_at) if raw_pwd_at is not None else None
         except (InvalidTokenError, TypeError, ValueError) as e:
             logger.warning(TOKEN_EXPIRED_MESSAGE)
             raise AuthException(data='', message=TOKEN_EXPIRED_MESSAGE) from e
@@ -97,6 +100,11 @@ class GuestUser:
         if guest_row is None or is_guest_account_disabled(guest_row[0]):
             logger.warning(TOKEN_INVALID_MESSAGE)
             raise AuthException(data='', message=TOKEN_INVALID_MESSAGE)
+        # 改过密码（本人改、或找回密码重设）之后，此前签发的令牌一律作废 ——
+        # 会话没有按用户的索引，没法在改密码时逐个撤销，只能在这里按密码版本拦
+        if is_token_before_password_change(pwd_at, guest_row[0].pwd_update_date):
+            logger.warning(f'访客user_id={user_id}的令牌签发于最近一次改密码之前，已作废')
+            raise AuthException(data='', message=TOKEN_EXPIRED_MESSAGE)
 
         return GuestInfoModel(
             userId=guest_row[0].user_id,

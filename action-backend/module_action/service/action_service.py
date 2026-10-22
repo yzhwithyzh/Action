@@ -1,17 +1,20 @@
 import asyncio
 import contextlib
+import hashlib
 import json
 import re
 import shlex
 import shutil
 import uuid
 from collections import Counter, defaultdict
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
 
 from fastapi import UploadFile
+from sqlalchemy import text as sa_text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.vo import CrudResponseModel, PageModel
@@ -27,6 +30,7 @@ from module_action.dao.action_dao import (
     LiteratureDao,
     NewsDao,
     PublicationDao,
+    ReportAiDao,
     ReportDraftDao,
     ReportReviewDao,
     ReportTrailDao,
@@ -36,10 +40,13 @@ from module_action.dao.action_dao import (
     StudyTypeDao,
     StudyWizardDao,
     TeamMemberDao,
+    parse_id_list,
 )
 from module_action.entity.do.action_do import (
     ActionBackgroundRun,
+    ActionReportAiRun,
     ActionReportReview,
+    ActionReportSuggestion,
     ActionReportTrail,
     ActionSrdAssessment,
     ActionStudyType,
@@ -49,6 +56,8 @@ from module_action.entity.vo.action_vo import (
     MAX_ASSIST_INPUT_CHARS,
     MAX_TRAIL_ROWS,
     MIN_MANUSCRIPT_CHARS,
+    AiRunStateModel,
+    AiSubmitResultModel,
     AssistApplyModel,
     AssistRequestModel,
     AssistResultModel,
@@ -58,6 +67,8 @@ from module_action.entity.vo.action_vo import (
     BackgroundSubmitResultModel,
     CfirConstructModel,
     CfirDomainModel,
+    CfirElementModel,
+    CfirReferenceModel,
     CfirStrategyModel,
     ChecklistReviewStateModel,
     ChecklistReviewSubmitModel,
@@ -84,6 +95,11 @@ from module_action.entity.vo.action_vo import (
     PublicationPageQueryModel,
     PublicationYearModel,
     ReaimDimensionModel,
+    RefineBatchSubmitModel,
+    RenderModel,
+    RenderSectionModel,
+    RenderSubmitModel,
+    ReportAiStateModel,
     ReportDraftComposeModel,
     ReportDraftCreateModel,
     ReportDraftItemModel,
@@ -107,8 +123,13 @@ from module_action.entity.vo.action_vo import (
     SrdItemModel,
     SrdRunStateModel,
     StudyTypeModel,
+    ChecklistOptionModel,
     StudyTypeSaveModel,
     StudyTypeStatModel,
+    SuggestionApplyModel,
+    SuggestionApplyResultModel,
+    SuggestionDiscardModel,
+    SuggestionModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
     TrailAddModel,
@@ -118,9 +139,23 @@ from module_action.entity.vo.action_vo import (
 )
 from module_action.service.ai_assist_service import AiAssistService
 from module_action.service.publication_parse import build_citation_text
+from module_action.service.refine_context import issues_by_item, manuscript_reference, squash
 from module_action.service.report_assist_prompt import AssistContext, needs_current_text
 from module_action.service.report_compose_service import ComposeItem, compose_draft_text
-from module_action.service.report_export_service import BUILDERS, ExportDraft, ExportItem, build_docx_on
+from module_action.service.report_export_service import (
+    BUILDERS,
+    ExportDraft,
+    ExportItem,
+    build_docx_on,
+    build_docx_render,
+)
+from module_action.service.report_render_prompt import (
+    build_materials,
+    detect_lang,
+    placeholder_of,
+    reference_text,
+    section_hash,
+)
 from module_action.service.srd_export_service import build_assessment_xlsx
 from module_action.service.study_wizard_tree import check_wizard_tree, result_type_refs
 from utils.common_util import CamelCaseUtil
@@ -1107,7 +1142,7 @@ class GuidelineService:
         if in_use:
             # 删了的话这几类研究在报告助手第二步一条 checklist 都展不开，且要走到那一步才发现
             raise ServiceException(
-                message=f'研究类型 {"、".join(in_use)} 把它挂作重点推荐规范（决定第二步展开哪份 checklist），'
+                message=f'研究类型 {"、".join(in_use)} 把它挂作重点推荐规范或第二步可切换的规范，'
                 '请先在「研究类型管理」里改掉'
             )
         try:
@@ -1584,11 +1619,22 @@ class ChecklistReviewService:
         # draft_id 由前端传，但**归属必须在这里验**：不验的话随手改一个 id
         # 就能把自己的判定挂到别人的草稿上，第四步的工作清单会跟着串台
         draft_id = None
+        #: 只校验这几张清单表（草稿在第二步取消纳入了某几张时，sql/051）。None = 全部
+        part_nos: list[int] | None = None
         if submit.draft_id:
             draft = await ReportDraftDao.get_draft_by_id(query_db, submit.draft_id, user_id)
             if not draft:
                 raise ServiceException(message='草稿不存在')
-            draft_id = submit.draft_id
+            # 草稿依据的不是这份规范：不挂到它上面 —— 挂上的话打开这份草稿时会把另一份规范的判定
+            # 当成它的检查结果显示出来；范围也不按它圈（拿 A 规范的表号去圈 B 规范的条目会圈错）
+            draft_id = submit.draft_id if int(draft.guideline_id) == int(guideline_id) else None
+            # 导入那次映射**不圈范围**：它要把原稿分派到所有条目上，用户之后重新勾上某张表时
+            # 那几条也该已经回填好了
+            if purpose != 'import' and int(draft.guideline_id) == int(guideline_id):
+                scoped = ReportDraftService.scoped_items(draft, items)
+                if len(scoped) < len(items):
+                    items = scoped
+                    part_nos = sorted({int(it.get('partNo') or 1) for it in scoped})
 
         # session_id 自己先生成：台账要先落库，而落库时就得带上它
         session_id = uuid.uuid4().hex
@@ -1619,13 +1665,15 @@ class ChecklistReviewService:
             await query_db.rollback()
             raise
 
-        payload = {
+        payload: dict[str, Any] = {
             'guideline_code': guideline_code,
             'guideline_id': guideline_id,
             'manuscript': manuscript,
             'locale': submit.locale,
             'user_id': user_id,
         }
+        if part_nos is not None:
+            payload['part_nos'] = part_nos
         try:
             async with cls._client() as client:
                 await client.submit(payload, session_id=session_id)
@@ -2136,7 +2184,30 @@ class StudyTypeService:
         # 按 id 现取规范当前的代号：代号在后台可改，库里的 hot_guideline 只是快照（sql/048）。
         # 规范已删或没挂的给空串 —— 前台第二步据此判「没有 checklist」，不会拿一个查不到的代号去查
         hot_ids = sorted({t.hot_guideline_id for t in types if t.hot_guideline_id})
-        hot_code = {g.guideline_id: g.code for g in await StudyTypeDao.get_hot_guidelines_by_ids(query_db, hot_ids)}
+        alt_of = {t.type_id: parse_id_list(t.alt_guideline_ids) for t in types}
+        all_ids = sorted(set(hot_ids) | {i for ids in alt_of.values() for i in ids})
+        gl_rows = {g.guideline_id: g for g in await StudyTypeDao.get_hot_guidelines_by_ids(query_db, all_ids)}
+        hot_code = {gid: gl_rows[gid].code for gid in hot_ids if gid in gl_rows}
+        item_count = await StudyTypeDao.count_items_by_guideline_ids(query_db, all_ids)
+
+        def options(t: Any) -> list[ChecklistOptionModel]:
+            """第二步可选的规范：重点推荐那份在前，其后是 alt（sql/056）；已删的规范跳过"""
+            ids = ([t.hot_guideline_id] if t.hot_guideline_id else []) + alt_of[t.type_id]
+            seen: list[int] = []
+            for gid in ids:
+                if gid in gl_rows and gid not in seen:
+                    seen.append(gid)
+
+            return [
+                ChecklistOptionModel(
+                    guidelineId=gid,
+                    code=gl_rows[gid].code,
+                    nameZh=gl_rows[gid].name_zh,
+                    nameEn=gl_rows[gid].name_en,
+                    itemCount=item_count.get(gid, 0),
+                )
+                for gid in seen
+            ]
 
         stat_map: dict[int, list[StudyTypeStatModel]] = defaultdict(list)
         for s in stats:
@@ -2154,6 +2225,8 @@ class StudyTypeService:
                 tipZh=t.tip_zh or '',
                 tipEn=t.tip_en or '',
                 status=t.status,
+                altGuidelineIds=[i for i in alt_of[t.type_id] if i in gl_rows],
+                checklistOptions=options(t),
                 guidelines=gl_map.get(t.type_id, []),
                 stats=stat_map.get(t.type_id, []),
             )
@@ -2191,6 +2264,29 @@ class StudyTypeService:
                 '请先在「规范目录管理」中建好这份规范'
             )
         return guideline.code
+
+    @classmethod
+    async def _resolve_alt_guidelines(
+        cls, query_db: AsyncSession, guideline_ids: list[int], hot_id: int | None
+    ) -> str:
+        """
+        校验第二步可切换的其他规范都存在，返回要落库的逗号串（去重、剔掉与重点推荐重复的）
+
+        与 `_resolve_hot_guideline` 同一口径：不存在的拦，0 条目的放行（TIDieR-A 眼下就是先挂上、素材后补）
+
+        :param query_db: orm对象
+        :param guideline_ids: 入参里的规范id列表
+        :param hot_id: 重点推荐规范id
+        :return: 逗号分隔的规范id
+        :raises ServiceException: 有规范不存在或已删除
+        """
+        ids = [i for i in parse_id_list(','.join(str(i) for i in guideline_ids)) if i != (hot_id or 0)]
+        found = {g.guideline_id for g in await StudyTypeDao.get_hot_guidelines_by_ids(query_db, ids)}
+        missing = [i for i in ids if i not in found]
+        if missing:
+            raise ServiceException(message='所选的可切换规范中有已删除或不存在的，请刷新页面后重新选择')
+
+        return ','.join(str(i) for i in ids)
 
     @classmethod
     async def get_study_type_page_services(
@@ -2231,6 +2327,7 @@ class StudyTypeService:
         if await StudyTypeDao.get_study_type_by_key(query_db, save.type_key):
             raise ServiceException(message=f'新增失败，类型标识 {save.type_key} 已存在')
         hot_code = await cls._resolve_hot_guideline(query_db, save.hot_guideline_id)
+        alt_ids = await cls._resolve_alt_guidelines(query_db, save.alt_guideline_ids, save.hot_guideline_id)
 
         sort_num = save.sort_num
         if sort_num is None:
@@ -2242,6 +2339,7 @@ class StudyTypeService:
                 name_en=save.name_en,
                 hot_guideline=hot_code,
                 hot_guideline_id=save.hot_guideline_id or None,
+                alt_guideline_ids=alt_ids,
                 sort_num=sort_num,
                 status=save.status,
                 tip_zh=save.tip_zh,
@@ -2285,6 +2383,12 @@ class StudyTypeService:
             raise ServiceException(message='研究类型不存在')
         old_key = current.type_key
         hot_code = await cls._resolve_hot_guideline(query_db, save.hot_guideline_id)
+        # 没带这个字段（还没刷新的老后台页面）= 不改，别把已挂的可切换规范清空
+        alt_ids = (
+            await cls._resolve_alt_guidelines(query_db, save.alt_guideline_ids, save.hot_guideline_id)
+            if 'alt_guideline_ids' in save.model_fields_set
+            else ','.join(str(i) for i in parse_id_list(current.alt_guideline_ids) if i != (save.hot_guideline_id or 0))
+        )
 
         if save.type_key != old_key:
             exist = await StudyTypeDao.get_study_type_by_key(query_db, save.type_key)
@@ -2308,6 +2412,7 @@ class StudyTypeService:
                     'name_en': save.name_en,
                     'hot_guideline': hot_code,
                     'hot_guideline_id': save.hot_guideline_id or None,
+                    'alt_guideline_ids': alt_ids,
                     'sort_num': save.sort_num if save.sort_num is not None else current.sort_num,
                     'status': save.status,
                     'tip_zh': save.tip_zh,
@@ -2537,7 +2642,7 @@ class ImplementationService:
     @classmethod
     async def get_cfir_tree_services(cls, query_db: AsyncSession) -> list[CfirDomainModel]:
         """
-        获取 CFIR 领域 -> 构念 -> 策略 三级结构
+        获取 CFIR 领域 -> 构念 -> 子条目 / 策略 结构
 
         :param query_db: orm对象
         :return: CFIR 领域列表
@@ -2547,6 +2652,31 @@ class ImplementationService:
         constructs = await ImplementationDao.get_cfir_constructs(query_db, domain_ids)
         construct_ids = [c.construct_id for c in constructs]
         strategies = await ImplementationDao.get_cfir_strategies(query_db, construct_ids)
+        elements = await ImplementationDao.get_cfir_elements(query_db, construct_ids)
+
+        # 子条目按 parent_id 组树：先建好全部节点，再把有上级的挂进上级的 children（查询已按 sort_num 排好）
+        nodes = {
+            e.element_id: CfirElementModel(
+                elementId=e.element_id,
+                label=e.label,
+                nameZh=e.name_zh,
+                nameEn=e.name_en,
+                conceptZh=e.concept_zh,
+                conceptEn=e.concept_en,
+                exampleZh=e.example_zh,
+                exampleEn=e.example_en,
+                originZh=e.origin_zh,
+                originEn=e.origin_en,
+                source=e.source,
+            )
+            for e in elements
+        }
+        elem_map: dict[int, list[CfirElementModel]] = defaultdict(list)
+        for e in elements:
+            if e.parent_id is None:
+                elem_map[e.construct_id].append(nodes[e.element_id])
+            elif e.parent_id in nodes:
+                nodes[e.parent_id].children.append(nodes[e.element_id])
 
         strat_map: dict[int, list[CfirStrategyModel]] = defaultdict(list)
         for s in strategies:
@@ -2572,7 +2702,15 @@ class ImplementationService:
                     nameEn=c.name_en,
                     hintZh=c.hint_zh,
                     hintEn=c.hint_en,
+                    conceptZh=c.concept_zh,
+                    conceptEn=c.concept_en,
+                    exampleZh=c.example_zh,
+                    exampleEn=c.example_en,
+                    originZh=c.origin_zh,
+                    originEn=c.origin_en,
+                    source=c.source,
                     severity=c.severity,
+                    elements=elem_map.get(c.construct_id, []),
                     strategies=strat_map.get(c.construct_id, []),
                 )
             )
@@ -2583,10 +2721,24 @@ class ImplementationService:
                 seq=d.seq,
                 nameZh=d.name_zh,
                 nameEn=d.name_en,
+                introZh=d.intro_zh,
+                introEn=d.intro_en,
                 constructs=con_map.get(d.domain_id, []),
             )
             for d in domains
         ]
+
+    @classmethod
+    async def get_cfir_references_services(cls, query_db: AsyncSession) -> list[CfirReferenceModel]:
+        """
+        获取 CFIR 针刺版框架参考文献（构念 / 子条目 source 里的 [n] 指向这里）
+
+        :param query_db: orm对象
+        :return: 参考文献列表
+        """
+        refs = await ImplementationDao.get_cfir_references(query_db)
+
+        return [CfirReferenceModel(refNo=r.ref_no, citation=r.citation) for r in refs]
 
     @classmethod
     async def get_eric_services(
@@ -3578,6 +3730,81 @@ class ReportDraftService:
     #: 列表一次最多回多少条
     LIST_LIMIT = 50
 
+    # ------------------------------------------------------------------ 纳入的清单表（sql/051）
+    #
+    # 一份规范可能含多张清单表（RCT = CONSORT 主表 + 摘要表 + STRICTA 表），第二步按表切换，
+    # 用户可以取消纳入某张。取消纳入的表不计完成度、不进检查、不进合成与导出，
+    # **但条目正文照存**：详情照回、保存照收，重新勾上时都还在。
+
+    @staticmethod
+    def parse_parts(raw: str | None) -> list[int]:
+        """
+        库里的逗号串 → 升序去重的 part_no 列表
+
+        :param raw: `action_report_draft.parts`
+        :return: part_no 列表；空 = 全部纳入
+        """
+        return sorted({int(s) for s in (raw or '').split(',') if s.strip().isdigit()})
+
+    @staticmethod
+    def scope_ids(part_of: dict[int, int], parts: Sequence[int]) -> set[int]:
+        """
+        纳入范围内的条目id
+
+        选中的表在规范里一张都找不到了（后台删了表、或把条目挪到了别的表）时**按全部纳入算**：
+        否则这份草稿会整份变空 —— 完成度 0/0、检查无条目可判，而用户什么都没做过。
+
+        :param part_of: 条目id -> part_no（该规范当前启用的全部条目）
+        :param parts: 纳入的 part_no；空 = 全部
+        :return: 纳入范围内的条目id集合
+        """
+        if parts:
+            wanted = set(parts)
+            chosen = {item_id for item_id, part in part_of.items() if part in wanted}
+            if chosen:
+                return chosen
+
+        return set(part_of)
+
+    @staticmethod
+    def part_map(items: Sequence[dict[str, Any]]) -> dict[int, int]:
+        """条目字典列表 → 条目id -> part_no（为空按 1，与列默认值一致）"""
+        return {int(it['itemId']): int(it.get('partNo') or 1) for it in items}
+
+    @classmethod
+    def _normalize_parts(cls, parts: Sequence[int], part_of: dict[int, int]) -> str:
+        """
+        校验并规范化要保存的纳入范围
+
+        **选中全部时存空串**：空串的含义是「全部纳入」，后台日后给这份规范加一张表时，
+        没动过选择的草稿也自动纳入它；存成 '1,2,3' 的话新表就被悄悄排除在外了。
+
+        :param parts: 前端传来的 part_no 列表
+        :param part_of: 条目id -> part_no（该规范当前启用的全部条目）
+        :return: 要写进 `parts` 列的值
+        :raises ServiceException: 选了规范里不存在的表
+        """
+        wanted = set(parts)
+        # 空列表 = 全部纳入：前端在清单正按新规范重取时（换研究类型前那次保存）手里没有可信的表号，
+        # 「改回全部」只能这样表达
+        if not wanted:
+            return ''
+        available = set(part_of.values())
+        stray = sorted(wanted - available)
+        if stray:
+            raise ServiceException(message=f'清单表 {stray} 不属于当前报告规范')
+        if wanted >= available:
+            return ''
+
+        return ','.join(str(p) for p in sorted(wanted))
+
+    @classmethod
+    def scoped_items(cls, draft: Any, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """按草稿的 `parts` 过滤条目字典列表，保持原顺序"""
+        scope = cls.scope_ids(cls.part_map(items), cls.parse_parts(getattr(draft, 'parts', '')))
+
+        return [it for it in items if int(it['itemId']) in scope]
+
     # ------------------------------------------------------------------ 取数
 
     @classmethod
@@ -3603,9 +3830,13 @@ class ReportDraftService:
         require_map: dict[int, str],
         filled_ids: set[int],
         contents: dict[int, str] | None = None,
+        part_of: dict[int, int] | None = None,
     ) -> ReportDraftModel:
         """
         把一份草稿装成出参模型，顺带算完成度
+
+        完成度只算**纳入的清单表**（`part_of` + 草稿的 `parts`）；逐条正文则照回全部启用条目 ——
+        没纳入的表也得把正文带回去，否则前端整体覆盖式的保存会把它们清空。
 
         完成度**现算不落库**：存冗余计数就要在每次保存、每次后台改条目填写要求时同步维护，
         算一遍的成本远低于维护一致性的成本。
@@ -3618,8 +3849,13 @@ class ReportDraftService:
         :param require_map: 条目id -> require_level（该规范当前启用的全部条目）
         :param filled_ids: 已填写的条目id集合（可能含已下线条目）
         :param contents: 条目id -> 正文；给 None 表示这次不带逐条正文（列表页）
+        :param part_of: 条目id -> part_no；给 None 表示不按清单表圈范围
         :return: 草稿模型
         """
+        parts = cls.parse_parts(getattr(draft, 'parts', ''))
+        if part_of is not None:
+            scope = cls.scope_ids(part_of, parts)
+            require_map = {item_id: level for item_id, level in require_map.items() if item_id in scope}
         filled = filled_ids & set(require_map)
         required_ids = {item_id for item_id, level in require_map.items() if level == '0'}
 
@@ -3629,6 +3865,8 @@ class ReportDraftService:
             guidelineCode=code,
             studyTypeKey=draft.study_type_key or '',
             title=draft.title or '',
+            hasSource=bool((getattr(draft, 'source_text', '') or '').strip()),
+            parts=parts,
             items=(
                 [ReportDraftItemModel(itemId=item_id, content=text) for item_id, text in sorted(contents.items())]
                 if contents is not None
@@ -3679,10 +3917,12 @@ class ReportDraftService:
         # 逐份草稿各查一遍等于把同一条查询跑 N 遍
         codes: dict[int, str] = {}
         require_cache: dict[int, dict[int, str]] = {}
+        part_cache: dict[int, dict[int, int]] = {}
         for gid in {d.guideline_id for d in drafts}:
             guideline = await GuidelineDao.get_guideline_detail_by_id(query_db, gid)
             codes[gid] = guideline.code if guideline else ''
             require_cache[gid] = await ReportDraftDao.get_item_require_map(query_db, gid)
+            part_cache[gid] = await ReportDraftDao.get_item_part_map(query_db, gid)
 
         # 一条查询取回全部草稿的「哪些条目已填」，**不读正文**：列表只需要计数，
         # 而正文是这张表里唯一的大字段（单条上限两万字符 × 几十条 × 最多 30 份草稿）
@@ -3694,6 +3934,7 @@ class ReportDraftService:
                 codes[draft.guideline_id],
                 require_cache[draft.guideline_id],
                 filled_map.get(draft.draft_id, set()),
+                part_of=part_cache[draft.guideline_id],
             )
             for draft in drafts
         ]
@@ -3753,7 +3994,7 @@ class ReportDraftService:
         fresh = await ReportDraftDao.get_draft_by_id(query_db, new_draft_id, user_id)
         require_map = {int(it['itemId']): (it.get('requireLevel') or '0') for it in items}
 
-        return cls._to_model(fresh, code, require_map, set(), {})
+        return cls._to_model(fresh, code, require_map, set(), {}, part_of=cls.part_map(items))
 
     #: 导入稿件的大小上限。一篇论文正文常规在几十 KB；10MB 足够带图表，
     #: 再大多半是插了大量图片的 docx —— 图片对条目映射毫无用处，只会拖慢解析
@@ -3911,7 +4152,7 @@ class ReportDraftService:
         contents = {item_id: text for item_id, text in all_contents.items() if item_id in require_map}
         filled_ids = {item_id for item_id, text in all_contents.items() if text.strip()}
 
-        return cls._to_model(draft, code, require_map, filled_ids, contents)
+        return cls._to_model(draft, code, require_map, filled_ids, contents, part_of=cls.part_map(items))
 
     @classmethod
     async def save_draft_services(
@@ -3936,17 +4177,16 @@ class ReportDraftService:
         if stray:
             raise ServiceException(message=f'条目 {stray[:5]} 不属于当前报告规范')
 
+        values: dict[str, Any] = {
+            'title': save.title.strip() or draft.title,
+            'update_by': str(user_id),
+            'update_time': datetime.now(),
+        }
+        if save.parts is not None:
+            values['parts'] = cls._normalize_parts(save.parts, cls.part_map(items))
+
         try:
-            await ReportDraftDao.edit_draft_dao(
-                query_db,
-                draft_id,
-                user_id,
-                {
-                    'title': save.title.strip() or draft.title,
-                    'update_by': str(user_id),
-                    'update_time': datetime.now(),
-                },
-            )
+            await ReportDraftDao.edit_draft_dao(query_db, draft_id, user_id, values)
             # 只覆盖当前规范仍启用的那些条目，草稿里已下线条目的正文原样留着
             await ReportDraftDao.replace_draft_items(query_db, draft_id, user_id, contents, valid_ids)
             await query_db.commit()
@@ -3959,7 +4199,7 @@ class ReportDraftService:
         require_map = {int(it['itemId']): (it.get('requireLevel') or '0') for it in items}
         filled_ids = {row.item_id for row in rows if (row.content or '').strip()}
 
-        return cls._to_model(fresh, code, require_map, filled_ids, contents)
+        return cls._to_model(fresh, code, require_map, filled_ids, contents, part_of=cls.part_map(items))
 
     @classmethod
     async def delete_draft_services(cls, query_db: AsyncSession, draft_id: int, user_id: int) -> CrudResponseModel:
@@ -3974,11 +4214,23 @@ class ReportDraftService:
         draft = await ReportDraftDao.get_draft_by_id(query_db, draft_id, user_id)
         if not draft:
             raise ServiceException(message='草稿不存在')
+        # 这份草稿还有在跑的一键优化 / 整篇成文：先叫停。台账马上要被物理删掉，
+        # 不叫停的话 worker 会把剩下的模型调用全部跑完，结果没人认领
+        live_sessions = [str(r.session_id) for r in await ReportAiDao.list_active_dao(query_db, user_id, draft_id)]
+        if live_sessions:
+            with contextlib.suppress(Exception):
+                async with ReportAiService._client() as client:
+                    for sid in live_sessions:
+                        # 逐个吞异常：一个叫停失败不能让其余几个接着跑、接着计费
+                        with contextlib.suppress(Exception):
+                            await client.stop(sid)
         try:
             await ReportDraftDao.delete_draft_dao(query_db, draft_id, user_id)
             # 校验记录不跟着删，只摘掉 draft_id：014 起每条记录自带稿件快照，
             # 它是一条能独立回看的历史，跟着草稿删等于用户没要求过的数据丢失
             await ReportReviewDao.detach_reviews_of_draft_dao(query_db, draft_id)
+            # 第四步的建议与整篇成文里都是稿件正文与模型改写：随草稿物理删除（sql/053）
+            await ReportAiDao.delete_by_draft_dao(query_db, draft_id, user_id)
             await query_db.commit()
 
             return CrudResponseModel(is_success=True, message='删除成功')
@@ -4010,11 +4262,13 @@ class ReportDraftService:
         # 导入的草稿：初稿 = 原稿 + 改过的条目写回原处（图片、表格、没对应条目的章节原样保留）。
         # 不能按条目重拼 —— 那会丢掉讨论、致谢、参考文献，也带不过去任何图表
         built = await cls._rebuild(query_db, draft, items, contents, user_id, lang)
+        # 没纳入的清单表（sql/051）不进初稿：不出占位、不计「仍未填写」
+        scoped = cls.scoped_items(draft, items)
         if built is not None:
             result, keeps_layout = built
             missing = sum(
                 1
-                for it in items
+                for it in scoped
                 if (it.get('requireLevel') or '0') == '0' and not contents.get(int(it['itemId']), '').strip()
             )
             st = result.stats
@@ -4042,8 +4296,9 @@ class ReportDraftService:
 
         # 一条正文都没有 —— 合出来只会是一串「待补充」，
         # 送去第三步等于让模型对着一份空稿判几十条「未报告」，白烧一次调用
-        if not any((text or '').strip() for text in contents.values()):
-            raise ServiceException(message='草稿还没有任何内容，请先填写至少一条')
+        scoped_ids = {int(it['itemId']) for it in scoped}
+        if not any((text or '').strip() for item_id, text in contents.items() if item_id in scoped_ids):
+            raise ServiceException(message='纳入的清单表里还没有任何内容，请先填写至少一条')
 
         # 条目要求原文（contentZh/En）**不往下传**：合成层拿不到它，就不可能把它写进稿件，
         # 见 `report_compose_service` 的模块 docstring
@@ -4054,7 +4309,7 @@ class ReportDraftService:
                 item_no=(it.get('itemNoEn') if lang == 'en' else it.get('itemNoZh')) or '',
                 require_level=(it.get('requireLevel') or '0'),
             )
-            for it in items
+            for it in scoped
         ]
         result = compose_draft_text(draft.title or '', compose_items, contents, lang, orphan_texts)
 
@@ -4121,16 +4376,20 @@ class ReportDraftService:
         source = await ReportDraftDao.get_source_dao(query_db, draft_id)
         line_texts = _manuscript_line_map(source_text)
         anchors = await cls._anchors_of(query_db, draft, source, user_id, line_texts)
+        # 没纳入的清单表按「没改过」处理：原稿里对应的段落原样留着，条目框里的改动不写回。
+        # 取消纳入是「这张表不用了」，不是「把原稿里这几段删掉」
+        scope = {int(it['itemId']) for it in cls.scoped_items(draft, items)}
         edits = []
         for it in items:
             item_id = int(it['itemId'])
             a = anchors.get(item_id) or {}
+            baseline = str(a.get('text') or '')
             edits.append(
                 ItemEdit(
                     item_id=item_id,
                     lines=tuple(int(n) for n in a.get('lines') or ()),
-                    baseline=str(a.get('text') or ''),
-                    current=contents.get(item_id, ''),
+                    baseline=baseline,
+                    current=contents.get(item_id, '') if item_id in scope else baseline,
                 )
             )
         data = source.file_data if source is not None else None
@@ -4164,7 +4423,13 @@ class ReportDraftService:
 
     @classmethod
     async def export_draft_services(
-        cls, query_db: AsyncSession, draft_id: int, user_id: int, fmt: str = 'docx', locale: str = 'zh'
+        cls,
+        query_db: AsyncSession,
+        draft_id: int,
+        user_id: int,
+        fmt: str = 'docx',
+        locale: str = 'zh',
+        body: str = 'auto',
     ) -> tuple[bytes, str, str, str]:
         """
         导出一份草稿（第五步）
@@ -4180,8 +4445,9 @@ class ReportDraftService:
         :param user_id: 访客用户id
         :param fmt: docx / xlsx / json
         :param locale: 语言（zh / en）
+        :param body: docx 正文用哪一份：`render` = 第四步的整篇成文；其余 = 原稿写回 / 条目合成（原有行为）
         :return: (文件字节, 文件名, media type, 扩展名)
-        :raises ServiceException: 草稿不存在，或格式不认识
+        :raises ServiceException: 草稿不存在，或格式不认识，或要整篇成文却还没生成过
         """
         builder = BUILDERS.get(fmt)
         if not builder:
@@ -4220,12 +4486,21 @@ class ReportDraftService:
                 require_level=(it.get('requireLevel') or '0'),
                 content=contents.get(int(it['itemId']), ''),
                 verdict=verdicts.get(int(it['itemId']), ''),
+                part_no=int(it.get('partNo') or 1),
+                part_title=pick(it, 'partZh', 'partEn'),
             )
-            for it in items
+            # 没纳入的清单表（sql/051）不进对照表；docx 正文的重建另在 _rebuild 里按同一口径处理
+            for it in cls.scoped_items(draft, items)
         ]
         export = ExportDraft(title=title, guideline_code=code, items=tuple(export_items), source_text=source_text)
         payload = None
-        if ext == 'docx' and source_text.strip():
+        if ext == 'docx' and body == 'render':
+            # 正文 = 第四步的整篇成文（按章节），附录对照表照旧接在后面
+            rendered = await ReportAiService.render_sections_of(query_db, draft_id, user_id)
+            if rendered is None:
+                raise ServiceException(message='这份草稿还没有整篇成文，请先在第四步生成')
+            payload = build_docx_render(rendered[1], export, lang, paper_title=rendered[2])
+        elif ext == 'docx' and source_text.strip():
             # 导入的草稿：正文 = 原稿 + 改过的条目写回原处，图片、表格、样式都在（与「生成初稿」同一份）
             built = await cls._rebuild_docx(query_db, draft, items, contents, user_id, lang)
             if built is not None:
@@ -4382,21 +4657,28 @@ class ReportReviewService:
             raise ServiceException(message='该条目不属于当前报告规范')
 
         rows = await ReportDraftDao.get_draft_items(query_db, draft_id, user_id)
-        current = next((r.content or '' for r in rows if r.item_id == item_id), '')
+        contents = {r.item_id: (r.content or '') for r in rows}
+        current = contents.get(item_id, '')
+        # 与一键优化同一份全稿参考与检查问题（refine_context），两条路给模型的东西不能不一样
+        scoped_items = ReportDraftService.scoped_items(_draft, items)
+        scoped = {int(it['itemId']): contents.get(int(it['itemId']), '') for it in scoped_items}
 
-        verdict, reason = '', ''
+        verdict, reason, issues = '', '', []
         review = await ReportReviewDao.get_latest_review_dao(query_db, draft_id, user_id)
         if review:
             judged = await ReportReviewDao.get_review_items_dao(query_db, review.review_id)
             hit = next((r for r in judged if r.item_id == item_id), None)
             if hit:
                 verdict, reason = hit.status, (hit.reason or '')
+            issues = issues_by_item(review.consistency, scoped, lang).get(item_id, [])
 
         return AssistContext(
             guideline_code=code,
             current_text=current,
             verdict=verdict,
             verdict_reason=reason,
+            issues=tuple(issues),
+            manuscript=manuscript_reference(scoped_items, contents, lang),
             **cls._pick_item(item, lang),
         )
 
@@ -4482,7 +4764,24 @@ class ReportReviewService:
             instruction=req.instruction,
         )
 
-        return AssistResultModel(itemId=req.item_id or 0, action=req.action, text=text, modelLabel=label)
+        # 草稿模式的「AI 优化」结果作为一条建议入库（sql/053）：与一键优化的建议进同一张表，
+        # 刷新不丢、历次可回看，采用时同样过「已过时」那道闸。base_text 记的是模型看到的那一版正文
+        suggestion_id = None
+        if from_draft and req.action == 'refine' and req.item_id is not None:
+            suggestion_id = await ReportAiService.add_single_suggestion(
+                query_db,
+                draft_id=int(req.draft_id or 0),
+                user_id=user_id,
+                item_id=req.item_id,
+                base_text=ctx.current_text,
+                content=text,
+                instruction=req.instruction,
+                model_label=label,
+            )
+
+        return AssistResultModel(
+            itemId=req.item_id or 0, action=req.action, text=text, modelLabel=label, suggestionId=suggestion_id
+        )
 
     @classmethod
     async def apply_services(cls, query_db: AsyncSession, apply: AssistApplyModel, user_id: int) -> ReportDraftModel:
@@ -4532,7 +4831,12 @@ class ReportReviewService:
         filled_ids = {r.item_id for r in after if (r.content or '').strip()}
 
         return ReportDraftService._to_model(
-            fresh, code, require_map, filled_ids, {r.item_id: (r.content or '') for r in after}
+            fresh,
+            code,
+            require_map,
+            filled_ids,
+            {r.item_id: (r.content or '') for r in after},
+            part_of=ReportDraftService.part_map(items),
         )
 
 
@@ -5349,3 +5653,978 @@ class BackgroundGenService:
         )
 
         return CrudResponseModel(is_success=True, message='已请求停止')
+
+
+@dataclass(frozen=True)
+class _AiRun:
+    """
+    一次第四步 AI 任务的运行态快照（普通值，不是 ORM 对象）—— 同 `_ReviewRun` / `_BgRun`：
+    提交 → 轮询 → 落库要连着 commit 好几次，跨 commit 读 ORM 属性在 async 会话里抛 `MissingGreenlet`
+    """
+
+    run_id: int
+    session_id: str
+    draft_id: int
+    user_id: int
+    kind: str
+    run_status: str
+    progress: int
+    phase: str
+    error_msg: str
+    item_total: int
+    done_count: int
+    #: 提交时塞进去的上下文（render：各章的素材指纹 + 只重写哪一章；refine：跳过的条目）
+    seed: str
+
+
+class ReportAiService:
+    """
+    报告助手第四步：逐条建议 · 一键优化 · 整篇成文（sql/053）
+
+    算力在 `tools/report_ai_worker_tool`（队列 `report_ai`），**落库在轮询里做**，worker 只认 Redis。
+    同 `BackgroundGenService` 的几条纪律：撞并发上限先对账再判 · 对账里「查不动」不等于「查到没有」·
+    别把 ORM 对象跨 commit 传下去（`_AiRun`）。
+
+    ## 建议都入库，采用都过一道「已过时」闸
+
+    单条「AI 优化」（`/report-assist`，同步）与一键优化（worker）产出的建议进同一张表。
+    每条带 `base_text` = 生成时这一条的正文；采用时与当前正文不一致就**跳过并如实返回** ——
+    用户在建议生成之后又手改过它，整条覆盖会冲掉手改的字。「全部采用」逐条过同一道闸。
+
+    ## 整篇成文按章节、按章判过时
+
+    每一章记下素材指纹（这一章各条目正文的哈希）；读的时候与当前正文重算一遍，对不上的那一章
+    标「已过时」。不按整份草稿的更新时间判：改了第 3 章不该让第 1 章也显示过时。
+    """
+
+    #: 同时在跑的上限：一键优化几十次调用、整篇成文逐章调用，都是分钟级
+    MAX_RUNNING_PER_USER = 1
+    #: 每份草稿留几次已结束的任务（成文那行挂着整篇正文）
+    KEEP_RUNS = 5
+    #: 每条留几条建议（「重新优化」点多了不该把库撑大）
+    KEEP_SUGGESTIONS = 5
+    #: 补充事实的上限，与 `report_assist_prompt.MAX_INSTRUCTION_CHARS` 对齐
+    MAX_NOTE = 1000
+
+    @classmethod
+    def _client(cls) -> Any:
+        """延迟导入 worker 配置：tools 包依赖 redis 等库，不该拖累未用到该功能的进程启动"""
+        from tools.common.task_client import TaskClient  # noqa: PLC0415
+        from tools.report_ai_worker_tool.config.worker_config import CONFIG  # noqa: PLC0415
+
+        return TaskClient(CONFIG)
+
+    @classmethod
+    def _snapshot(cls, r: ActionReportAiRun) -> _AiRun:
+        status = str(r.run_status or 'pending')
+
+        return _AiRun(
+            run_id=int(r.run_id),
+            session_id=str(r.session_id),
+            draft_id=int(r.draft_id),
+            user_id=int(r.user_id),
+            kind=str(r.kind),
+            run_status=status,
+            progress=int(r.progress or 0),
+            phase=str(r.phase or ''),
+            error_msg=str(r.error_msg or ''),
+            item_total=int(r.item_total or 0),
+            done_count=int(r.done_count or 0),
+            seed=str(r.result_json or '') if status in ('pending', 'running') else '',
+        )
+
+    @staticmethod
+    def _hash(pairs: Sequence[tuple[int, str]]) -> str:
+        """一章素材的指纹：条目id + 正文。判「这一章成文之后又改过没有」"""
+        raw = json.dumps([[i, (t or '').strip()] for i, t in pairs], ensure_ascii=False)
+
+        return hashlib.sha1(raw.encode('utf-8')).hexdigest()[:16]
+
+    # ------------------------------------------------------------------ 取素材
+
+    @classmethod
+    async def _draft_material(
+        cls, query_db: AsyncSession, draft_id: int, user_id: int
+    ) -> tuple[Any, str, list[dict[str, Any]], list[dict[str, Any]], dict[int, str]]:
+        """草稿 + 规范代号 + 全部条目 + **纳入范围内**的条目（清单顺序）+ 全部正文"""
+        draft, code, items = await ReportDraftService._load(query_db, draft_id, user_id)
+        rows = await ReportDraftDao.get_draft_items(query_db, draft_id, user_id)
+        contents = {r.item_id: (r.content or '') for r in rows}
+
+        return draft, code, items, ReportDraftService.scoped_items(draft, items), contents
+
+    #: 清单表标题里出现这些字样的，按摘要清单表处理（RCT 的「非药物疗法摘要中报告……的必备条目」表）
+    _ABSTRACT_MARKS = ('摘要', 'abstract')
+
+    @classmethod
+    def _is_abstract_part(cls, item: dict[str, Any]) -> bool:
+        title = ' '.join(str(item.get(k) or '') for k in ('partZh', 'partEn')).lower()
+
+        return any(m in title for m in cls._ABSTRACT_MARKS)
+
+    @classmethod
+    def _sections(cls, items: list[dict[str, Any]], contents: dict[int, str], lang: str) -> list[dict[str, Any]]:
+        """
+        按章节（条目的 domain）把素材分组，章节顺序取清单里首次出现的顺序。
+
+        已填的条目给正文；空着的**必填**条目给一行【待补充】占位（与合成初稿同形，不含条目要求原文 ——
+        抄进去第三步会把要求本身判成「已报告」）；空着的选填条目不出现。
+        一整章全是占位的跳过：没有任何作者写的事实可写，送给模型只会得到一段空话。
+
+        **摘要清单表单独成一章「摘要」，排在最前**（甲方定稿）：它与主表都有「方法 / 结果」这类
+        同名章节，按 domain 合并的话摘要内容会混进正文、同一事实写两遍。
+        """
+        abstract = '摘要' if lang == 'zh' else 'Abstract'
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for it in items:
+            item_id = int(it['itemId'])
+            pick = ReportReviewService._pick_item(it, lang)
+            text = contents.get(item_id, '').strip()
+            required = (it.get('requireLevel') or '0') == '0'
+            if not text and not required:
+                continue
+            domain = abstract if cls._is_abstract_part(it) else (pick['domain'] or '—')
+            grouped.setdefault(domain, []).append({
+                'itemId': item_id,
+                'itemNo': pick['item_no'],
+                'text': text or placeholder_of(pick['item_no'] or str(item_id), lang),
+                'placeholder': not text,
+            })
+        out = []
+        for domain, rows in grouped.items():
+            if all(r['placeholder'] for r in rows):
+                continue
+            pairs = [(int(r['itemId']), '' if r['placeholder'] else str(r['text'])) for r in rows]
+            out.append({'domain': domain, 'items': rows, 'hash': cls._hash(pairs)})
+        # 摘要那一章挪到最前（排序是稳定的，其余章节保持清单顺序）
+        out.sort(key=lambda sec: 0 if sec['domain'] == abstract else 1)
+
+        return out
+
+    @classmethod
+    def _materials(cls, items: list[dict[str, Any]], contents: dict[int, str], lang: str) -> list[Any]:
+        """
+        整篇成文的素材（2026-10 起，先定提纲再逐节写）：已填的条目给正文，空着的**必填**条目给一行
+        【待补充】占位（不含条目要求原文），空着的选填条目不出现；正文完全相同的并成一份（`build_materials`）。
+
+        章节不在这里分 —— 交给模型按论文结构定提纲（`report_render_prompt`）。
+        """
+        rows: list[tuple[int, str, str, str, bool]] = []
+        for it in items:
+            item_id = int(it['itemId'])
+            pick = ReportReviewService._pick_item(it, lang)
+            text = contents.get(item_id, '').strip()
+            if not text and (it.get('requireLevel') or '0') != '0':
+                continue
+            no = pick['item_no'] or str(item_id)
+            rows.append((item_id, no, pick['domain'] or '', text or placeholder_of(no, lang, pick['domain'] or ''), not text))
+
+        return build_materials(rows)
+
+    @staticmethod
+    def _material_payload(mats: Sequence[Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                'itemId': m.item_id, 'itemNo': m.item_no, 'domain': m.domain, 'text': m.text,
+                'placeholder': m.placeholder, 'also': list(m.also), 'alsoNos': list(m.also_nos),
+            }
+            for m in mats
+        ]
+
+    @staticmethod
+    def _current_hash(item_ids: Sequence[int], contents: dict[int, str]) -> str:
+        """一节按条目当前正文重算的指纹（与 worker 写进结果的 `hash` 同一算法：`section_hash`）"""
+        return section_hash([(int(i), contents.get(int(i), '')) for i in item_ids])
+
+    # ------------------------------------------------------------------ 提交
+
+    @classmethod
+    async def _guard_running(cls, query_db: AsyncSession, user_id: int) -> None:
+        """
+        并发闸：撞上限先对账再判 —— 孤儿记录不该把账号永久锁死。
+
+        「先数后插」不是原子的：双击、或两个标签页同时提交，两个请求都会在对方 commit 之前数到 0。
+        所以对账（它会 commit）之后再拿一把**按用户的事务级咨询锁**、在锁里重数一次，
+        锁一直持有到 `_enqueue` 插入台账那次 commit —— 后来的请求等锁放开时就数得到前一个了。
+        这之间不许再有 commit（会提前放锁）。SQLite（单测）没有咨询锁，跳过
+        """
+        running = len(await ReportAiDao.list_active_dao(query_db, user_id))
+        if running >= cls.MAX_RUNNING_PER_USER:
+            running = await cls._reconcile(query_db, user_id)
+        if query_db.bind.dialect.name == 'postgresql':
+            await query_db.execute(
+                sa_text('select pg_advisory_xact_lock(hashtext(:ns), :uid)'), {'ns': 'action_report_ai', 'uid': int(user_id)}
+            )
+            running = len(await ReportAiDao.list_active_dao(query_db, user_id))
+        if running >= cls.MAX_RUNNING_PER_USER:
+            await query_db.rollback()
+            raise ServiceException(message='你已有一个 AI 任务在进行中，请等它跑完再提交')
+
+    @classmethod
+    async def _enqueue(
+        cls,
+        query_db: AsyncSession,
+        *,
+        draft_id: int,
+        user_id: int,
+        kind: str,
+        locale: str,
+        item_total: int,
+        payload: dict[str, Any],
+        seed: dict[str, Any],
+        draft_update_time: Any,
+    ) -> tuple[int, str]:
+        """先落台账、再入队；入队失败就地标 failed（留痕，不回滚）"""
+        session_id = uuid.uuid4().hex
+        record = ActionReportAiRun(
+            draft_id=draft_id,
+            user_id=user_id,
+            session_id=session_id,
+            kind=kind,
+            locale=locale,
+            run_status='pending',
+            progress=0,
+            phase='',
+            item_total=item_total,
+            # 跑完之前这一列借来存「提交时的上下文」（各章指纹 / 只重写哪一章 / 跳过的条目），落库时换成结果
+            result_json=json.dumps(seed, ensure_ascii=False),
+            draft_update_time=draft_update_time,
+            del_flag='0',
+            create_time=datetime.now(),
+        )
+        try:
+            await ReportAiDao.add_run_dao(query_db, record)
+            run_id = int(record.run_id)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        body = {**payload, 'kind': kind, 'draft_id': draft_id, 'user_id': user_id, 'locale': locale}
+        try:
+            async with cls._client() as client:
+                await client.submit(body, session_id=session_id)
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                await ReportAiDao.edit_run_dao(
+                    query_db,
+                    run_id,
+                    {
+                        'run_status': 'failed',
+                        'error_msg': f'任务入队失败：{type(e).__name__}'[:500],
+                        'finish_time': datetime.now(),
+                    },
+                )
+                await query_db.commit()
+            raise ServiceException(message='任务提交失败，请稍后再试') from e
+
+        return run_id, session_id
+
+    @classmethod
+    async def submit_refine_services(
+        cls, query_db: AsyncSession, draft_id: int, submit: RefineBatchSubmitModel, user_id: int, locale: str = 'zh'
+    ) -> AiSubmitResultModel:
+        """
+        一键优化：给定的条目逐条走一次「AI 优化」（与单条同一份提示词）
+
+        只认纳入范围内的条目；空着又没给补充事实的跳过并如实返回。
+        """
+        lang = 'en' if locale == 'en' else 'zh'
+        draft, code, _all, items, contents = await cls._draft_material(query_db, draft_id, user_id)
+        # 下面的并发闸撞上限时会对账、会 commit，commit 之后再读 ORM 属性就是 MissingGreenlet —— 先抄成普通值
+        draft_update_time = draft.update_time
+        by_id = {int(it['itemId']): it for it in items}
+
+        verdicts: dict[int, tuple[str, str]] = {}
+        review = await ReportReviewDao.get_latest_review_dao(query_db, draft_id, user_id)
+        scoped = {int(it['itemId']): contents.get(int(it['itemId']), '') for it in items}
+        # 全稿参考与检查问题：模型只看得到这一条的话，该改的不改、别处写过的又被标成【待补充】（refine_context）
+        manuscript = manuscript_reference(items, contents, lang)
+        issues: dict[int, list[str]] = {}
+        if review:
+            verdicts = {
+                r.item_id: (r.status, r.reason or '')
+                for r in await ReportReviewDao.get_review_items_dao(query_db, review.review_id)
+            }
+            issues = issues_by_item(review.consistency, scoped, lang)
+
+        payload_items: list[dict[str, Any]] = []
+        #: 空着又没给要点（模型手里只有条目要求，写出来是一段满屏【待补充】的空壳）
+        skipped: list[int] = []
+        #: 正文超过单次改写上限（多半是把整段稿子贴进了一条），要先拆分
+        too_long: list[int] = []
+        #: 不在纳入范围内、或不属于这份规范 —— 前端给的条目已过期（范围刚改过），只计数
+        ignored = 0
+        for item_id in dict.fromkeys(submit.item_ids):
+            item = by_id.get(item_id)
+            if item is None:
+                ignored += 1
+                continue
+            current = contents.get(item_id, '')
+            note = (submit.instructions.get(item_id) or '').strip()[: cls.MAX_NOTE]
+            if len(current) > MAX_ASSIST_INPUT_CHARS:
+                too_long.append(item_id)
+                continue
+            if not current.strip() and not note:
+                skipped.append(item_id)
+                continue
+            verdict, reason = verdicts.get(item_id, ('', ''))
+            payload_items.append({
+                'itemId': item_id,
+                'ctx': {
+                    'guideline_code': code,
+                    'current_text': current,
+                    'verdict': verdict,
+                    'verdict_reason': reason,
+                    'issues': issues.get(item_id, []),
+                    **ReportReviewService._pick_item(item, lang),
+                },
+                'instruction': note,
+            })
+        if not payload_items:
+            if too_long and skipped:
+                raise ServiceException(
+                    message=f'没有可优化的条目：{len(skipped)} 条还空着（请先写几句或给出要点），'
+                    f'{len(too_long)} 条正文超过 {MAX_ASSIST_INPUT_CHARS} 字（请先拆分）'
+                )
+            if too_long:
+                raise ServiceException(message=f'选中的条目正文超过 {MAX_ASSIST_INPUT_CHARS} 字，请先拆分')
+            if skipped:
+                raise ServiceException(message='选中的条目都还空着：请先写几句，或给出要点')
+            raise ServiceException(message='选中的条目已不在纳入的清单表里，请刷新后重试')
+
+        await cls._guard_running(query_db, user_id)
+        run_id, session_id = await cls._enqueue(
+            query_db,
+            draft_id=draft_id,
+            user_id=user_id,
+            kind='refine',
+            locale=lang,
+            item_total=len(payload_items),
+            # 全稿每条都一样，放在 payload 顶层只传一份，worker 再塞回每条的上下文
+            payload={'items': payload_items, 'manuscript': manuscript},
+            seed={'skipped': skipped, 'tooLong': too_long, 'ignored': ignored},
+            draft_update_time=draft_update_time,
+        )
+
+        return AiSubmitResultModel(
+            runId=run_id, sessionId=session_id, itemTotal=len(payload_items),
+            skipped=skipped, tooLong=too_long, ignored=ignored,
+        )
+
+    @classmethod
+    async def submit_render_services(
+        cls, query_db: AsyncSession, draft_id: int, submit: RenderSubmitModel, user_id: int
+    ) -> AiSubmitResultModel:
+        """
+        整篇成文：按章节把条目写成连贯正文。`domain` 非空时只重写那一章，其余章节沿用上一次的成文。
+
+        成文语言 = 作者实际写的语言（`detect_lang`），**不顺带翻译**。
+        """
+        draft, code, _all, items, contents = await cls._draft_material(query_db, draft_id, user_id)
+        # 并发闸撞上限时会对账、会 commit，之后再读 ORM 属性就是 MissingGreenlet —— 先抄成普通值
+        draft_update_time = draft.update_time
+        title = draft.title or ''
+        filled = [contents.get(int(it['itemId']), '') for it in items]
+        filled = [t for t in filled if t.strip()]
+        if not filled:
+            raise ServiceException(message='纳入的清单表里还没有任何内容，请先填写')
+
+        latest = await ReportAiDao.get_latest_render_dao(query_db, draft_id, user_id)
+        latest_data: dict[str, Any] = {}
+        if latest is not None:
+            with contextlib.suppress(ValueError, TypeError):
+                latest_data = json.loads(latest.result_json or '{}') or {}
+        # 只重写一章时沿用上一次成文的语言：作者之后多写了几句英文、判定翻了面的话，
+        # 章节名会换成另一种语言，合并时对不上旧章，同一章出现中英两份
+        lang = (str(latest_data.get('lang') or '') if submit.domain else '') or detect_lang(filled)
+        lang = 'en' if lang == 'en' else 'zh'
+        mats = cls._materials(items, contents, lang)
+        if not any(not m.placeholder for m in mats):
+            raise ServiceException(message='纳入的清单表里还没有任何内容，请先填写')
+
+        if not submit.domain:
+            # 整篇：提纲交给模型定（worker 里先调一次），小节数事先不知道，进度按 worker 回报的走
+            payload = {'lang': lang, 'title': title, 'guideline_code': code, 'materials': cls._material_payload(mats)}
+            seed = {'domain': '', 'order': []}
+            total = len(mats)
+        else:
+            # 单节重写：沿用上一次的提纲，只重写这一节；这一节有哪些条目看上一次成文记下的 itemIds
+            old_secs = list(latest_data.get('sections') or [])
+            idx = next((i for i, sec in enumerate(old_secs) if sec.get('domain') == submit.domain), -1)
+            if idx < 0:
+                raise ServiceException(message='这一节已经不在上一次的成文里，请重新生成整篇')
+            if 'itemIds' not in old_secs[idx]:
+                raise ServiceException(message='这份成文是改版前生成的，请先重新生成整篇')
+            wanted = {int(i) for i in old_secs[idx].get('itemIds') or []}
+            mine = [m for m in mats if wanted & set(m.item_ids)]
+            if not any(not m.placeholder for m in mine):
+                raise ServiceException(message='这一节已经没有可写的内容，请重新生成整篇')
+            prev = old_secs[idx - 1] if idx > 0 else {}
+            previous_tail = ((prev.get('paragraphs') or [{}])[-1].get('text') or '')[-200:] if prev.get('paragraphs') else ''
+            payload = {
+                'lang': lang,
+                'title': str(latest_data.get('title') or '') or title,
+                'guideline_code': code,
+                'previous_tail': previous_tail,
+                'outline': str(latest_data.get('outline') or ''),
+                'reference': reference_text(mats, lang),
+                # 其他各节的正文：worker 判「丢掉的数字」时要按全文看（engine/render.relax_dropped）
+                'elsewhere': '\n'.join(
+                    str(p.get('text') or '') for i, sec in enumerate(old_secs) if i != idx for p in sec.get('paragraphs') or []
+                ),
+                'sections': [{
+                    'domain': submit.domain, 'part': str(old_secs[idx].get('part') or ''),
+                    'items': cls._material_payload(mine),
+                }],
+            }
+            seed = {'domain': submit.domain, 'order': [str(sec.get('domain')) for sec in old_secs]}
+            total = 1
+
+        await cls._guard_running(query_db, user_id)
+        run_id, session_id = await cls._enqueue(
+            query_db,
+            draft_id=draft_id,
+            user_id=user_id,
+            kind='render',
+            locale=lang,
+            item_total=total,
+            payload=payload,
+            seed=seed,
+            draft_update_time=draft_update_time,
+        )
+
+        return AiSubmitResultModel(runId=run_id, sessionId=session_id, itemTotal=total)
+
+    # ------------------------------------------------------------------ 轮询与落库
+
+    @classmethod
+    async def _commit_values(cls, query_db: AsyncSession, run: _AiRun, values: dict[str, Any]) -> _AiRun:
+        """
+        更新一条**还没到终态**的任务（进度、失败、停止、状态丢失）。
+
+        条件更新：另一个轮询可能刚把它落成 completed，手里这份旧快照再无条件写一次，
+        就会把它改回 running（下一轮又落一次库、建议插两份）或改成 failed —— 等于绕过了幂等闸。
+        没改到（已是终态）时快照照返回，调用方随后都会重读记录。
+        """
+        try:
+            await ReportAiDao.edit_active_run_dao(query_db, run.run_id, values)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return replace(
+            run,
+            run_status=str(values.get('run_status', run.run_status)),
+            progress=int(values.get('progress', run.progress)),
+            phase=str(values.get('phase', run.phase)),
+            error_msg=str(values.get('error_msg', run.error_msg)),
+            done_count=int(values.get('done_count', run.done_count)),
+        )
+
+    @classmethod
+    async def _sync_run(cls, query_db: AsyncSession, run: _AiRun, state: dict[str, Any]) -> _AiRun:
+        """把 worker 状态同步进库；首次看到终态时落结果（一键优化停下时已生成的那部分也落）"""
+        if run.run_status in ('completed', 'failed', 'stopped'):
+            return run
+        status = str(state.get('status') or 'pending')
+        current = int(state.get('progress_current') or 0)
+        total = int(state.get('progress_total') or 100) or 100
+        result = state.get('result') if isinstance(state.get('result'), dict) else None
+        if status in ('completed', 'stopped') and result:
+            return await cls._persist(query_db, run, result, status, str(state.get('error') or ''))
+        if status == 'completed':
+            # 「跑完了」却没有结果（Redis 里的结果丢了 / 被截断）：判失败，**不能**落成一份空成文 ——
+            # 那会成为「最近一次成文」把之前那份好的盖住，页面看着和「还没生成过」一样
+            status = 'failed'
+            state = {**state, 'error': '任务结果缺失，请重新提交'}
+        values: dict[str, Any] = {
+            'run_status': status,
+            'progress': min(100, round(current / total * 100)),
+            'phase': str(state.get('stage') or run.phase or '')[:40],
+        }
+        if status in ('failed', 'stopped'):
+            values['error_msg'] = (
+                str(state.get('error') or '') or ('已停止' if status == 'stopped' else 'AI 任务失败')
+            )[:500]
+            values['finish_time'] = datetime.now()
+
+        return await cls._commit_values(query_db, run, values)
+
+    @classmethod
+    async def _persist(cls, query_db: AsyncSession, run: _AiRun, result: dict[str, Any], status: str, error: str) -> _AiRun:
+        seed: dict[str, Any] = {}
+        with contextlib.suppress(ValueError, TypeError):
+            seed = json.loads(run.seed or '{}') or {}
+        values: dict[str, Any] = {
+            'run_status': status,
+            'progress': 100 if status == 'completed' else run.progress,
+            'phase': 'done' if status == 'completed' else run.phase,
+            'error_msg': (error or '已停止')[:500] if status == 'stopped' else '',
+            'finish_time': datetime.now(),
+        }
+        try:
+            # 「上一次成文」必须在 claim **之前**取：claim 会把本行标成 completed，之后再按
+            # 「最近一次 completed」去取，取到的就是本行自己（它的 result_json 还是提交时的 seed），
+            # 单章重写会把其余各章全丢掉，失败章也沿用不了旧章
+            prev_json = ''
+            if run.kind == 'render':
+                prev = await ReportAiDao.get_latest_render_dao(query_db, run.draft_id, run.user_id)
+                prev_json = str(prev.result_json or '') if prev is not None else ''
+            # 幂等闸：并发轮询 / 对账同时撞上终态时只有一方拿到落库权，另一方原样返回
+            if not await ReportAiDao.claim_terminal_dao(query_db, run.run_id, status):
+                await query_db.rollback()
+                return replace(run, run_status=status)
+            if run.kind == 'refine':
+                values.update(await cls._persist_refine(query_db, run, result, seed))
+            else:
+                values.update(await cls._persist_render(query_db, run, result, seed, prev_json))
+                if values.pop('_all_failed', False):
+                    # 这次一章都没写成：不落新成文，上一次的成文原样保留为「最近一次」。
+                    # 被用户停止的照旧记 stopped（那不是失败）
+                    stopped = status == 'stopped'
+                    values.update({
+                        'run_status': 'stopped' if stopped else 'failed',
+                        'error_msg': ('已停止' if stopped else (values.get('_first_error') or '整篇成文失败，请稍后重试'))[:500],
+                        'result_json': run.seed,
+                    })
+                values.pop('_first_error', None)
+            await ReportAiDao.edit_run_dao(query_db, run.run_id, values)
+            await ReportAiDao.trim_runs_dao(query_db, run.draft_id, cls.KEEP_RUNS)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return replace(
+            run,
+            run_status=str(values['run_status']),
+            progress=int(values['progress']),
+            done_count=int(values.get('done_count', 0)),
+        )
+
+    @classmethod
+    async def _persist_refine(
+        cls, query_db: AsyncSession, run: _AiRun, result: dict[str, Any], seed: dict[str, Any]
+    ) -> dict[str, Any]:
+        """
+        一键优化：每条结果落一条待审阅的建议
+
+        **与原文一字不差（忽略空白）的不落**，只计数：提示词允许「已经满足要求就原样输出」，
+        落成建议的话，列表里就是一排点了「采用」也什么都不变的空建议（2026-10 测试撞到过）
+        """
+        now = datetime.now()
+        results = result.get('results') or []
+        unchanged = [
+            int(r['itemId'])
+            for r in results
+            if str(r.get('text') or '').strip() and squash(str(r.get('text'))) == squash(str(r.get('baseText') or ''))
+        ]
+        results = [r for r in results if int(r['itemId']) not in unchanged]
+        rows = [
+            ActionReportSuggestion(
+                draft_id=run.draft_id,
+                user_id=run.user_id,
+                item_id=int(r['itemId']),
+                run_id=run.run_id,
+                base_text=str(r.get('baseText') or ''),
+                content=str(r.get('text') or ''),
+                instruction=str(r.get('instruction') or '')[: cls.MAX_NOTE],
+                model_label=str(r.get('model') or '')[:200],
+                status='pending',
+                create_time=now,
+            )
+            for r in results
+            if str(r.get('text') or '').strip()
+        ]
+        item_ids = [int(r['itemId']) for r in results if str(r.get('text') or '').strip()]
+        if rows:
+            await ReportAiDao.add_suggestions_dao(query_db, rows)
+            await ReportAiDao.trim_suggestions_dao(query_db, run.draft_id, item_ids, cls.KEEP_SUGGESTIONS)
+        models = sorted({str(r.get('model') or '') for r in result.get('results') or []} - {''})
+
+        return {
+            'done_count': len(item_ids),
+            'result_json': json.dumps(
+                {
+                    'skipped': seed.get('skipped', []),
+                    'tooLong': seed.get('tooLong', []),
+                    'ignored': int(seed.get('ignored') or 0),
+                    'unchanged': unchanged,
+                    'failed': result.get('failed') or [],
+                },
+                ensure_ascii=False,
+            ),
+            'model_label': ', '.join(models)[:200],
+        }
+
+    @classmethod
+    async def _persist_render(
+        cls, query_db: AsyncSession, run: _AiRun, result: dict[str, Any], seed: dict[str, Any], prev_json: str = ''
+    ) -> dict[str, Any]:
+        """
+        整篇成文：各章带上提交时的素材指纹，再与上一次的成文（`prev_json`，claim 之前取的）合并：
+
+        - **这次没写成的章沿用上一次那章，但带上失败标记**（`error`）—— 原来能用的正文不该被换成空章，
+          可「这次没写成」也不能悄悄藏起来：页面上那一章照样显示「这一章没能生成」。
+          「没写成」= 没有段落（调用失败，或模型回了东西却一段也解析不出来）
+        - **这次一章都没写成**：整次判失败（由 `_persist` 处理），上一次的成文原样保留
+        - 只重写一章时，其余章节原样沿用；但**已经不在当前章节列表里的旧章剔掉**（作者把它清空了）
+        - 合并结果按提交那一刻的章节顺序排（`seed.order`）
+        """
+        # 指纹：2026-10 起 worker 按提纲小节算好写进结果（`hash`）；之前的任务由提交时的 seed 带着
+        hashes = seed.get('hashes') or {}
+        fresh = [{**sec, 'hash': sec.get('hash') or hashes.get(sec.get('domain'), '')} for sec in result.get('sections') or []]
+        if not any(sec.get('paragraphs') for sec in fresh):
+            first_error = next((str(sec.get('error')) for sec in fresh if sec.get('error')), '')
+            return {'_all_failed': True, '_first_error': first_error}
+
+        old: list[dict[str, Any]] = []
+        prev_data: dict[str, Any] = {}
+        if prev_json:
+            with contextlib.suppress(ValueError, TypeError, AttributeError):
+                data = json.loads(prev_json) or {}
+                if str(data.get('lang') or 'zh') == str(result.get('lang') or 'zh'):
+                    old = list(data.get('sections') or [])
+                    prev_data = data
+        old_by = {str(sec.get('domain')): sec for sec in old}
+        # 整篇时小节由模型这次定的提纲决定，顺序就是这次结果的顺序；单节重写按提交时的顺序
+        order = list(seed.get('order') or []) or [str(sec.get('domain')) for sec in fresh]
+        rank = {dom: i for i, dom in enumerate(order)}
+
+        merged: dict[str, dict[str, Any]] = {}
+        if seed.get('domain'):
+            merged.update({dom: sec for dom, sec in old_by.items() if not rank or dom in rank})
+        for sec in fresh:
+            dom = str(sec.get('domain'))
+            if sec.get('paragraphs'):
+                merged[dom] = sec
+            elif dom in old_by:
+                merged[dom] = {**old_by[dom], 'ok': False, 'error': str(sec.get('error') or '本次未能生成')}
+            else:
+                # 上一次没有这一章、这次也没写成：照样落一个空章，但要带失败标记 —— 页面只在有 error 时
+                # 才提示「这一章没能生成」，不带的话它只剩一条「漏写条目」，看不出是这次没写成
+                merged[dom] = {**sec, 'ok': False, 'error': str(sec.get('error') or '本次未能生成')}
+        sections = sorted(merged.values(), key=lambda sec: rank.get(str(sec.get('domain')), len(rank)))
+
+        done = sum(1 for sec in sections if sec.get('ok'))
+        await ReportTrailService.record(
+            query_db, run.user_id, 'rendered', draft_id=run.draft_id, total=len(sections), reported=done,
+        )
+
+        # 题目与提纲：整篇时取这次的，单节重写沿用上一次的（单节不重定提纲）
+        meta_src = prev_data if seed.get('domain') else result
+        meta = {k: meta_src.get(k) for k in ('title', 'titleItemIds', 'outline', 'outlined') if meta_src.get(k) is not None}
+
+        return {
+            'done_count': done,
+            'result_json': json.dumps(
+                {'lang': result.get('lang') or 'zh', **meta, 'sections': sections}, ensure_ascii=False
+            ),
+            'model_label': str(result.get('model') or '')[:200],
+        }
+
+    @classmethod
+    async def _reconcile(cls, query_db: AsyncSession, user_id: int) -> int:
+        """对账：未终结的任务补查一次 worker 状态，返回真正还在跑的条数（口径同 BackgroundGenService）"""
+        runs = [cls._snapshot(r) for r in await ReportAiDao.list_active_dao(query_db, user_id)]
+        if not runs:
+            return 0
+        states: dict[str, dict[str, Any] | None] = {}
+        try:
+            async with cls._client() as client:
+                for run in runs:
+                    # **查不动 ≠ 查到「没有」**：只有确实返回 None 才算孤儿
+                    with contextlib.suppress(Exception):
+                        states[run.session_id] = await client.status(run.session_id)
+        except Exception:
+            return len(runs)
+        alive = 0
+        for run in runs:
+            if run.session_id not in states:
+                alive += 1
+                continue
+            state = states[run.session_id]
+            if not state:
+                await cls._commit_values(
+                    query_db,
+                    run,
+                    {
+                        'run_status': 'failed',
+                        'error_msg': '任务状态已丢失（worker 未处理或状态已过期）',
+                        'finish_time': datetime.now(),
+                    },
+                )
+                continue
+            if (await cls._sync_run(query_db, run, state)).run_status in ('pending', 'running'):
+                alive += 1
+
+        return alive
+
+    @classmethod
+    def _state_of(cls, r: ActionReportAiRun) -> AiRunStateModel:
+        failed, skipped, too_long, ignored, unchanged = 0, 0, 0, 0, 0
+        if r.kind == 'refine':
+            with contextlib.suppress(ValueError, TypeError, AttributeError):
+                data = json.loads(r.result_json or '{}') or {}
+                failed = len(data.get('failed') or [])
+                skipped = len(data.get('skipped') or [])
+                too_long = len(data.get('tooLong') or [])
+                ignored = int(data.get('ignored') or 0)
+                unchanged = len(data.get('unchanged') or [])
+
+        return AiRunStateModel(
+            runId=int(r.run_id),
+            sessionId=str(r.session_id),
+            kind=str(r.kind),
+            runStatus=str(r.run_status or 'pending'),
+            progress=int(r.progress or 0),
+            phase=str(r.phase or ''),
+            errorMsg=str(r.error_msg or ''),
+            itemTotal=int(r.item_total or 0),
+            doneCount=int(r.done_count or 0),
+            failedCount=failed,
+            skippedCount=skipped,
+            tooLongCount=too_long,
+            ignoredCount=ignored,
+            unchangedCount=unchanged,
+        )
+
+    @classmethod
+    async def poll_services(cls, query_db: AsyncSession, session_id: str, user_id: int) -> AiRunStateModel:
+        """轮询一次；终态那一刻顺带落库"""
+        record = await ReportAiDao.get_run_by_session(query_db, session_id, user_id)
+        if not record:
+            raise ServiceException(message='任务不存在')
+        run = cls._snapshot(record)
+        if run.run_status in ('pending', 'running'):
+            reached, state = False, None
+            with contextlib.suppress(Exception):
+                async with cls._client() as client:
+                    state = await client.status(session_id)
+                    reached = True
+            if state:
+                await cls._sync_run(query_db, run, state)
+            elif reached:
+                # 确实查到「没有」（入队时就写了 pending，所以没有 = 状态过期或 Redis 被清）：判丢失。
+                # **查不动的不算** —— 一次 Redis 抖动不该把还在跑的任务写成失败
+                await cls._commit_values(
+                    query_db,
+                    run,
+                    {
+                        'run_status': 'failed',
+                        'error_msg': '任务状态已丢失（worker 未处理或状态已过期），请重新提交',
+                        'finish_time': datetime.now(),
+                    },
+                )
+            record = await ReportAiDao.get_run_by_session(query_db, session_id, user_id)
+            if not record:
+                raise ServiceException(message='任务不存在')
+
+        return cls._state_of(record)
+
+    @classmethod
+    async def stop_services(cls, query_db: AsyncSession, session_id: str, user_id: int) -> CrudResponseModel:
+        """请求停止。一键优化停下时已经生成的建议照样落库（worker 会把它们写进 stopped 状态）"""
+        record = await ReportAiDao.get_run_by_session(query_db, session_id, user_id)
+        if not record:
+            raise ServiceException(message='任务不存在')
+        async with cls._client() as client:
+            await client.stop(session_id)
+
+        return CrudResponseModel(is_success=True, message='已请求停止')
+
+    # ------------------------------------------------------------------ 打开草稿时的整份状态
+
+    @classmethod
+    async def state_services(cls, query_db: AsyncSession, draft_id: int, user_id: int) -> ReportAiStateModel:
+        """在跑的任务（刷新后接回轮询）+ 最近一次整篇成文（逐章判过时）+ 逐条建议（逐条判过时）"""
+        _draft, _code, _all, items, contents = await cls._draft_material(query_db, draft_id, user_id)
+
+        live_rows = await ReportAiDao.list_active_dao(query_db, user_id, draft_id)
+        live = cls._state_of(live_rows[0]) if live_rows else None
+
+        render = None
+        latest = await ReportAiDao.get_latest_render_dao(query_db, draft_id, user_id)
+        if latest is not None:
+            data: dict[str, Any] = {}
+            with contextlib.suppress(ValueError, TypeError):
+                data = json.loads(latest.result_json or '{}') or {}
+            lang = str(data.get('lang') or 'zh')
+            # 改版前的成文没有 itemIds，仍按清单章节现算指纹比
+            legacy = {s['domain']: s['hash'] for s in cls._sections(items, contents, lang)}
+
+            def stale(s: dict[str, Any]) -> bool:
+                if 'itemIds' in s:
+                    return cls._current_hash(s.get('itemIds') or [], contents) != s.get('hash')
+                return legacy.get(str(s.get('domain') or '')) != s.get('hash')
+
+            render = RenderModel(
+                runId=int(latest.run_id),
+                lang=lang,
+                title=str(data.get('title') or ''),
+                sections=[
+                    RenderSectionModel(
+                        domain=str(s.get('domain') or ''),
+                        part=str(s.get('part') or ''),
+                        paragraphs=list(s.get('paragraphs') or []),
+                        ok=bool(s.get('ok')),
+                        issues=list(s.get('issues') or []),
+                        error=str(s.get('error') or ''),
+                        stale=stale(s),
+                    )
+                    for s in data.get('sections') or []
+                ],
+                modelLabel=str(latest.model_label or ''),
+                createTime=latest.create_time,
+            )
+
+        suggestions = [
+            SuggestionModel(
+                suggestionId=int(r.suggestion_id),
+                itemId=int(r.item_id),
+                runId=int(r.run_id) if r.run_id else None,
+                content=str(r.content or ''),
+                baseText=str(r.base_text or ''),
+                instruction=str(r.instruction or ''),
+                modelLabel=str(r.model_label or ''),
+                status=str(r.status or 'pending'),
+                stale=(r.base_text or '').strip() != contents.get(int(r.item_id), '').strip(),
+                createTime=r.create_time,
+            )
+            for r in await ReportAiDao.list_suggestions_dao(query_db, draft_id, user_id)
+        ]
+
+        return ReportAiStateModel(live=live, render=render, suggestions=suggestions)
+
+    @classmethod
+    async def render_sections_of(
+        cls, query_db: AsyncSession, draft_id: int, user_id: int
+    ) -> tuple[str, list[dict], str] | None:
+        """导出用：最近一次整篇成文的 (语言, 各节, 题目)；没有就是 None"""
+        latest = await ReportAiDao.get_latest_render_dao(query_db, draft_id, user_id)
+        if latest is None:
+            return None
+        try:
+            data = json.loads(latest.result_json or '{}') or {}
+        except (ValueError, TypeError):
+            return None
+
+        return str(data.get('lang') or 'zh'), list(data.get('sections') or []), str(data.get('title') or '')
+
+    # ------------------------------------------------------------------ 建议：入库 · 采用 · 放弃
+
+    @classmethod
+    async def add_single_suggestion(
+        cls,
+        query_db: AsyncSession,
+        *,
+        draft_id: int,
+        user_id: int,
+        item_id: int,
+        base_text: str,
+        content: str,
+        instruction: str,
+        model_label: str,
+    ) -> int:
+        """单条「AI 优化」的结果入库（由 `ReportReviewService.assist_services` 调）"""
+        row = ActionReportSuggestion(
+            draft_id=draft_id,
+            user_id=user_id,
+            item_id=item_id,
+            run_id=None,
+            base_text=base_text,
+            content=content,
+            instruction=instruction[: cls.MAX_NOTE],
+            model_label=model_label[:200],
+            status='pending',
+            create_time=datetime.now(),
+        )
+        try:
+            await ReportAiDao.add_suggestions_dao(query_db, [row])
+            suggestion_id = int(row.suggestion_id)
+            await ReportAiDao.trim_suggestions_dao(query_db, draft_id, [item_id], cls.KEEP_SUGGESTIONS)
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return suggestion_id
+
+    @classmethod
+    async def apply_services(
+        cls, query_db: AsyncSession, draft_id: int, apply: SuggestionApplyModel, user_id: int
+    ) -> SuggestionApplyResultModel:
+        """
+        采用建议写回条目。**每一条都过「已过时」闸**：当前正文 ≠ 生成时的正文就跳过并如实返回。
+        同一条目选了好几版时只采用最新的那一版（其余照「过时」处理）—— **最新那版过时了也不退而采用旧版**：
+        用户没打算采用那一版，base 恰好等于当前正文只是巧合（正文改走又改回来）。
+        每条写回由服务端记一条 `applied` 留痕 —— 第五步的 AI 使用说明靠它答得出来。
+
+        读正文、核对、写回都在草稿行锁里：不锁的话，另一个标签页的保存恰好落在「读」与「写」之间，
+        比对的是旧快照，比对通过后整条覆盖，把刚存进来的手改冲掉 —— 正是这道闸要防的事
+        """
+        await ReportDraftDao.lock_draft_dao(query_db, draft_id, user_id)
+        _draft, code, all_items, _scoped, contents = await cls._draft_material(query_db, draft_id, user_id)
+        valid_ids = {int(it['itemId']) for it in all_items}
+        rows = await ReportAiDao.get_suggestions_dao(query_db, draft_id, user_id, apply.ids)
+        # 快照成普通值：下面要 commit，跨 commit 读 ORM 属性会 MissingGreenlet
+        picked = [
+            (int(r.suggestion_id), int(r.item_id), (r.base_text or '').strip(), str(r.content or ''))
+            for r in rows
+            if r.status == 'pending'
+        ]
+        applied: dict[int, str] = {}
+        stale: list[int] = []
+        applied_ids: list[int] = []
+        seen: set[int] = set()
+        for sid, item_id, base, text in sorted(picked, key=lambda x: -x[0]):
+            current = contents.get(item_id, '')
+            first = item_id not in seen
+            seen.add(item_id)
+            if not first or item_id not in valid_ids or current.strip() != base:
+                stale.append(sid)
+                continue
+            new = f'{current.strip()}\n{text}' if apply.mode == 'append' and current.strip() else text
+            contents[item_id] = new
+            applied[item_id] = new
+            applied_ids.append(sid)
+        if applied:
+            try:
+                # **只覆盖被采用的那几条**：整份写回会把读取之后、并发保存进来的其它条目改动冲掉
+                await ReportDraftDao.replace_draft_items(query_db, draft_id, user_id, applied, set(applied))
+                # 草稿更新时间跟着走：第三步「检查结果可能已过时」靠它判
+                await ReportDraftDao.edit_draft_dao(
+                    query_db, draft_id, user_id, {'update_by': str(user_id), 'update_time': datetime.now()}
+                )
+                await ReportAiDao.set_suggestion_status_dao(query_db, draft_id, user_id, applied_ids, 'applied')
+                for item_id, text in applied.items():
+                    await ReportTrailService.record(
+                        query_db, user_id, 'applied', draft_id=draft_id, guideline_code=code,
+                        item_id=item_id, char_count=len(text),
+                    )
+                await query_db.commit()
+            except Exception:
+                await query_db.rollback()
+                raise
+        else:
+            # 一条都没写：把行锁放掉
+            await query_db.rollback()
+
+        return SuggestionApplyResultModel(applied=applied, stale=sorted(stale))
+
+    @classmethod
+    async def discard_services(
+        cls, query_db: AsyncSession, draft_id: int, discard: SuggestionDiscardModel, user_id: int
+    ) -> CrudResponseModel:
+        """放弃建议（只改状态，列表不再返回它）"""
+        await ReportDraftService._load(query_db, draft_id, user_id)
+        try:
+            await ReportAiDao.set_suggestion_status_dao(query_db, draft_id, user_id, discard.ids, 'discarded')
+            await query_db.commit()
+        except Exception:
+            await query_db.rollback()
+            raise
+
+        return CrudResponseModel(is_success=True, message='已放弃')

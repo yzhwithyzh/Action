@@ -18,6 +18,9 @@ from exceptions.exception import ServiceException
 from module_action.entity.vo.action_vo import (
     CollabRequestModel,
     CollabRequestPageQueryModel,
+    GuestAdminModel,
+    GuestAdminPageQueryModel,
+    GuestStatusModel,
     GuidelineCategoryModel,
     GuidelineCategoryPageQueryModel,
     GuidelineItemModel,
@@ -61,6 +64,7 @@ from module_action.service.action_service import (
     StudyWizardService,
     TeamMemberService,
 )
+from module_action.service.guest_auth_service import GuestAdminService
 from module_action.service.publication_meta_service import PublicationMetaService
 from module_admin.entity.vo.common_vo import UploadResponseModel
 from module_admin.entity.vo.user_vo import CurrentUserModel
@@ -1603,6 +1607,67 @@ async def delete_admin_literature(
     current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
 ) -> Response:
     result = await LiteratureService.delete_literature_services(query_db, lit_ids, current_user.user.user_name)
+    logger.info(result.message)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+# ------------------------------------------------------------------ 官网访客
+# 访客与后台账号共用 sys_user（user_type='01'），后台「用户管理」刻意把访客排除在外，
+# 这里是访客唯一的管理入口。只有看与停用/启用，不改密码、不授角色（理由见 GuestAdminService）。
+
+
+@action_admin_controller.get(
+    '/guest/list',
+    summary='获取官网访客分页列表',
+    description='含注册资料与名下工作计数',
+    response_model=PageResponseModel[GuestAdminModel],
+    dependencies=[UserInterfaceAuthDependency('action:guestUser:list')],
+)
+async def get_admin_guest_list(
+    request: Request,
+    guest_page_query: Annotated[GuestAdminPageQueryModel, Query()],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await GuestAdminService.get_guest_list_services(query_db, guest_page_query)
+    logger.info('获取成功')
+
+    return ResponseUtil.success(model_content=result)
+
+
+@action_admin_controller.get(
+    '/guest/{user_id}',
+    summary='获取官网访客详情',
+    description='后台维护用',
+    response_model=DataResponseModel[GuestAdminModel],
+    dependencies=[UserInterfaceAuthDependency('action:guestUser:query')],
+)
+async def get_admin_guest_detail(
+    request: Request,
+    user_id: Annotated[int, Path(description='用户id')],
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await GuestAdminService.guest_detail_services(query_db, user_id)
+    logger.info(f'获取user_id为{user_id}的访客信息成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_admin_controller.put(
+    '/guest/status',
+    summary='停用 / 启用官网访客',
+    description='即时生效：访客身份依赖每个请求都回库判停用',
+    response_model=ResponseBaseModel,
+    dependencies=[UserInterfaceAuthDependency('action:guestUser:edit')],
+)
+@Log(title='官网访客', business_type=BusinessType.UPDATE)
+async def change_admin_guest_status(
+    request: Request,
+    status_model: GuestStatusModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_user: Annotated[CurrentUserModel, CurrentUserDependency()],
+) -> Response:
+    result = await GuestAdminService.change_guest_status_services(query_db, status_model, current_user.user.user_name)
     logger.info(result.message)
 
     return ResponseUtil.success(msg=result.message)

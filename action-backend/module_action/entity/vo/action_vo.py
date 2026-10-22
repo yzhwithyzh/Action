@@ -1004,8 +1004,12 @@ class ReportDraftModel(ActionBaseModel):
     guideline_code: str | None = Field(default=None, description='规范代号，如 STRICTA')
     study_type_key: str | None = Field(default=None, description='第一步判定的研究类型')
     title: str | None = Field(default=None, description='草稿名称')
+    #: 导入的草稿（带原稿）。第四步「整篇成文」会整篇重写原稿，前端据此先确认一次；第五步据此默认导出原稿写回
+    has_source: bool = Field(default=False, description='是否导入的草稿')
+    #: 纳入的清单表。**空 = 全部纳入**（老草稿、新草稿的默认值）。下面四个完成度计数只算纳入的表
+    parts: list[int] = Field(default_factory=list, description='纳入的清单表序号（part_no），空=全部纳入')
     items: list[ReportDraftItemModel] = Field(default_factory=list, description='逐条目正文（仅详情返回）')
-    item_total: int = Field(default=0, description='该规范的条目总数')
+    item_total: int = Field(default=0, description='该规范（纳入的清单表内）的条目总数')
     filled_count: int = Field(default=0, description='已填写的条目数')
     required_total: int = Field(default=0, description='必填条目数')
     required_filled: int = Field(default=0, description='已填写的必填条目数')
@@ -1062,6 +1066,9 @@ class ReportDraftSaveModel(BaseModel):
     items: list[ReportDraftItemModel] = Field(
         default_factory=list, max_length=MAX_DRAFT_ITEMS, description='逐条目正文（整体覆盖）'
     )
+    #: 纳入的清单表。**不传 = 这次不改**（与 items 的整体覆盖语义不同：自动保存每次都带 items，
+    #: 而选用哪几张表是另一个动作，不该被一次没带它的保存冲掉）。**传空列表 = 全部纳入**
+    parts: list[int] | None = Field(default=None, max_length=20, description='纳入的清单表序号；不传=不改')
 
 
 class ReportDraftComposeModel(BaseModel):
@@ -1249,6 +1256,9 @@ class AssistResultModel(BaseModel):
     action: str = Field(description='本次执行的动作')
     text: str = Field(description='改写后的正文')
     model_label: str = Field(default='', description='实际出结果的模型，便于排障')
+    #: 草稿模式下的「AI 优化」（action=refine）结果会作为一条建议入库（sql/053），这里回它的 id；
+    #: 采用走 `/report-drafts/{id}/suggestions/apply`，与一键优化的建议同一条路
+    suggestion_id: int | None = Field(default=None, description='入库的建议id（仅草稿模式的 refine）')
 
 
 class AssistApplyModel(BaseModel):
@@ -1263,9 +1273,159 @@ class AssistApplyModel(BaseModel):
     content: str = Field(default='', max_length=MAX_DRAFT_ITEM_CHARS, description='写回的正文')
 
 
+# ---------------------------------------------------------------- 第四步：逐条建议 · 一键优化 · 整篇成文（sql/053）
+
+#: 一次一键优化最多几条。与 worker 的 MAX_REFINE_ITEMS 对齐
+MAX_REFINE_BATCH = 200
+
+
+class SuggestionModel(ActionBaseModel):
+    """
+    一条优化建议
+
+    `stale` 由服务端现算：生成建议时这一条的正文（base_text）与当前正文不一致 ——
+    用户在建议生成之后又手改过它，这时采用会冲掉手改的字，所以不让采用。
+    """
+
+    suggestion_id: int = Field(description='建议id')
+    item_id: int = Field(description='条目id')
+    run_id: int | None = Field(default=None, description='来自哪次一键优化；单条优化为空')
+    content: str = Field(default='', description='建议正文')
+    #: 生成时这一条的正文。前端拿它与编辑态比，未保存的手改也能当场判出「已过时」
+    base_text: str = Field(default='', description='生成建议时这一条的正文')
+    instruction: str = Field(default='', description='作者当时给的补充事实')
+    model_label: str = Field(default='', description='出结果的模型')
+    status: str = Field(default='pending', description='pending / applied / discarded')
+    stale: bool = Field(default=False, description='生成之后这一条又被改过')
+    create_time: datetime | None = Field(default=None, description='生成时间')
+
+
+class RefineBatchSubmitModel(BaseModel):
+    """
+    一键优化的入参
+
+    要优化哪几条由前端给（它手上就有第三步的问题清单）；后端只认纳入范围内的条目，
+    空着又没给补充事实的跳过 —— 模型手里只有条目要求时写出来的是一段满屏【待补充】的空壳。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    item_ids: list[int] = Field(min_length=1, max_length=MAX_REFINE_BATCH, description='要优化的条目id')
+    #: 条目id → 作者在第四步写下的补充事实（可选）
+    instructions: dict[int, str] = Field(default_factory=dict, description='逐条的补充事实')
+
+
+class RenderSubmitModel(BaseModel):
+    """
+    整篇成文的入参。`domain` 非空时只重写这一章（其余章节沿用上一次的成文）
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    domain: str = Field(default='', max_length=500, description='只重写这一章；空 = 整篇')
+
+
+class AiSubmitResultModel(BaseModel):
+    """提交回执"""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    run_id: int = Field(description='任务记录id')
+    session_id: str = Field(description='worker 任务id，轮询用')
+    item_total: int = Field(default=0, description='条目数 / 章节数')
+    skipped: list[int] = Field(default_factory=list, description='一键优化里因为空着又没给要点而跳过的条目id')
+    too_long: list[int] = Field(default_factory=list, description='一键优化里因为正文超长而跳过的条目id')
+    ignored: int = Field(default=0, description='不在纳入范围内、被忽略的条目数')
+
+
+class AiRunStateModel(BaseModel):
+    """一次 AI 任务的轮询快照"""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    run_id: int = Field(description='任务记录id')
+    session_id: str = Field(description='worker 任务id')
+    kind: str = Field(description='refine / render')
+    run_status: str = Field(description='pending / running / completed / failed / stopped')
+    progress: int = Field(default=0, description='进度百分比')
+    phase: str = Field(default='', description='当前阶段（render 为章节名）')
+    error_msg: str = Field(default='', description='失败原因')
+    item_total: int = Field(default=0, description='条目数 / 章节数')
+    done_count: int = Field(default=0, description='产出建议的条目数 / 核对通过的章节数')
+    failed_count: int = Field(default=0, description='一键优化里没生成成的条数')
+    skipped_count: int = Field(default=0, description='一键优化里因为空着又没给要点而跳过的条数')
+    too_long_count: int = Field(default=0, description='一键优化里因为正文超长而跳过的条数')
+    unchanged_count: int = Field(default=0, description='一键优化里模型判定已满足要求、原样返回而不出建议的条数')
+    ignored_count: int = Field(default=0, description='一键优化里因为已不在纳入范围内而忽略的条数')
+
+
+class RenderSectionModel(BaseModel):
+    """成文的一节（2026-10 起是模型定的提纲里的一个小节）"""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    domain: str = Field(description='小节标题（不分小节的部分就是部分名），也是这一节的键')
+    part: str = Field(default='', description='所属一级部分（如「2 方法」）；改版前的成文为空')
+    paragraphs: list[dict] = Field(default_factory=list, description='[{text, itemIds}]')
+    ok: bool = Field(default=True, description='代码核对是否通过')
+    issues: list[dict] = Field(default_factory=list, description='[{kind, values}]')
+    error: str = Field(default='', description='这一章没写成的原因')
+    stale: bool = Field(default=False, description='成文之后这一章的条目又被改过')
+
+
+class RenderModel(BaseModel):
+    """最近一次整篇成文"""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    run_id: int = Field(description='任务记录id')
+    lang: str = Field(default='zh', description='成文语言')
+    title: str = Field(default='', description='论文题目（照录作者写的题目条目）；没有就空')
+    sections: list[RenderSectionModel] = Field(default_factory=list, description='各节')
+    model_label: str = Field(default='', description='出结果的模型')
+    create_time: datetime | None = Field(default=None, description='生成时间')
+
+
+class ReportAiStateModel(BaseModel):
+    """打开草稿时第四步要的全部状态：在跑的任务 · 最近的成文 · 逐条建议"""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    live: AiRunStateModel | None = Field(default=None, description='这份草稿在跑的任务（刷新后接回轮询用）')
+    render: RenderModel | None = Field(default=None, description='最近一次跑完的整篇成文')
+    suggestions: list[SuggestionModel] = Field(default_factory=list, description='逐条建议（新的在后）')
+
+
+class SuggestionApplyModel(BaseModel):
+    """采用建议。`mode=append` 只在采用单条时有意义（追加到现有正文末尾）"""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    ids: list[int] = Field(min_length=1, max_length=MAX_REFINE_BATCH, description='建议id')
+    mode: Literal['replace', 'append'] = Field(default='replace', description='覆盖 / 追加')
+
+
+class SuggestionApplyResultModel(BaseModel):
+    """采用结果。过时的那几条**跳过并如实返回**，不静默覆盖"""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    applied: dict[int, str] = Field(default_factory=dict, description='条目id → 写回后的正文')
+    stale: list[int] = Field(default_factory=list, description='因为已过时而跳过的建议id')
+
+
+class SuggestionDiscardModel(BaseModel):
+    """放弃建议"""
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    ids: list[int] = Field(min_length=1, max_length=MAX_REFINE_BATCH, description='建议id')
+
+
+
 #: 留痕事件的取值域。**枚举而不是自由文本**：前端能传任意字符串就等于绕过了
 #: 「稿件不入库」那条承诺，人读的句子由前端按 i18n 渲染，库里只存这个键
-TrailEvent = Literal['submitted', 'judged', 'cross', 'failed', 'applied']
+TrailEvent = Literal['submitted', 'judged', 'cross', 'failed', 'applied', 'rendered']
 
 #: 一次列表最多回多少条留痕
 MAX_TRAIL_ROWS = 50
@@ -1327,6 +1487,21 @@ class StudyTypeStatModel(ActionBaseModel):
     text_en: str | None = Field(default=None, description='推荐说明（英文）')
 
 
+class ChecklistOptionModel(ActionBaseModel):
+    """
+    第二步「用哪份规范写」的一个选项（按 id 现取的规范当前代号与名称）
+
+    `item_count` 是启用中的条目数：0 条的规范照样列出（后台挂了就该看得见），
+    前台据此标「条目待录入」，不让人点进去才发现是空的。
+    """
+
+    guideline_id: int = Field(description='规范id')
+    code: str = Field(description='规范当前代号（第二步按它取 checklist、草稿按它分开列）')
+    name_zh: str | None = Field(default=None, description='规范名称（中文）')
+    name_en: str | None = Field(default=None, description='规范名称（英文）')
+    item_count: int = Field(default=0, description='启用中的 checklist 条目数')
+
+
 class StudyTypeModel(ActionBaseModel):
     """
     研究类型（含关联规范与统计推荐）
@@ -1342,6 +1517,10 @@ class StudyTypeModel(ActionBaseModel):
     tip_zh: str | None = Field(default=None, description='专属提示（中文）')
     tip_en: str | None = Field(default=None, description='专属提示（英文）')
     status: str | None = Field(default=None, description='状态（0正常 1停用）')
+    alt_guideline_ids: list[int] = Field(default_factory=list, description='第二步可切换的其他规范id（sql/056）')
+    checklist_options: list[ChecklistOptionModel] = Field(
+        default_factory=list, description='第二步可选的规范：重点推荐那份在前，其后按 alt_guideline_ids 顺序'
+    )
     guidelines: list[str] = Field(default_factory=list, description='关联规范代号列表')
     stats: list[StudyTypeStatModel] = Field(default_factory=list, description='统计方法推荐')
 
@@ -1368,6 +1547,8 @@ class StudyTypeSaveModel(BaseModel):
       —— 指错了前台第二步展不开，用户只会看到一片空白。这条是硬闸。**按 id 不按代号**：
       代号在「规范目录管理」里可改，2026-08 改过一次，按字符串挂的研究类型全部指空（sql/048）。
       出参的 `hot_guideline` 是按 id 现取的当前代号，入参里不收它。
+    - **`alt_guideline_ids` 是第二步还能切换到的其他规范**（sql/056，如 RCT 的 TIDieR-A），同样按 id 挂、
+      同样拦不存在的。一份草稿只对应一份规范，切换规范 = 换一份草稿。
     - **`guidelines` 只是展示标签**，不是外键。库里现有「针灸专属条目」「针刺检索策略」
       「GRADE 证据分级」这类值在 `action_guideline` 里根本不存在，它们是给用户看的说明文字。
       所以这一栏不校验，只按顺序存。
@@ -1385,6 +1566,9 @@ class StudyTypeSaveModel(BaseModel):
     name_zh: str = Field(min_length=1, max_length=100, description='名称（中文）')
     name_en: str = Field(default='', max_length=200, description='名称（英文）')
     hot_guideline_id: int | None = Field(default=None, description='重点推荐规范id，留空=不展开 checklist')
+    alt_guideline_ids: list[int] = Field(
+        default_factory=list, max_length=10, description='第二步可切换的其他规范id（与重点推荐那份重复的会被剔掉）'
+    )
     sort_num: int | None = Field(default=None, ge=0, description='显示顺序，留空排到末尾')
     status: Literal['0', '1'] = Field(default='0', description='状态（0正常 1停用）')
     tip_zh: str = Field(default='', max_length=1000, description='专属提示（中文）')
@@ -1453,6 +1637,25 @@ class CfirStrategyModel(ActionBaseModel):
     source_en: str | None = Field(default=None, description='来源（英文）')
 
 
+class CfirElementModel(ActionBaseModel):
+    """
+    CFIR 构念下的子条目（①②… 与 ①-1…，children 装下一级）
+    """
+
+    element_id: int | None = Field(default=None, description='子条目id')
+    label: str | None = Field(default=None, description='编号')
+    name_zh: str | None = Field(default=None, description='名称（中文）')
+    name_en: str | None = Field(default=None, description='名称（英文）')
+    concept_zh: str | None = Field(default=None, description='概念（中文）')
+    concept_en: str | None = Field(default=None, description='概念（英文）')
+    example_zh: str | None = Field(default=None, description='示例（中文，一行一条）')
+    example_en: str | None = Field(default=None, description='示例（英文，一行一条）')
+    origin_zh: str | None = Field(default=None, description='与原版CFIR的对应关系（中文）')
+    origin_en: str | None = Field(default=None, description='与原版CFIR的对应关系（英文）')
+    source: str | None = Field(default=None, description='文献来源')
+    children: list['CfirElementModel'] = Field(default_factory=list, description='下一级子条目')
+
+
 class CfirConstructModel(ActionBaseModel):
     """
     CFIR 构念（障碍点）
@@ -1464,7 +1667,15 @@ class CfirConstructModel(ActionBaseModel):
     name_en: str | None = Field(default=None, description='名称（英文）')
     hint_zh: str | None = Field(default=None, description='释义（中文）')
     hint_en: str | None = Field(default=None, description='释义（英文）')
+    concept_zh: str | None = Field(default=None, description='概念（中文）')
+    concept_en: str | None = Field(default=None, description='概念（英文）')
+    example_zh: str | None = Field(default=None, description='示例（中文，一行一条）')
+    example_en: str | None = Field(default=None, description='示例（英文，一行一条）')
+    origin_zh: str | None = Field(default=None, description='与原版CFIR的对应关系（中文）')
+    origin_en: str | None = Field(default=None, description='与原版CFIR的对应关系（英文）')
+    source: str | None = Field(default=None, description='文献来源')
     severity: Literal['h', 'm', 'l'] | None = Field(default=None, description='严重度')
+    elements: list[CfirElementModel] = Field(default_factory=list, description='子条目')
     strategies: list[CfirStrategyModel] = Field(default_factory=list, description='应对策略')
 
 
@@ -1477,7 +1688,18 @@ class CfirDomainModel(ActionBaseModel):
     seq: int | None = Field(default=None, description='领域序号')
     name_zh: str | None = Field(default=None, description='名称（中文）')
     name_en: str | None = Field(default=None, description='名称（英文）')
+    intro_zh: str | None = Field(default=None, description='维度说明（中文）')
+    intro_en: str | None = Field(default=None, description='维度说明（英文）')
     constructs: list[CfirConstructModel] = Field(default_factory=list, description='构念列表')
+
+
+class CfirReferenceModel(ActionBaseModel):
+    """
+    CFIR 针刺版框架参考文献
+    """
+
+    ref_no: int | None = Field(default=None, description='文献序号')
+    citation: str | None = Field(default=None, description='引用文本')
 
 
 # ---------------------------------------------------------------- ERIC / RE-AIM
@@ -1779,7 +2001,7 @@ class GuestEmailCodeModel(BaseModel):
     model_config = ConfigDict(alias_generator=to_camel)
 
     email: EmailStr = Field(max_length=50, description='邮箱')
-    scene: Literal['register', 'login'] = Field(description='验证码场景（register注册 login登录）')
+    scene: Literal['register', 'login', 'reset'] = Field(description='验证码场景（register注册 login登录 reset找回密码）')
     # 这一项是邮件正文选语言用的，与注册/登录入参不同，必须保留
     source_lang: Literal['zh', 'en'] = Field(default='zh', description='提交时界面语言')
 
@@ -1880,6 +2102,111 @@ class GuestLoginModel(BaseModel):
         return self
 
 
+class GuestPasswordResetModel(BaseModel):
+    """
+    官网访客-找回密码入参（凭邮箱验证码重设密码）
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    email: EmailStr = Field(max_length=50, description='邮箱')
+    code: str = Field(min_length=6, max_length=6, pattern=r'^\d{6}$', description='邮箱验证码')
+    password: str = Field(min_length=6, max_length=50, description='新密码')
+    confirm_password: str = Field(min_length=6, max_length=50, description='确认新密码')
+
+    @model_validator(mode='after')
+    def check_password(self) -> 'GuestPasswordResetModel':
+        """
+        校验密码字节长度不超过bcrypt上限
+
+        :return: 校验通过的入参对象
+        """
+        _reject_oversize_password(self.password, '密码')
+        _reject_oversize_password(self.confirm_password, '确认密码')
+
+        return self
+
+
+class GuestProfileUpdateModel(BaseModel):
+    """
+    官网访客-修改资料入参
+
+    邮箱不在这里：它是登录标识，改邮箱要验证新邮箱归属，是另一件事。
+    三项都是整体覆盖语义（表单总是三项一起提交），机构/职位留空即清空。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    username: str = Field(min_length=1, max_length=30, description='用户名')
+    institution: str | None = Field(default=None, max_length=300, description='所属机构')
+    position: str | None = Field(default=None, max_length=100, description='职位')
+
+    @field_validator('username', mode='after')
+    @classmethod
+    def strip_username(cls, value: str) -> str:
+        """
+        去除用户名两端空白，纯空白交由下方 NotBlank 拦截
+
+        :param value: 原始用户名
+        :return: 去除两端空白后的用户名
+        """
+        return value.strip()
+
+    @field_validator('institution', 'position', mode='after')
+    @classmethod
+    def strip_optional_text(cls, value: str | None) -> str | None:
+        """
+        机构与职位去空白，纯空白按未填写处理
+
+        :param value: 原始文本
+        :return: 归一化后的文本
+        """
+        return _strip_optional_text(value)
+
+    # 文案与注册那份逐字一致：前端 `BACKEND_MESSAGE_KEYS` 按完整字符串映射，一份文案一个键
+    @model_validator(mode='after')
+    @Xss(field_name='username', message='用户名不能包含脚本字符')
+    @NotBlank(field_name='username', message='用户名不能为空')
+    @Size(field_name='username', min_length=0, max_length=30, message='用户名长度不能超过30个字符')
+    @Xss(field_name='institution', message='所属机构不能包含脚本字符')
+    @Size(field_name='institution', min_length=0, max_length=300, message='所属机构长度不能超过300个字符')
+    @Xss(field_name='position', message='职位不能包含脚本字符')
+    @Size(field_name='position', min_length=0, max_length=100, message='职位长度不能超过100个字符')
+    def check_text_fields(self) -> 'GuestProfileUpdateModel':
+        """
+        校验自由文本字段（脚本字符、空白、长度）
+
+        :return: 校验通过的入参对象
+        """
+        return self
+
+
+class GuestPasswordChangeModel(BaseModel):
+    """
+    官网访客-修改密码入参（已登录，凭原密码）
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    # 原密码不卡 6 位下限：老账号的密码规则可能变过，同登录侧
+    old_password: str = Field(min_length=1, max_length=50, description='原密码')
+    password: str = Field(min_length=6, max_length=50, description='新密码')
+    confirm_password: str = Field(min_length=6, max_length=50, description='确认新密码')
+
+    @model_validator(mode='after')
+    def check_password(self) -> 'GuestPasswordChangeModel':
+        """
+        校验密码字节长度不超过bcrypt上限
+
+        :return: 校验通过的入参对象
+        """
+        _reject_oversize_password(self.old_password, '原密码')
+        _reject_oversize_password(self.password, '密码')
+        _reject_oversize_password(self.confirm_password, '确认密码')
+
+        return self
+
+
 class GuestPublicInfoModel(BaseModel):
     """
     官网访客-对外暴露的访客信息
@@ -1926,6 +2253,61 @@ class GuestTokenModel(BaseModel):
 
     token: str = Field(description='访客令牌')
     guest: GuestPublicInfoModel = Field(description='访客信息')
+
+
+class GuestAdminModel(ActionBaseModel):
+    """
+    后台「访客管理」的访客行
+
+    只挑后台要看的那几列，**不含 password / user_name**：user_name 是 guest_ + 随机串的占位，
+    对管理员没有意义；password 哈希不该出现在任何出参里。
+    四个计数是该访客名下未删除的工作（报告草稿 / SRD 评估 / 稿件校验 / 背景生成）。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, from_attributes=True, populate_by_name=True)
+
+    user_id: int | None = Field(default=None, description='用户id')
+    email: str | None = Field(default=None, description='邮箱（登录标识）')
+    nick_name: str | None = Field(default=None, description='用户名')
+    institution: str | None = Field(default=None, description='所属机构')
+    position: str | None = Field(default=None, description='职位')
+    status: str | None = Field(default=None, description='账号状态（0正常 1停用；NULL 按正常）')
+    login_ip: str | None = Field(default=None, description='最后登录IP')
+    login_date: datetime | None = Field(default=None, description='最后登录时间')
+    pwd_update_date: datetime | None = Field(default=None, description='密码最后更新时间')
+    create_time: datetime | None = Field(default=None, description='注册时间')
+    draft_count: int = Field(default=0, description='报告草稿数')
+    srd_count: int = Field(default=0, description='SRD 评估数')
+    review_count: int = Field(default=0, description='稿件校验数')
+    background_count: int = Field(default=0, description='背景生成数')
+
+
+class GuestAdminPageQueryModel(ActionBaseModel):
+    """
+    访客分页查询模型
+
+    理由同 LiteratureModel：含下划线的字段在服务层可能按 snake_case 构造，必须开 populate_by_name。
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    keyword: str | None = Field(default=None, description='邮箱 / 用户名 / 机构 / 职位关键词')
+    status: Literal['0', '1'] | None = Field(default=None, description='账号状态')
+    begin_time: str | None = Field(default=None, description='注册时间起（yyyy-MM-dd）')
+    end_time: str | None = Field(default=None, description='注册时间止（yyyy-MM-dd）')
+    page_num: int = Field(default=1, description='当前页码')
+    page_size: int = Field(default=10, description='每页记录数')
+
+
+class GuestStatusModel(BaseModel):
+    """
+    访客停用 / 启用（窄接口，只收这两个值）
+    """
+
+    model_config = ConfigDict(alias_generator=to_camel)
+
+    user_id: int = Field(description='用户id')
+    status: Literal['0', '1'] = Field(description='账号状态（0正常 1停用）')
 
 # ---------------------------------------------------------------- 针灸文献知识库
 

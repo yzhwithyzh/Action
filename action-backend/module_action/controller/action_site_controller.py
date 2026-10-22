@@ -13,6 +13,8 @@ from common.constant import ApiNamespace
 from common.router import APIRouterPro
 from common.vo import DataResponseModel, DynamicResponseModel, PageResponseModel, ResponseBaseModel
 from module_action.entity.vo.action_vo import (
+    AiRunStateModel,
+    AiSubmitResultModel,
     AssistApplyModel,
     AssistRequestModel,
     AssistResultModel,
@@ -21,6 +23,7 @@ from module_action.entity.vo.action_vo import (
     BackgroundSubmitModel,
     BackgroundSubmitResultModel,
     CfirDomainModel,
+    CfirReferenceModel,
     ChecklistReviewStateModel,
     ChecklistReviewSubmitModel,
     ChecklistReviewSubmitResultModel,
@@ -29,6 +32,9 @@ from module_action.entity.vo.action_vo import (
     GuestEmailCodeModel,
     GuestInfoModel,
     GuestLoginModel,
+    GuestPasswordChangeModel,
+    GuestPasswordResetModel,
+    GuestProfileUpdateModel,
     GuestPublicInfoModel,
     GuestRegisterModel,
     GuestTokenModel,
@@ -45,6 +51,9 @@ from module_action.entity.vo.action_vo import (
     PublicationPageQueryModel,
     PublicationYearModel,
     ReaimDimensionModel,
+    RefineBatchSubmitModel,
+    RenderSubmitModel,
+    ReportAiStateModel,
     ReportDraftComposeModel,
     ReportDraftCreateModel,
     ReportDraftModel,
@@ -58,6 +67,9 @@ from module_action.entity.vo.action_vo import (
     SrdHistoryModel,
     SrdRunStateModel,
     StudyTypeModel,
+    SuggestionApplyModel,
+    SuggestionApplyResultModel,
+    SuggestionDiscardModel,
     TeamMemberModel,
     TeamMemberPageQueryModel,
     TrailAddModel,
@@ -74,6 +86,7 @@ from module_action.service.action_service import (
     ImplementationService,
     NewsService,
     PublicationService,
+    ReportAiService,
     ReportDraftService,
     ReportReviewService,
     ReportTrailService,
@@ -465,7 +478,7 @@ async def get_site_study_wizard(
 @action_site_controller.get(
     '/implementation/cfir',
     summary='获取 CFIR 针刺版障碍与策略库',
-    description='官网公开接口，返回 CFIR 领域 → 构念 → 应对策略三级结构',
+    description='官网公开接口，返回 CFIR 领域 → 构念（含子条目树）→ 应对策略',
     response_model=DataResponseModel[list[CfirDomainModel]],
 )
 async def get_site_cfir(
@@ -474,6 +487,22 @@ async def get_site_cfir(
 ) -> Response:
     result = await ImplementationService.get_cfir_tree_services(query_db)
     logger.info('获取CFIR策略库成功')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.get(
+    '/implementation/cfir-references',
+    summary='获取 CFIR 针刺版框架参考文献',
+    description='官网公开接口，构念与子条目的文献来源角标 [n] 对应这里的序号',
+    response_model=DataResponseModel[list[CfirReferenceModel]],
+)
+async def get_site_cfir_references(
+    request: Request,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await ImplementationService.get_cfir_references_services(query_db)
+    logger.info('获取CFIR参考文献成功')
 
     return ResponseUtil.success(data=result)
 
@@ -1120,9 +1149,10 @@ async def export_site_report_draft(
     current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
     fmt: Annotated[str, Query(description='导出格式（docx / xlsx / json）')] = 'docx',
     lang: Annotated[str, Query(description='导出语言（zh / en）')] = 'zh',
+    body: Annotated[str, Query(description='docx 正文：render = 第四步的整篇成文；auto = 原稿写回 / 条目合成')] = 'auto',
 ) -> Response:
     content, filename, media_type, _ext = await ReportDraftService.export_draft_services(
-        query_db, draft_id, current_guest.user_id, fmt, lang
+        query_db, draft_id, current_guest.user_id, fmt, lang, body
     )
     logger.info(f'导出报告草稿 {draft_id}（{fmt}）成功')
 
@@ -1204,6 +1234,150 @@ async def apply_site_report_assist(
     return ResponseUtil.success(data=result)
 
 
+# ---------------------------------------------------------------- 第四步：逐条建议 · 一键优化 · 整篇成文（sql/053）
+#
+# 一键优化与整篇成文是分钟级任务，走 `tools/report_ai_worker_tool`（队列 report_ai）：
+# 提交 → 轮询（终态那一刻落库）→ 停止。打开草稿时 `/report-drafts/{id}/ai` 一次取回
+# 在跑的任务（刷新后接回轮询）、最近的整篇成文与逐条建议。
+# **复数路径（/report-drafts/{id}/...）按草稿取，单数（/report-ai/{sid}）按任务轮询**。
+
+
+@action_site_controller.get(
+    '/report-drafts/{draft_id}/ai',
+    summary='第四步的整份状态：在跑的任务 · 最近的整篇成文 · 逐条建议',
+    description='成文逐章判「已过时」（这一章的条目在成文之后又改过），建议逐条判「已过时」（生成之后这一条又改过）',
+    response_model=DataResponseModel[ReportAiStateModel],
+)
+async def get_site_report_ai_state(
+    request: Request,
+    draft_id: int,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportAiService.state_services(query_db, draft_id, current_guest.user_id)
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.post(
+    '/report-drafts/{draft_id}/refine-batch',
+    summary='一键优化：给定的条目逐条生成优化建议',
+    description=(
+        '与单条「AI 优化」同一份提示词。**只产出建议，不改稿**：结果作为待审阅的建议入库，'
+        '用户逐条或「全部采用」后才写回。空着又没给补充事实的条目跳过并在回执里列出'
+    ),
+    response_model=DataResponseModel[AiSubmitResultModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_REPORT_AI, preset=ApiRateLimitPreset.USER_RESOURCE_EXECUTION)
+async def submit_site_refine_batch(
+    request: Request,
+    draft_id: int,
+    submit: RefineBatchSubmitModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+    lang: Annotated[str, Query(description='提示词与输出语言（zh / en）')] = 'zh',
+) -> Response:
+    result = await ReportAiService.submit_refine_services(query_db, draft_id, submit, current_guest.user_id, lang)
+    logger.info(f'一键优化已提交：草稿 {draft_id}，{result.item_total} 条（任务 {result.session_id}）')
+
+    return ResponseUtil.success(data=result, msg='已提交，正在优化')
+
+
+@action_site_controller.post(
+    '/report-drafts/{draft_id}/render',
+    summary='整篇成文：把各条目按章节写成一篇连贯的文章',
+    description=(
+        '只用作者写下的事实；每章写完由代码核对数字、占位、条目覆盖与穴位代码，不通过的章节标出原因。'
+        '`domain` 非空时只重写这一章。成文语言跟着作者实际写的语言走，不顺带翻译'
+    ),
+    response_model=DataResponseModel[AiSubmitResultModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_REPORT_AI, preset=ApiRateLimitPreset.USER_RESOURCE_EXECUTION)
+async def submit_site_render(
+    request: Request,
+    draft_id: int,
+    submit: RenderSubmitModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportAiService.submit_render_services(query_db, draft_id, submit, current_guest.user_id)
+    logger.info(f'整篇成文已提交：草稿 {draft_id}，{result.item_total} 章（任务 {result.session_id}）')
+
+    return ResponseUtil.success(data=result, msg='已提交，正在成文')
+
+
+@action_site_controller.get(
+    '/report-ai/{session_id}',
+    summary='轮询一键优化 / 整篇成文的任务状态',
+    description='终态那一刻由这里落库（worker 只认 Redis）。一键优化被停止时，已生成的建议照样落库',
+    response_model=DataResponseModel[AiRunStateModel],
+)
+async def get_site_report_ai_run(
+    request: Request,
+    session_id: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportAiService.poll_services(query_db, session_id, current_guest.user_id)
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.post(
+    '/report-ai/{session_id}/stop',
+    summary='停止一键优化 / 整篇成文',
+    response_model=ResponseBaseModel,
+)
+async def stop_site_report_ai_run(
+    request: Request,
+    session_id: str,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportAiService.stop_services(query_db, session_id, current_guest.user_id)
+
+    return ResponseUtil.success(msg=result.message)
+
+
+@action_site_controller.post(
+    '/report-drafts/{draft_id}/suggestions/apply',
+    summary='采用优化建议（写回条目）',
+    description=(
+        '每条都过「已过时」闸：条目当前正文与生成建议时不一致的跳过并在 `stale` 里列出，不静默覆盖。'
+        '每条写回由服务端记 applied 留痕'
+    ),
+    response_model=DataResponseModel[SuggestionApplyResultModel],
+)
+async def apply_site_suggestions(
+    request: Request,
+    draft_id: int,
+    apply_req: SuggestionApplyModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportAiService.apply_services(query_db, draft_id, apply_req, current_guest.user_id)
+    logger.info(f'草稿 {draft_id} 采用建议：写回 {len(result.applied)} 条，过时跳过 {len(result.stale)} 条')
+
+    return ResponseUtil.success(data=result)
+
+
+@action_site_controller.post(
+    '/report-drafts/{draft_id}/suggestions/discard',
+    summary='放弃优化建议',
+    response_model=ResponseBaseModel,
+)
+async def discard_site_suggestions(
+    request: Request,
+    draft_id: int,
+    discard: SuggestionDiscardModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await ReportAiService.discard_services(query_db, draft_id, discard, current_guest.user_id)
+
+    return ResponseUtil.success(msg=result.message)
+
+
 @action_site_controller.post(
     '/report-trails',
     summary='追加一条操作留痕',
@@ -1261,7 +1435,7 @@ async def submit_site_collaborate(
 
 # ---------------------------------------------------------------- 访客账号
 #
-# 这四个接口是官网唯一的写入口（前三个还是完全匿名的），必须挂限流。
+# 这几个接口是官网账号体系的写入口（发码 / 注册 / 登录 / 找回密码是完全匿名的），必须挂限流。
 # 访客与后台账号共用 sys_user 但走完全独立的身份依赖，不复用 PreAuthDependency。
 
 
@@ -1354,3 +1528,57 @@ async def logout_guest(
     logger.info('访客登出成功')
 
     return ResponseUtil.success(msg=result)
+
+
+@action_site_controller.post(
+    '/auth/password-reset',
+    summary='访客找回密码',
+    description='官网公开接口，凭邮箱验证码（scene=reset）重设密码，成功后直接返回登录令牌；此前签发的令牌全部作废',
+    response_model=DynamicResponseModel[GuestTokenModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_GUEST_PASSWORD_RESET, preset=ApiRateLimitPreset.ANON_AUTH_REGISTER)
+async def reset_guest_password(
+    request: Request,
+    reset_model: GuestPasswordResetModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+) -> Response:
+    result = await GuestAuthService.reset_password(request, query_db, reset_model)
+    logger.info('访客找回密码成功')
+
+    return ResponseUtil.success(msg='密码已重设', model_content=result)
+
+
+@action_site_controller.put(
+    '/auth/profile',
+    summary='修改访客资料',
+    description='官网访客接口，修改用户名 / 所属机构 / 职位（邮箱是登录标识，不在此修改）',
+    response_model=DataResponseModel[GuestPublicInfoModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_GUEST_PROFILE, preset=ApiRateLimitPreset.USER_COMMON_MUTATION)
+async def update_guest_profile(
+    request: Request,
+    profile_model: GuestProfileUpdateModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await GuestAuthService.update_profile(query_db, current_guest, profile_model)
+
+    return ResponseUtil.success(msg='资料已保存', data=result)
+
+
+@action_site_controller.put(
+    '/auth/password',
+    summary='修改访客密码',
+    description='官网访客接口，凭原密码修改；成功后换发新令牌，其他设备上的登录随之失效',
+    response_model=DynamicResponseModel[GuestTokenModel],
+)
+@ApiRateLimit(namespace=ApiNamespace.ACTION_GUEST_PASSWORD, preset=ApiRateLimitPreset.USER_SECURITY_MUTATION)
+async def change_guest_password(
+    request: Request,
+    change_model: GuestPasswordChangeModel,
+    query_db: Annotated[AsyncSession, DBSessionDependency()],
+    current_guest: Annotated[GuestInfoModel, GuestUserDependency()],
+) -> Response:
+    result = await GuestAuthService.change_password(request, query_db, current_guest, change_model)
+
+    return ResponseUtil.success(msg='密码已修改', model_content=result)

@@ -21,14 +21,18 @@ from typing import Any
 
 import docx
 
+from tools import consort_a_checklist
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC_ROOT = REPO_ROOT / 'ACTION网站及其材料' / '针刺报告规范'
 OUT_SQL = REPO_ROOT / 'action-backend' / 'sql' / 'action-checklist-pg.sql'
 OUT_JSON = REPO_ROOT / 'action-backend' / 'sql' / 'action-checklist.json'
 
-# guideline_id 与 action-website-pg.sql 里的 action_guideline 种子保持一致
+# guideline_id 与 action-website-pg.sql 里的 action_guideline 种子保持一致。
+# 规范 1（RCT）不在这里：原先抽的是「随机对照试验 RCT/STRICTA-*.docx」（CONSORT 2017 非药物扩展 +
+# 摘要表 + STRICTA 2010，78 条），已换成 CONSORT-A 2026，数据在 tools/consort_a_checklist.py，
+# 由 main() 接在 setval 之后输出。别把那一行加回来，否则两份规范的条目会同时挂在规范 1 下。
 GUIDELINES: list[dict[str, Any]] = [
-    {'gid': 1, 'code': 'STRICTA', 'dir': '随机对照试验 RCT', 'stem': 'STRICTA'},
     {'gid': 2, 'code': 'SPIRIT', 'dir': '临床试验方案 Protocol', 'stem': 'SPIRIT'},
     {'gid': 3, 'code': 'PRISMA', 'dir': '系统综述Meta分析', 'stem': 'PRISMA'},
     {'gid': 4, 'code': 'CARE', 'dir': '病例报告', 'stem': 'CARE'},
@@ -176,11 +180,12 @@ def q(v: str | int | None) -> str:
 DDL = """-- ----------------------------
 -- 报告规范 checklist 条目（PostgreSQL）
 --
--- 数据来源：《ACTION网站及其材料/针刺报告规范》下 6 个规范子目录的中/英文版 docx，
+-- 数据来源：《ACTION网站及其材料/针刺报告规范》下 5 个规范子目录的中/英文版 docx，
 -- 由 action-backend/tools/extract_checklists.py 抽取生成，请勿手工编辑本文件；
+-- 规范 1（RCT）的 CONSORT-A 2026 条目来自 tools/consort_a_checklist.py（素材是一份 PDF，不走 docx 抽取）。
 -- 条目的日常增删改走后台「规范条目管理」页面。
 --
--- 一份规范可能含多张清单表（如 RCT = CONSORT 主表 + 摘要表 + STRICTA 表），
+-- 一份规范可能含多张清单表（如 SPIRIT = SPIRIT 2025 主表 + SPIRIT-TCM 针刺扩展表），
 -- 用 part_no/part_zh/part_en 保留出处，页面上按 sort_num 合并成一条流水清单。
 -- docx 最后一列「行号/或不报告的理由」属于稿件维度（第三步校验产出），不入本表。
 -- ----------------------------
@@ -313,6 +318,9 @@ def main() -> None:
         lines.append('')
 
     lines.append(f"select setval('action_guideline_item_item_id_seq', {item_id});")
+    lines.append('')
+    # CONSORT-A 不写死 item_id、接在 setval 之后，与增量 055 落库结果一致
+    lines.extend(consort_a_checklist.insert_lines())
     lines.append('')
     lines.append('commit;')
     lines.append('')

@@ -362,6 +362,9 @@ class ActionStudyType(Base):
     # 代号快照，程序不按它匹配：规范代号在后台可改，按字符串挂的话一改名就全部指空（sql/048）
     hot_guideline = Column(String(64), nullable=True, server_default="''", comment='重点推荐规范代号（快照）')
     hot_guideline_id = Column(Integer, nullable=True, comment='重点推荐规范id（决定第二步展开哪份 checklist）')
+    alt_guideline_ids = Column(
+        String(200), nullable=True, server_default="''", comment='第二步可切换的其他规范id（逗号分隔，sql/056）'
+    )
     sort_num = Column(Integer, nullable=True, server_default='0', comment='显示顺序')
     status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
     tip_zh = Column(String(1000), nullable=True, server_default="''", comment='专属提示（中文）')
@@ -460,6 +463,8 @@ class ActionCfirDomain(Base):
     seq = Column(Integer, nullable=False, comment='领域序号')
     name_zh = Column(String(200), nullable=False, comment='名称（中文）')
     name_en = Column(String(300), nullable=True, server_default="''", comment='名称（英文）')
+    intro_zh = Column(String(300), nullable=True, server_default="''", comment='维度说明（中文）')
+    intro_en = Column(String(500), nullable=True, server_default="''", comment='维度说明（英文）')
     status = Column(CHAR(1), nullable=True, server_default='0', comment='状态（0正常 1停用）')
     create_by = Column(String(64), nullable=True, server_default="''", comment='创建者')
     create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
@@ -482,8 +487,53 @@ class ActionCfirConstruct(Base):
     name_en = Column(String(300), nullable=True, server_default="''", comment='名称（英文）')
     hint_zh = Column(String(800), nullable=True, server_default="''", comment='释义（中文）')
     hint_en = Column(String(1000), nullable=True, server_default="''", comment='释义（英文）')
+    concept_zh = Column(Text, nullable=True, comment='概念（中文）')
+    concept_en = Column(Text, nullable=True, comment='概念（英文）')
+    example_zh = Column(Text, nullable=True, comment='示例（中文，一行一条）')
+    example_en = Column(Text, nullable=True, comment='示例（英文，一行一条）')
+    origin_zh = Column(String(200), nullable=True, server_default="''", comment='与原版CFIR的对应关系（中文）')
+    origin_en = Column(String(300), nullable=True, server_default="''", comment='与原版CFIR的对应关系（英文）')
+    source = Column(String(300), nullable=True, server_default="''", comment='文献来源（角标对应 action_cfir_reference.ref_no）')
     severity = Column(CHAR(1), nullable=True, server_default="'m'", comment='严重度（h高 m中 l低）')
     sort_num = Column(Integer, nullable=True, server_default='0', comment='显示顺序')
+
+
+class ActionCfirElement(Base):
+    """
+    官网-CFIR构念子条目（sql/059，数据源 tools/cfir_acu_framework.py）
+
+    构念下的 ①②… 与 ①-1…：parent_id 为空的是第一级，非空的挂在另一条子条目下。
+    """
+
+    __tablename__ = 'action_cfir_element'
+    __table_args__ = {'comment': '官网-CFIR构念子条目'}
+
+    element_id = Column(Integer, primary_key=True, autoincrement=True, comment='子条目id')
+    construct_id = Column(Integer, nullable=False, comment='所属构念id')
+    parent_id = Column(Integer, nullable=True, comment='上级子条目id（空 = 构念下的第一级）')
+    label = Column(String(16), nullable=True, server_default="''", comment='编号（①、①-1、A …）')
+    name_zh = Column(String(200), nullable=False, comment='名称（中文）')
+    name_en = Column(String(300), nullable=True, server_default="''", comment='名称（英文）')
+    concept_zh = Column(Text, nullable=True, comment='概念（中文）')
+    concept_en = Column(Text, nullable=True, comment='概念（英文）')
+    example_zh = Column(Text, nullable=True, comment='示例（中文，一行一条）')
+    example_en = Column(Text, nullable=True, comment='示例（英文，一行一条）')
+    origin_zh = Column(String(200), nullable=True, server_default="''", comment='与原版CFIR的对应关系（中文）')
+    origin_en = Column(String(300), nullable=True, server_default="''", comment='与原版CFIR的对应关系（英文）')
+    source = Column(String(300), nullable=True, server_default="''", comment='文献来源')
+    sort_num = Column(Integer, nullable=True, server_default='0', comment='显示顺序')
+
+
+class ActionCfirReference(Base):
+    """
+    官网-CFIR针刺版框架参考文献（source 里的 [n] 即 ref_no）
+    """
+
+    __tablename__ = 'action_cfir_reference'
+    __table_args__ = {'comment': '官网-CFIR针刺版框架参考文献'}
+
+    ref_no = Column(Integer, primary_key=True, comment='文献序号')
+    citation = Column(Text, nullable=False, comment='引用文本')
 
 
 class ActionCfirStrategy(Base):
@@ -789,7 +839,9 @@ class ActionReportDraft(Base):
     source_text = Column(Text, nullable=True, comment='导入的原稿全文；逐条填的草稿为空')
     source_name = Column(String(255), nullable=True, server_default=text("''"), comment='导入时的原始文件名')
     source_lines = Column(Integer, nullable=True, server_default='0', comment='原稿有效行数（空行不占号）')
-    acu_basis = Column(String(32), nullable=True, server_default=text("''"), comment='穴位选取依据（bianzheng/duizheng/jingyan）')
+    #: 纳入的清单表（逗号分隔的 part_no），空串 = 全部纳入。取消纳入只是不选用，条目正文不删（sql/051）
+    parts = Column(String(200), nullable=True, server_default=text("''"), comment='纳入的清单表序号（逗号分隔的 part_no，空=全部纳入）')
+    acu_basis =Column(String(32), nullable=True, server_default=text("''"), comment='穴位选取依据（bianzheng/duizheng/jingyan）')
     acu_basis_note = Column(String(1000), nullable=True, server_default=text("''"), comment='选穴依据补充说明')
     acu_needle = Column(String(1000), nullable=True, server_default=text("''"), comment='进针手法（角度、深度、行针手法）')
     acu_deqi = Column(String(1000), nullable=True, server_default=text("''"), comment='得气感应')
@@ -1182,3 +1234,63 @@ class ActionBackgroundRun(Base):
     del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
     create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
     finish_time = Column(DateTime, nullable=True, comment='结束时间')
+
+
+#: 自增主键：库里是 bigserial；SQLite（单测用的内存库）只认 INTEGER PRIMARY KEY 才自增
+_PK = BigInteger().with_variant(Integer, 'sqlite')
+
+
+class ActionReportAiRun(Base):
+    """
+    报告助手第四步的分钟级 AI 任务（sql/053）：`kind` = refine 一键优化 / render 整篇成文
+
+    算法在 `tools/report_ai_worker_tool`；**落库在轮询接口里做**（worker 只认 Redis）。
+    render 的整份成文整块存 `result_json`：它只作为一次生成的快照被读取，没有跨记录查询需求。
+    """
+
+    __tablename__ = 'action_report_ai_run'
+    __table_args__ = {'comment': '报告助手第四步的分钟级 AI 任务'}
+
+    run_id = Column(_PK, primary_key=True, autoincrement=True, comment='任务id')
+    draft_id = Column(BigInteger, nullable=False, comment='草稿id')
+    user_id = Column(BigInteger, nullable=False, comment='访客id')
+    session_id = Column(String(64), nullable=False, comment='worker 任务id')
+    kind = Column(String(16), nullable=False, comment='refine 一键优化 / render 整篇成文')
+    locale = Column(String(8), nullable=True, server_default=text("'zh'"), comment='语言')
+    run_status = Column(String(20), nullable=True, server_default=text("'pending'"), comment='任务状态')
+    progress = Column(Integer, nullable=True, server_default='0', comment='进度百分比')
+    phase = Column(String(40), nullable=True, server_default=text("''"), comment='当前阶段')
+    error_msg = Column(String(500), nullable=True, server_default=text("''"), comment='失败原因')
+    item_total = Column(Integer, nullable=True, server_default='0', comment='条目数 / 章节数')
+    done_count = Column(Integer, nullable=True, server_default='0', comment='产出建议的条目数 / 核对通过的章节数')
+    model_label = Column(String(200), nullable=True, server_default=text("''"), comment='出结果的模型')
+    result_json = Column(Text, nullable=True, comment='render 的整份成文；refine 的跳过与失败清单')
+    draft_update_time = Column(DateTime, nullable=True, comment='提交时草稿的更新时间')
+    del_flag = Column(CHAR(1), nullable=True, server_default='0', comment='删除标志（0存在 2删除）')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    finish_time = Column(DateTime, nullable=True, comment='结束时间')
+
+
+class ActionReportSuggestion(Base):
+    """
+    逐条优化建议（sql/053）。单条「AI 优化」与一键优化产出的都进这里，「历次建议」才是一份。
+
+    `base_text` 是生成时这一条的正文：采用时与当前正文不一致即判「已过时」、不写回 ——
+    用户在建议生成之后又手改过这一条，整条覆盖会把那几个字冲掉。
+    """
+
+    __tablename__ = 'action_report_suggestion'
+    __table_args__ = {'comment': '报告助手逐条优化建议'}
+
+    suggestion_id = Column(_PK, primary_key=True, autoincrement=True, comment='建议id')
+    draft_id = Column(BigInteger, nullable=False, comment='草稿id')
+    user_id = Column(BigInteger, nullable=False, comment='访客id')
+    item_id = Column(Integer, nullable=False, comment='条目id')
+    run_id = Column(BigInteger, nullable=True, comment='来自哪次一键优化；单条优化为空')
+    base_text = Column(Text, nullable=True, comment='生成建议时这一条的正文')
+    content = Column(Text, nullable=False, comment='建议正文')
+    instruction = Column(String(1000), nullable=True, server_default=text("''"), comment='作者给的补充事实与修改意见')
+    model_label = Column(String(200), nullable=True, server_default=text("''"), comment='出结果的模型')
+    status = Column(String(16), nullable=True, server_default=text("'pending'"), comment='pending / applied / discarded')
+    create_time = Column(DateTime, nullable=True, comment='创建时间', default=datetime.now)
+    update_time = Column(DateTime, nullable=True, comment='更新时间')

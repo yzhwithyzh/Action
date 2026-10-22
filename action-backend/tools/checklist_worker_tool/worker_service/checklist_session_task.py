@@ -18,6 +18,7 @@
       "guideline_id": 1,
       "manuscript": "稿件全文……",         必填，strip 后不少于 MIN_MANUSCRIPT_CHARS 字
       "locale": "zh",                    条目取中文还是英文、一致性结论用什么语言写，默认 zh
+      "part_nos": [1, 3],                可选：只校验这几张清单表（草稿取消纳入了某几张时），缺省=全部
       "engine": {                        可选：算法参数覆盖，只认白名单里的键（见 _audit_config）
         "batch_size": 8, "window_chars": 60000, "window_overlap": 1500,
         "max_concurrency": 4, "max_chars": 300000,
@@ -113,6 +114,7 @@ class ChecklistSessionTask(BaseSessionTask):
         self._guideline_code = ''
         self._guideline_id: int | None = None
         self._locale = 'zh'
+        self._part_nos: set[int] | None = None
         self._model_health = model_health
         # 模型池与调用器在 process() 里才建：建池要查数据库，validate 失败的任务不该付这个代价
         self._pool: list[ModelConfig] = []
@@ -138,6 +140,14 @@ class ChecklistSessionTask(BaseSessionTask):
         self._guideline_id = int(gid) if gid else None
 
         self._locale = 'en' if str(self.payload.get('locale') or 'zh').lower().startswith('en') else 'zh'
+
+        raw_parts = self.payload.get('part_nos')
+        if raw_parts is not None and not isinstance(raw_parts, list):
+            raise TaskPayloadError('part_nos 必须是整数列表')
+        try:
+            self._part_nos = {int(p) for p in raw_parts} if raw_parts else None
+        except (TypeError, ValueError) as e:
+            raise TaskPayloadError('part_nos 必须是整数列表') from e
 
     def task_meta(self) -> dict[str, Any]:
         """标 running 时一并写进任务状态的元数据，`cli status` 与排障时看得到。
@@ -279,6 +289,11 @@ class ChecklistSessionTask(BaseSessionTask):
             # 会把一个「—」当条目正文发给模型，而中文列里明明有内容
             text = str(row.get(f'{base}{suffix}') or '')
             return text if text.strip() and not DASH.match(text.strip()) else str(row.get(f'{base}Zh') or '')
+
+        # 草稿在第二步取消纳入了某几张清单表时只校验剩下的（后端 sql/051）。
+        # 圈完一条不剩就是 payload 与库对不上（那几张表被后台删了），如实报错，不悄悄退回全部
+        if self._part_nos is not None:
+            rows = [row for row in rows if int(row.get('partNo') or 1) in self._part_nos]
 
         items = [
             ChecklistItem(
