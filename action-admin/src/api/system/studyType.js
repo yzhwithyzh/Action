@@ -34,3 +34,39 @@ export function delStudyType(typeIds) {
     method: 'delete'
   })
 }
+
+// ---------------------------------------------------------------- 分支问卷（第一步，sql/041）
+
+// 查询整棵问卷（全部题与选项）
+export function listStudyWizard() {
+  return request({
+    url: '/action/admin/study-wizard/list',
+    method: 'get'
+  })
+}
+
+// 新增题目（选项整体覆盖）
+export function addWizardQuestion(data) {
+  return request({
+    url: '/action/admin/study-wizard',
+    method: 'post',
+    data: data
+  })
+}
+
+// 修改题目（选项整体覆盖）
+export function updateWizardQuestion(data) {
+  return request({
+    url: '/action/admin/study-wizard',
+    method: 'put',
+    data: data
+  })
+}
+
+// 删除题目
+export function delWizardQuestion(questionIds) {
+  return request({
+    url: '/action/admin/study-wizard/' + questionIds,
+    method: 'delete'
+  })
+}

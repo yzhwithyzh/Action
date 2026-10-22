@@ -214,17 +214,28 @@
           </el-col>
           <el-col :span="16">
             <el-form-item label="缩略图" prop="thumbUrl">
-              <image-upload v-model="form.thumbUrl" :limit="1" />
+              <!-- 直传阿里云 OSS（action-gmu · 华南3 广州），存进库里的是公网直链。
+                   **不能用默认的 /common/upload**：那条落后端本地磁盘、返回相对路径，
+                   而官网是另一个域的静态站，列表页那张缩略图会裂。
+                   种子数据里那几条 /assets/logo-*.png 是随前端打包的静态资源，不受此限 -->
+              <image-upload
+                v-model="form.thumbUrl"
+                :limit="1"
+                :file-size="5"
+                :file-type="['png', 'jpg', 'jpeg', 'webp', 'gif']"
+                action="/action/admin/news/image"
+              />
             </el-form-item>
           </el-col>
           <el-col :span="24">
             <el-form-item label="中文正文" prop="contentZh">
-              <editor v-model="form.contentZh" :min-height="192" />
+              <!-- 正文里插入/粘贴的图片同样直传 OSS，理由同上（默认值是本地磁盘那条通道） -->
+              <editor v-model="form.contentZh" :min-height="192" action="/action/admin/news/image" />
             </el-form-item>
           </el-col>
           <el-col :span="24">
             <el-form-item label="英文正文" prop="contentEn">
-              <editor v-model="form.contentEn" :min-height="192" />
+              <editor v-model="form.contentEn" :min-height="192" action="/action/admin/news/image" />
             </el-form-item>
           </el-col>
           <el-col :span="24">

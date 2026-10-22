@@ -1,5 +1,11 @@
 <template>
   <div class="app-container">
+    <el-tabs v-model="tab">
+    <!-- 问卷决定「怎么问」，判定结果决定「问完给什么」。先摆问卷：甲方改分支逻辑时来的是这一页 -->
+    <el-tab-pane label="分支问卷" name="wizard">
+      <wizard-panel :types="allTypes" />
+    </el-tab-pane>
+    <el-tab-pane label="判定结果（研究类型）" name="types">
     <el-form :model="queryParams" ref="queryRef" :inline="true" v-show="showSearch" label-width="80px">
       <el-form-item label="关键词" prop="keyword">
         <el-input
@@ -44,16 +50,11 @@
     </el-row>
 
     <el-alert type="info" :closable="false" class="mb8" show-icon>
-      本表是<b>报告助手第一步的问卷词表</b>：决定「你的研究属于哪一类」有哪些选项、每个选项挂哪些规范标签、推荐哪些统计方法。
+      这里是分支问卷的<b>判定结果</b>：用户答完问卷落到哪一类研究，匹配卡片上就显示这一类的挂载规范、推荐统计方法与专属提示。
       与「规范分类管理」用途不同（那张是规范目录页的陈列分类），两边对同一类研究取同样的标识，但不构成关联。
       <br />
-      <b>「重点推荐规范」决定第二步展开哪份 checklist</b>，是这页最要紧的一个字段；「关联规范标签」只是第一步匹配结果卡片上的展示 chip，可以填库里没有的说明性文字。
-    </el-alert>
-
-    <el-alert type="warning" :closable="false" class="mb8" show-icon>
-      <b>新增或修改「类型标识」后，官网上不会立刻出现这个选项。</b>
-      第一步的选项列表与文案键写在前端代码里（<code>composables/wizardQuery.ts</code> 的 TYPE_OPTS 与
-      <code>assistant.typeOpt.&lt;标识&gt;</code>），需要开发同步一次并重新发布，否则新类型选不出来、改过标识的选项会显示成标识本身。
+      <b>「重点推荐规范」决定第二步展开哪份 checklist</b>，是这页最要紧的一个字段；「关联规范标签」只是匹配卡片上的展示 chip，可以填库里没有的说明性文字。
+      <b>新增的类型要在「分支问卷」里挂到某个选项上</b>，官网才选得到。
     </el-alert>
 
     <el-table v-loading="loading" :data="typeList" @selection-change="handleSelectionChange">
@@ -68,9 +69,20 @@
           <el-tag v-if="scope.row.hotGuideline" type="danger" effect="dark">{{ scope.row.hotGuideline }}</el-tag>
           <span v-else class="muted">未设置</span>
           <!-- 条目数是这一列真正的信息量：0 条就意味着第二步展不开 -->
-          <div class="hint" :class="{ warn: itemCount(scope.row.hotGuideline) === 0 }">
-            {{ itemCountText(scope.row.hotGuideline) }}
+          <div class="hint" :class="{ warn: itemCount(scope.row.hotGuidelineId) === 0 }">
+            {{ itemCountText(scope.row.hotGuidelineId) }}
           </div>
+        </template>
+      </el-table-column>
+      <el-table-column label="可切换规范" align="center" width="170">
+        <template #default="scope">
+          <template v-if="(scope.row.checklistOptions || []).length > 1">
+            <div v-for="o in scope.row.checklistOptions.slice(1)" :key="o.guidelineId">
+              <el-tag type="warning" effect="plain">{{ o.code }}</el-tag>
+              <div class="hint" :class="{ warn: !o.itemCount }">{{ o.itemCount ? `${o.itemCount} 条条目` : '该规范暂无条目' }}</div>
+            </div>
+          </template>
+          <span v-else class="muted">无</span>
         </template>
       </el-table-column>
       <el-table-column label="关联规范标签" min-width="220">
@@ -88,6 +100,18 @@
       <el-table-column label="统计推荐" align="center" width="90">
         <template #default="scope">{{ (scope.row.stats || []).length }} 条</template>
       </el-table-column>
+      <el-table-column label="专属提示" min-width="200" :show-overflow-tooltip="true">
+        <template #default="scope">
+          <span v-if="scope.row.tipZh">{{ scope.row.tipZh }}</span>
+          <span v-else class="muted">无</span>
+        </template>
+      </el-table-column>
+      <el-table-column label="状态" align="center" width="70">
+        <template #default="scope">
+          <el-tag v-if="scope.row.status === '1'" type="info">停用</el-tag>
+          <el-tag v-else type="success">正常</el-tag>
+        </template>
+      </el-table-column>
       <el-table-column label="顺序" prop="sortNum" align="center" width="70" />
       <el-table-column label="操作" align="center" width="140" class-name="small-padding fixed-width">
         <template #default="scope">
@@ -103,7 +127,7 @@
           <el-col :span="12">
             <el-form-item label="类型标识" prop="typeKey">
               <el-input v-model="form.typeKey" placeholder="小写字母开头，如 rct / protocol" />
-              <div class="hint">前台第一步选项与文案键都用它，改动需开发同步前端</div>
+              <div class="hint">分支问卷的选项按它指向这里；改了会连带改过去</div>
             </el-form-item>
           </el-col>
           <el-col :span="12">
@@ -126,22 +150,43 @@
           </el-col>
         </el-row>
 
-        <el-form-item label="重点推荐规范" prop="hotGuideline">
-          <el-select v-model="form.hotGuideline" clearable filterable allow-create default-first-option placeholder="决定第二步展开哪份 checklist" style="width: 100%">
+        <!-- 存的是规范 id 不是代号：代号在「规范目录管理」里可改，按字符串挂的话一改名就全部指空（sql/048） -->
+        <el-form-item label="重点推荐规范" prop="hotGuidelineId">
+          <el-select v-model="form.hotGuidelineId" clearable filterable placeholder="决定第二步展开哪份 checklist" style="width: 100%">
             <el-option
               v-for="g in guidelineOptions"
-              :key="g.code"
+              :key="g.guidelineId"
               :label="`${g.code} — ${g.nameZh || ''}`"
-              :value="g.code"
+              :value="g.guidelineId"
             >
               <span>{{ g.code }}</span>
-              <span class="opt-count" :class="{ warn: (itemCounts[g.code] || 0) === 0 }">
-                {{ itemCounts[g.code] || 0 }} 条
+              <span class="opt-count" :class="{ warn: (itemCounts[g.guidelineId] || 0) === 0 }">
+                {{ itemCounts[g.guidelineId] || 0 }} 条
               </span>
             </el-option>
           </el-select>
-          <div class="hint" :class="{ warn: form.hotGuideline && itemCount(form.hotGuideline) === 0 }">
+          <div class="hint" :class="{ warn: form.hotGuidelineId && itemCount(form.hotGuidelineId) === 0 }">
             {{ hotHint }}
+          </div>
+        </el-form-item>
+
+        <!-- 与重点推荐规范同样按 id 挂（sql/056）。一份草稿只对应一份规范，用户在第二步顶部切换 -->
+        <el-form-item label="可切换规范" prop="altGuidelineIds">
+          <el-select v-model="form.altGuidelineIds" multiple filterable placeholder="第二步除重点推荐规范外，还能切换到的规范" style="width: 100%">
+            <el-option
+              v-for="g in guidelineOptions.filter(x => x.guidelineId !== form.hotGuidelineId)"
+              :key="g.guidelineId"
+              :label="`${g.code} — ${g.nameZh || ''}`"
+              :value="g.guidelineId"
+            >
+              <span>{{ g.code }}</span>
+              <span class="opt-count" :class="{ warn: (itemCounts[g.guidelineId] || 0) === 0 }">
+                {{ itemCounts[g.guidelineId] || 0 }} 条
+              </span>
+            </el-option>
+          </el-select>
+          <div class="hint">
+            选了的话，报告助手第二步顶部会出现规范切换按钮（重点推荐规范排第一）。每份规范各写各的草稿；0 条条目的规范会标「条目待录入」。
           </div>
         </el-form-item>
 
@@ -174,6 +219,14 @@
           </div>
         </el-form-item>
 
+        <el-form-item label="专属提示">
+          <div class="stat-list">
+            <el-input v-model="form.tipZh" type="textarea" autosize placeholder="中文，如：重点完整记录针刺穴位、操作手法、得气反应与不良事件。" class="mb8" />
+            <el-input v-model="form.tipEn" type="textarea" autosize placeholder="English" />
+            <div class="hint">显示在匹配卡片底部。只对某个答案成立的提示（如「设假针」），请写在分支问卷对应选项上</div>
+          </div>
+        </el-form-item>
+
         <el-form-item label="状态" prop="status">
           <el-radio-group v-model="form.status">
             <el-radio value="0">正常</el-radio>
@@ -188,6 +241,8 @@
         </div>
       </template>
     </el-dialog>
+    </el-tab-pane>
+    </el-tabs>
   </div>
 </template>
 
@@ -195,12 +250,16 @@
 import { listStudyType, addStudyType, updateStudyType, delStudyType } from '@/api/system/studyType'
 import { listGuideline } from '@/api/system/guideline'
 import { listGuidelineItem } from '@/api/system/guidelineItem'
+import WizardPanel from './WizardPanel.vue'
 
 const { proxy } = getCurrentInstance()
 
+const tab = ref('wizard')
 const typeList = ref([])
+/** 不受关键词筛选的全量类型，给分支问卷的下拉与名称显示用 */
+const allTypes = ref([])
 const guidelineOptions = ref([])
-/** 规范代号 -> checklist 条目数。0 条就意味着选它作重点规范时第二步展不开 */
+/** 规范id -> checklist 条目数。0 条就意味着选它作重点规范时第二步展不开 */
 const itemCounts = ref({})
 const open = ref(false)
 const loading = ref(true)
@@ -223,19 +282,19 @@ const data = reactive({
 })
 const { queryParams, form, rules } = toRefs(data)
 
-function itemCount(code) {
-  return code ? itemCounts.value[code] || 0 : 0
+function itemCount(id) {
+  return id ? itemCounts.value[id] || 0 : 0
 }
 
-function itemCountText(code) {
-  if (!code) return ''
-  const n = itemCount(code)
+function itemCountText(id) {
+  if (!id) return ''
+  const n = itemCount(id)
   return n ? `${n} 条条目` : '该规范暂无条目'
 }
 
 const hotHint = computed(() => {
-  if (!form.value.hotGuideline) return '留空则第二步展不开任何清单'
-  const n = itemCount(form.value.hotGuideline)
+  if (!form.value.hotGuidelineId) return '留空则第二步展不开任何清单'
+  const n = itemCount(form.value.hotGuidelineId)
   return n
     ? `第二步会展开这份规范的 ${n} 条 checklist 条目`
     : '这份规范目前 0 条条目，第二步会是一片空白——可以先存，但需尽快在「规范条目管理」补齐'
@@ -245,6 +304,7 @@ function getList() {
   loading.value = true
   listStudyType(queryParams.value).then(res => {
     typeList.value = res.data || []
+    if (!queryParams.value.keyword) allTypes.value = typeList.value
     loading.value = false
   })
 }
@@ -252,14 +312,14 @@ function getList() {
 /** 拉规范目录与各自的条目数，供「重点推荐规范」下拉与提示用 */
 function getGuidelines() {
   // 这两个接口要的是 action:guideline:* 权限，只授了 studyType 权限的账号会 403。
-  // 静默吞掉：下拉是 allow-create 的，取不到选项照样能手填代号，不该整页报错
+  // 静默吞掉：取不到选项时下拉为空、改不了重点规范，但列表与其余字段照常可编辑，不该整页报错
   listGuideline({ pageNum: 1, pageSize: 200 })
     .then(res => {
       guidelineOptions.value = res.rows || res.data || []
       guidelineOptions.value.forEach(g => {
         listGuidelineItem({ guidelineId: g.guidelineId, pageNum: 1, pageSize: 1 })
           .then(r => {
-            itemCounts.value = { ...itemCounts.value, [g.code]: r.total || 0 }
+            itemCounts.value = { ...itemCounts.value, [g.guidelineId]: r.total || 0 }
           })
           .catch(() => {})
       })
@@ -278,9 +338,12 @@ function reset() {
     typeKey: '',
     nameZh: '',
     nameEn: '',
-    hotGuideline: '',
+    hotGuidelineId: undefined,
+    altGuidelineIds: [],
     sortNum: undefined,
     status: '0',
+    tipZh: '',
+    tipEn: '',
     guidelines: [],
     stats: []
   }
@@ -315,6 +378,7 @@ function handleUpdate(row) {
   form.value = {
     ...target,
     guidelines: [...(target.guidelines || [])],
+    altGuidelineIds: [...(target.altGuidelineIds || [])],
     stats: (target.stats || []).map(s => ({ ...s }))
   }
   open.value = true
@@ -327,6 +391,10 @@ function submitForm() {
     // 空行不提交：整体覆盖语义下，一行空的统计推荐会在前台渲染成一个空的 li
     const payload = {
       ...form.value,
+      // 清空下拉时 el-select 给的可能是 ''，后端这个字段是 int，统一成 null 表示「不挂」
+      hotGuidelineId: form.value.hotGuidelineId || null,
+      // 与重点推荐重复的剔掉（换了重点推荐之后，原先多选里可能正好有它）
+      altGuidelineIds: (form.value.altGuidelineIds || []).filter(id => id !== form.value.hotGuidelineId),
       stats: (form.value.stats || []).filter(s => (s.textZh || '').trim())
     }
     const req = payload.typeId ? updateStudyType(payload) : addStudyType(payload)

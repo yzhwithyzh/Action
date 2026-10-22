@@ -205,6 +205,17 @@
               <el-input v-model="form.extensionEn" type="textarea" :rows="2" placeholder="无扩展内容时填 — 或留空" />
             </el-form-item>
           </el-col>
+          <!-- 官网报告助手第二步「要求 / 示例 / 撰写」面板的中间那段。留空时官网显示「暂无示例」 -->
+          <el-col :span="24">
+            <el-form-item label="示例（中）" prop="exampleZh">
+              <el-input v-model="form.exampleZh" type="textarea" :rows="3" placeholder="一段符合本条要求的报告范文，供研究者对照撰写；留空即暂无示例" />
+            </el-form-item>
+          </el-col>
+          <el-col :span="24">
+            <el-form-item label="示例（英）" prop="exampleEn">
+              <el-input v-model="form.exampleEn" type="textarea" :rows="3" placeholder="Example text meeting this item; leave blank if none" />
+            </el-form-item>
+          </el-col>
           <el-col :span="12">
             <el-form-item label="填写要求" prop="requireLevel">
               <el-radio-group v-model="form.requireLevel">
@@ -339,6 +350,8 @@ function reset() {
     extLabelEn: undefined,
     extensionZh: undefined,
     extensionEn: undefined,
+    exampleZh: undefined,
+    exampleEn: undefined,
     // 新增时不传 sortNum，后端会自动排到该规范末尾
     sortNum: undefined,
     // 报告规范的通例是条目默认都要应答，只有带「如适用」这类限定语的才是条件填写
